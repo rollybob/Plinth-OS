@@ -11,3 +11,9 @@ path = "src/main.rs"
 bootloader_api = "0.11"
 uart_16550 = "0.3"
 x86_64 = "0.14"
+spin = "0.9"
+
+[features]
+# Compile the in-kernel test suite; the kernel runs it and exits instead
+# of booting normally. Driven by `cargo xtask test`.
+tests = []

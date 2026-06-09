@@ -2,4 +2,5 @@
 # in the captured serial output, in order. See xtask check_smoke_output.
 
 plinth: kernel entry
+plinth: frame allocator ready
 plinth: boot ok

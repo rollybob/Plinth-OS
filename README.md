@@ -24,8 +24,11 @@ Early. Current state:
 
 - [x] UEFI boot (bootloader 0.11 + OVMF), serial console, clean QEMU exit
 - [x] Smoke-test harness (`cargo xtask smoke`) asserting on boot output
-- [ ] Physical frame allocator with frames handed out as capabilities
-- [ ] Ring-3 processes and a ~6-call syscall surface
+- [x] Physical frame allocator (bitmap) and capability tables; frame
+      ownership is modeled as a mint/lookup/revoke cycle, kernel-side
+- [x] In-kernel test suite running under QEMU (`cargo xtask test`)
+- [ ] Ring-3 processes and a ~6-call syscall surface exposing frames
+      to userspace through those capabilities
 - [ ] Two demo library OSes with different memory-management policies
       on the same kernel
 - [ ] Fault-isolation demo: one process crashes, the others keep running
@@ -42,6 +45,7 @@ Early. Current state:
 ```
 cargo xtask run     # build kernel + UEFI disk image, boot in QEMU
 cargo xtask smoke   # boot with captured output, verify expected_boot_log.txt
+cargo xtask test    # build with --features tests, run the in-kernel suite
 cargo xtask run-gdb # boot paused, GDB server on :1234
 ```
 

@@ -8,7 +8,14 @@
 #![no_std]
 #![no_main]
 
+// The capability table has no production callers until the syscall layer
+// lands; today it is exercised from the test build only.
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+mod capability;
+mod frame_alloc;
 mod serial;
+#[cfg(feature = "tests")]
+mod tests;
 
 use bootloader_api::{
     config::{BootloaderConfig, Mapping},
@@ -40,8 +47,37 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .count();
     let _ = writeln!(serial, "plinth: {total} memory regions ({usable} usable)");
 
-    let _ = writeln!(serial, "plinth: boot ok");
-    qemu_exit(ExitCode::Success)
+    let phys_offset = boot_info
+        .physical_memory_offset
+        .into_option()
+        .expect("bootloader did not map physical memory");
+
+    let frames = frame_alloc::FrameAlloc::new(&boot_info.memory_regions, phys_offset);
+    let _ = writeln!(
+        serial,
+        "plinth: frame allocator ready ({} frames free)",
+        frames.free_frames()
+    );
+    *frame_alloc::FRAME_ALLOC.lock() = Some(frames);
+
+    // Test build: run the suite and exit immediately -- never continue to
+    // normal boot. The exit code tells xtask whether QEMU died unexpectedly,
+    // but pass/fail is judged from the [SUITE] serial line.
+    #[cfg(feature = "tests")]
+    {
+        let mut guard = frame_alloc::FRAME_ALLOC.lock();
+        let mut ctx = tests::TestCtx {
+            frames: guard.as_mut().expect("allocator installed above"),
+        };
+        let ok = tests::run_all(&mut ctx);
+        qemu_exit(if ok { ExitCode::Success } else { ExitCode::Failure })
+    }
+
+    #[cfg(not(feature = "tests"))]
+    {
+        let _ = writeln!(serial, "plinth: boot ok");
+        qemu_exit(ExitCode::Success)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -49,8 +85,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 enum ExitCode {
     /// QEMU exits with status (0 << 1) | 1 = 1.
     Success = 0,
-    /// QEMU exits with status (1 << 1) | 1 = 3.
-    Panic = 1,
+    /// QEMU exits with status (1 << 1) | 1 = 3. Used for panics and a
+    /// failed test suite.
+    Failure = 1,
 }
 
 /// Exit QEMU via the isa-debug-exit device (configured by xtask at port
@@ -74,5 +111,5 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // panic may have fired at any point, including mid-write.
     let mut serial = serial::init();
     let _ = writeln!(serial, "plinth: PANIC: {info}");
-    qemu_exit(ExitCode::Panic)
+    qemu_exit(ExitCode::Failure)
 }
