@@ -1,0 +1,13 @@
+[workspace]
+members = ["kernel", "xtask"]
+resolver = "2"
+
+# The kernel has no unwinding machinery; abort everywhere so panic paths
+# stay small and the panic handler is the single point of failure handling.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true

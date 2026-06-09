@@ -1,0 +1,5 @@
+# Smoke test contract: every non-blank, non-comment line below must appear
+# in the captured serial output, in order. See xtask check_smoke_output.
+
+plinth: kernel entry
+plinth: boot ok

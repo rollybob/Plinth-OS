@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Wraps the kernel ELF into a UEFI-bootable FAT32 disk image.
+bootloader = "0.11"
+# OVMF firmware (UEFI for QEMU). Downloaded once and cached under
+# target/ovmf/; no network activity after the first build.
+#
+# Pinned exactly: each crate version bundles a specific edk2 release via
+# Source::LATEST, and the 0.2.9 firmware hangs with no serial output
+# (not even BdsDxe lines) on qemu-system-x86_64 with q35 + pflash.
+# The 0.2.8 firmware boots the same disk image cleanly.
+ovmf-prebuilt = "=0.2.8"
