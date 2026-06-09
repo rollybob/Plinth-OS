@@ -79,4 +79,16 @@ impl CapTable {
             .take()
             .ok_or(CapError::EmptySlot)
     }
+
+    /// Remove every capability, handing each to `f`. Process teardown
+    /// uses this to return capability-owned resources to their pools.
+    /// (Teardown is unreachable in the test build, hence the cfg_attr.)
+    #[cfg_attr(feature = "tests", allow(dead_code))]
+    pub fn drain(&mut self, mut f: impl FnMut(Capability)) {
+        for slot in self.slots.iter_mut() {
+            if let Some(cap) = slot.take() {
+                f(cap);
+            }
+        }
+    }
 }

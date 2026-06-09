@@ -3,4 +3,12 @@
 
 plinth: kernel entry
 plinth: frame allocator ready
+plinth: GDT + TSS loaded
+plinth: IDT loaded
+plinth: syscall interface ready
+plinth: running hello
+hello: ring 3
+hello: frame mapped and writable
+hello: done
+plinth: hello exited (code 0)
 plinth: boot ok

@@ -14,6 +14,8 @@
 
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use spin::Mutex;
+use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
+use x86_64::PhysAddr;
 
 pub const FRAME_SIZE: u64 = 4096;
 
@@ -147,5 +149,15 @@ impl FrameAlloc {
             self.bitmap[wi] |= 1 << bit;
             self.free -= 1;
         }
+    }
+}
+
+// Lets the x86_64 mapper pull frames for intermediate page tables
+// directly from this allocator (memory::map_user_page).
+unsafe impl FrameAllocator<Size4KiB> for FrameAlloc {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        self.alloc()
+            .ok()
+            .map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
     }
 }

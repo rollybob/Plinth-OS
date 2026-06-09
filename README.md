@@ -27,8 +27,14 @@ Early. Current state:
 - [x] Physical frame allocator (bitmap) and capability tables; frame
       ownership is modeled as a mint/lookup/revoke cycle, kernel-side
 - [x] In-kernel test suite running under QEMU (`cargo xtask test`)
-- [ ] Ring-3 processes and a ~6-call syscall surface exposing frames
-      to userspace through those capabilities
+- [x] Ring-3 processes (syscall/sysret, synchronous run-to-completion
+      model) with a five-call syscall surface: write, exit, frame_alloc,
+      frame_map, frame_free. Userspace allocates a frame, chooses its own
+      virtual address, and maps it there -- the kernel only checks the
+      capability and the address window
+- [x] Exception handlers that terminate a faulting user process and
+      return control to the kernel; a user crash cannot take the
+      machine down
 - [ ] Two demo library OSes with different memory-management policies
       on the same kernel
 - [ ] Fault-isolation demo: one process crashes, the others keep running
@@ -55,6 +61,8 @@ afterwards) and compiles the bootloader, which takes a few minutes.
 ## Layout
 
 ```
-kernel/   the exokernel itself (no_std, x86_64-unknown-none)
-xtask/    build orchestration: disk image, QEMU invocation, smoke harness
+kernel/      the exokernel itself (no_std, x86_64-unknown-none)
+libplinth/   thin user-side syscall shim -- deliberately NOT a libOS
+hello-user/  demo process exercising the whole syscall surface
+xtask/       build orchestration: user binaries, disk image, QEMU, tests
 ```

@@ -7,15 +7,23 @@
 
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
-// The capability table has no production callers until the syscall layer
-// lands; today it is exercised from the test build only.
-#[cfg_attr(not(feature = "tests"), allow(dead_code))]
 mod capability;
 mod frame_alloc;
+mod gdt;
+mod interrupts;
+mod memory;
+// process/usermode are driven from the normal boot path only; the test
+// build stops before userspace, so silence their dead-code noise there.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod process;
 mod serial;
+mod syscall;
 #[cfg(feature = "tests")]
 mod tests;
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod usermode;
 
 use bootloader_api::{
     config::{BootloaderConfig, Mapping},
@@ -60,8 +68,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
     *frame_alloc::FRAME_ALLOC.lock() = Some(frames);
 
+    memory::init(phys_offset);
+
+    let selectors = gdt::init();
+    let _ = writeln!(serial, "plinth: GDT + TSS loaded");
+
+    interrupts::init();
+    let _ = writeln!(serial, "plinth: IDT loaded");
+
+    syscall::init(&selectors);
+    let _ = writeln!(serial, "plinth: syscall interface ready");
+
     // Test build: run the suite and exit immediately -- never continue to
-    // normal boot. The exit code tells xtask whether QEMU died unexpectedly,
+    // userspace. The exit code tells xtask whether QEMU died unexpectedly,
     // but pass/fail is judged from the [SUITE] serial line.
     #[cfg(feature = "tests")]
     {
@@ -75,6 +94,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     #[cfg(not(feature = "tests"))]
     {
+        // Built by xtask from hello-user/, linked at process::USER_CODE_VA.
+        const HELLO_BINARY: &[u8] = include_bytes!(env!("HELLO_BIN"));
+
+        let _ = writeln!(serial, "plinth: running hello ({} bytes)", HELLO_BINARY.len());
+        match process::run(HELLO_BINARY, phys_offset) {
+            Ok(process::Outcome::Exited(code)) => {
+                let _ = writeln!(serial, "plinth: hello exited (code {code})");
+            }
+            Ok(process::Outcome::Faulted) => {
+                let _ = writeln!(serial, "plinth: hello faulted");
+            }
+            Err(e) => {
+                let _ = writeln!(serial, "plinth: failed to run hello: {e}");
+                qemu_exit(ExitCode::Failure)
+            }
+        }
+
         let _ = writeln!(serial, "plinth: boot ok");
         qemu_exit(ExitCode::Success)
     }

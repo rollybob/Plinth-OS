@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use object::{Object, ObjectSegment};
 use ovmf_prebuilt::{Arch, FileType, Prebuilt, Source};
 
 fn main() {
@@ -18,13 +19,166 @@ fn main() {
     let subcmd = args.get(1).map(String::as_str).unwrap_or("run");
 
     match subcmd {
-        "build"   => { build(); }
-        "run"     => { let img = build(); run(&img, false); }
-        "run-gdb" => { let img = build(); run(&img, true); }
-        "smoke"   => { let img = build(); smoke(&img); }
+        "build"   => { build_all(); }
+        "run"     => { let img = build_all(); run(&img, false); }
+        "run-gdb" => { let img = build_all(); run(&img, true); }
+        "smoke"   => { let img = build_all(); smoke(&img); }
         "test"    => { let img = build_test(); run_tests(&img); }
+        "check"   => { check_clobbers(); }
         other     => { eprintln!("unknown subcommand: {other}"); std::process::exit(1); }
     }
+}
+
+/// User binaries embedded into the kernel. Crate directories are named
+/// {name}-user; flat binaries land in target/user/{name}.bin.
+const USER_CRATES: &[&str] = &["hello"];
+
+/// Build all user crates, then the kernel + disk image.
+fn build_all() -> PathBuf {
+    for name in USER_CRATES {
+        build_user_crate(name);
+    }
+    build()
+}
+
+/// Build one user crate (release: small enough to stay within its page
+/// budget, and the optimizer behavior is what actually ships) and extract
+/// a flat binary from its PT_LOAD segments.
+fn build_user_crate(name: &str) {
+    let root = workspace_root();
+    let crate_dir = root.join(format!("{name}-user"));
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    // Share the workspace target dir so caching works and kernel/build.rs
+    // finds binaries at predictable paths.
+    let status = Command::new(&cargo)
+        .current_dir(&crate_dir)
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .args(["build", "--release"])
+        .status()
+        .unwrap_or_else(|_| panic!("failed to invoke cargo for {name}-user"));
+    assert!(status.success(), "{name}-user build failed");
+
+    let elf_path = root.join(format!("target/x86_64-unknown-none/release/{name}-user"));
+    let elf_bytes = std::fs::read(&elf_path)
+        .unwrap_or_else(|e| panic!("failed to read {name}-user ELF: {e}"));
+
+    let flat = extract_flat_binary(&elf_bytes);
+
+    let out_dir = root.join("target/user");
+    std::fs::create_dir_all(&out_dir).expect("failed to create target/user");
+    let bin_path = out_dir.join(format!("{name}.bin"));
+    std::fs::write(&bin_path, &flat).unwrap_or_else(|e| panic!("failed to write {name}.bin: {e}"));
+
+    println!("{name}.bin: {} bytes", flat.len());
+}
+
+/// Project all PT_LOAD segments into one contiguous buffer starting at the
+/// lowest virtual address; gaps (including .bss tails) are zero-filled.
+/// The kernel maps the buffer verbatim at the linker base address.
+fn extract_flat_binary(elf_bytes: &[u8]) -> Vec<u8> {
+    let elf = object::File::parse(elf_bytes).expect("failed to parse user ELF");
+
+    let mut min_va = u64::MAX;
+    let mut max_va = 0u64;
+    for seg in elf.segments() {
+        let size = seg.size();
+        if size == 0 {
+            continue;
+        }
+        let va = seg.address();
+        min_va = min_va.min(va);
+        max_va = max_va.max(va + size);
+    }
+    if min_va == u64::MAX {
+        return Vec::new();
+    }
+
+    let mut flat = vec![0u8; (max_va - min_va) as usize];
+    for seg in elf.segments() {
+        let data = match seg.data() {
+            Ok(d) if !d.is_empty() => d,
+            _ => continue,
+        };
+        let offset = (seg.address() - min_va) as usize;
+        let copy_len = data.len().min(flat.len().saturating_sub(offset));
+        flat[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
+    }
+    flat
+}
+
+// Registers every non-noreturn syscall asm! block in libplinth must
+// declare: the kernel ABI clobbers the argument registers, syscall itself
+// clobbers rcx/r11, and the kernel dispatcher may clobber r8-r10.
+const REQUIRED_CLOBBERS: &[&str] = &[
+    "rax", "rdi", "rsi", "rdx", "rcx", "r8", "r9", "r10", "r11",
+];
+
+/// Lint every asm! block in libplinth/src for the full clobber set.
+fn check_clobbers() {
+    let root = workspace_root();
+    let src_dir = root.join("libplinth/src");
+    let mut violations = 0;
+
+    for entry in std::fs::read_dir(&src_dir).expect("failed to read libplinth/src") {
+        let path = entry.expect("dir entry error").path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            violations += lint_file(&path);
+        }
+    }
+
+    if violations > 0 {
+        eprintln!("clobber lint: {violations} violation(s) -- see above");
+        std::process::exit(1);
+    }
+    println!("clobber lint: ok");
+}
+
+fn lint_file(path: &Path) -> usize {
+    let src = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let mut violations = 0;
+    let mut search_from = 0;
+
+    while let Some(rel) = src[search_from..].find("asm!(") {
+        let block_start = search_from + rel;
+        let line_no = src[..block_start].bytes().filter(|&b| b == b'\n').count() + 1;
+
+        // Extract the block by matching the opening paren.
+        let open = block_start + 4;
+        let mut depth = 1usize;
+        let mut block_end = open + 1;
+        for (i, ch) in src[open + 1..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        block_end = open + 1 + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let block = &src[block_start..block_end];
+
+        // noreturn blocks are exempt: the CPU never returns to Rust, so
+        // there is no live register state to protect.
+        if !block.contains("noreturn") {
+            for reg in REQUIRED_CLOBBERS {
+                if !block.contains(&format!("\"{reg}\"")) {
+                    eprintln!(
+                        "{}:{line_no}: asm! block missing clobber for \"{reg}\"",
+                        path.display()
+                    );
+                    violations += 1;
+                }
+            }
+        }
+        search_from = block_end;
+    }
+    violations
 }
 
 fn workspace_root() -> PathBuf {
@@ -231,6 +385,10 @@ fn smoke(uefi_path: &Path) {
 /// Build the kernel with the test suite compiled in. Uses a separate
 /// image path so it never clobbers the smoke/run image.
 fn build_test() -> PathBuf {
+    for name in USER_CRATES {
+        build_user_crate(name);
+    }
+
     let root = workspace_root();
     let kernel_dir = root.join("kernel");
 

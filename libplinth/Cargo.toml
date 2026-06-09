@@ -1,0 +1,8 @@
+# Standalone crate -- intentionally not a workspace member. User crates
+# depend on it by path and build it for x86_64-unknown-none themselves.
+[workspace]
+
+[package]
+name = "libplinth"
+version = "0.1.0"
+edition = "2021"
