@@ -31,7 +31,7 @@ fn main() {
 
 /// User binaries embedded into the kernel. Crate directories are named
 /// {name}-user; flat binaries land in target/user/{name}.bin.
-const USER_CRATES: &[&str] = &["hello"];
+const USER_CRATES: &[&str] = &["hello", "bump", "list", "crash"];
 
 /// Build all user crates, then the kernel + disk image.
 fn build_all() -> PathBuf {

@@ -94,6 +94,48 @@ pub fn sys_frame_free(slot: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Console helpers (no core::fmt -- it drags in kilobytes of machinery)
+// ---------------------------------------------------------------------------
+
+/// Write `val` as 0x-prefixed lowercase hex, minimal digits.
+pub fn write_hex(val: u64) {
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    if val == 0 {
+        buf[2] = b'0';
+        sys_write(&buf[..3]);
+        return;
+    }
+    let digits = (64 - val.leading_zeros() as usize).div_ceil(4);
+    let mut i = 0;
+    while i < digits {
+        let shift = (digits - 1 - i) * 4;
+        let d = ((val >> shift) & 0xF) as u8;
+        buf[2 + i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        i += 1;
+    }
+    sys_write(&buf[..2 + digits]);
+}
+
+/// Write `val` in decimal.
+pub fn write_dec(val: u64) {
+    let mut buf = [0u8; 20];
+    if val == 0 {
+        sys_write(b"0");
+        return;
+    }
+    let mut i = buf.len();
+    let mut v = val;
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    sys_write(&buf[i..]);
+}
+
+// ---------------------------------------------------------------------------
 // Memory intrinsics
 // ---------------------------------------------------------------------------
 // LLVM lowers slice operations (PartialEq, copy_from_slice, etc.) to these

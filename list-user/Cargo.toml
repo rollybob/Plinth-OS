@@ -1,0 +1,24 @@
+# Standalone crate -- intentionally not a workspace member.
+[workspace]
+
+[package]
+name = "list-user"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "list-user"
+path = "src/main.rs"
+
+[dependencies]
+libplinth = { path = "../libplinth" }
+libos = { path = "../libos" }
+demo-app = { path = "../demo-app" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true

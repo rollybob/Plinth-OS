@@ -11,4 +11,37 @@ hello: ring 3
 hello: frame mapped and writable
 hello: done
 plinth: hello exited (code 0)
+
+# Same workload, bump policy: c cannot fit in the frame's remaining
+# 1024 bytes, so the libOS asks the kernel for a second frame.
+plinth: running bump-demo
+demo: policy = bump
+demo: a = 0x10000000
+demo: b = 0x10000600
+demo: freed a
+demo: c = 0x10000c00
+demo: c got a new address
+demo: kernel frames used: 2
+plinth: bump-demo exited (code 0)
+
+# Deliberate null dereference: the kernel logs the ring-3 #PF, kills the
+# process, and the boot continues.
+plinth: running crash-demo
+crash: about to dereference null
+plinth: [user fault] #PF
+plinth: terminating user process
+plinth: crash-demo faulted
+
+# Same workload, free-list policy: c reuses a's freed block -- same
+# address back, still only one kernel frame.
+plinth: running list-demo
+demo: policy = freelist
+demo: a = 0x10000000
+demo: b = 0x10000600
+demo: freed a
+demo: c = 0x10000000
+demo: c reused a freed block
+demo: kernel frames used: 1
+plinth: list-demo exited (code 0)
+
 plinth: boot ok

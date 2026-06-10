@@ -1,0 +1,10 @@
+# Standalone crate -- intentionally not a workspace member.
+[workspace]
+
+[package]
+name = "libos"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libplinth = { path = "../libplinth" }

@@ -94,20 +94,36 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     #[cfg(not(feature = "tests"))]
     {
-        // Built by xtask from hello-user/, linked at process::USER_CODE_VA.
-        const HELLO_BINARY: &[u8] = include_bytes!(env!("HELLO_BIN"));
+        // Built by xtask from the *-user crates, linked at USER_CODE_VA.
+        // The sequence is the demo: hello proves the syscall surface,
+        // then the same workload runs under two different library OSes
+        // with a deliberate crash between them -- the kernel logs the
+        // fault, reclaims the process, and keeps going.
+        const DEMOS: &[(&str, &[u8])] = &[
+            ("hello", include_bytes!(env!("HELLO_BIN"))),
+            ("bump-demo", include_bytes!(env!("BUMP_BIN"))),
+            ("crash-demo", include_bytes!(env!("CRASH_BIN"))),
+            ("list-demo", include_bytes!(env!("LIST_BIN"))),
+        ];
 
-        let _ = writeln!(serial, "plinth: running hello ({} bytes)", HELLO_BINARY.len());
-        match process::run(HELLO_BINARY, phys_offset) {
-            Ok(process::Outcome::Exited(code)) => {
-                let _ = writeln!(serial, "plinth: hello exited (code {code})");
+        for (name, binary) in DEMOS {
+            let _ = writeln!(serial, "plinth: running {name} ({} bytes)", binary.len());
+            match process::run(binary, phys_offset) {
+                Ok(process::Outcome::Exited(code)) => {
+                    let _ = writeln!(serial, "plinth: {name} exited (code {code})");
+                }
+                Ok(process::Outcome::Faulted) => {
+                    let _ = writeln!(serial, "plinth: {name} faulted");
+                }
+                Err(e) => {
+                    let _ = writeln!(serial, "plinth: failed to run {name}: {e}");
+                    qemu_exit(ExitCode::Failure)
+                }
             }
-            Ok(process::Outcome::Faulted) => {
-                let _ = writeln!(serial, "plinth: hello faulted");
-            }
-            Err(e) => {
-                let _ = writeln!(serial, "plinth: failed to run hello: {e}");
-                qemu_exit(ExitCode::Failure)
+            // Same number after every teardown (the one-time page-table
+            // frames aside): no process leaks, not even the crashed one.
+            if let Some(fa) = frame_alloc::FRAME_ALLOC.lock().as_ref() {
+                let _ = writeln!(serial, "plinth: {} frames free", fa.free_frames());
             }
         }
 
