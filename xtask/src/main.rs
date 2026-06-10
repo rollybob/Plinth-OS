@@ -271,18 +271,28 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool) -> Command {
     cmd
 }
 
+/// Default QEMU timeout; override with PLINTH_QEMU_TIMEOUT (seconds) on
+/// slow machines or loaded CI runners, where TCG boot can take longer.
 const TIMEOUT_SECS: u64 = 60;
+
+fn qemu_timeout() -> u64 {
+    std::env::var("PLINTH_QEMU_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(TIMEOUT_SECS)
+}
 
 /// Wait for QEMU with a hard timeout. Returns the exit code, or i32::MIN
 /// if the process was killed because it timed out.
 fn wait_qemu(mut child: std::process::Child) -> i32 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
+    let timeout = qemu_timeout();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
     loop {
         if let Some(s) = child.try_wait().expect("failed to wait on qemu") {
             return s.code().unwrap_or(1);
         }
         if std::time::Instant::now() >= deadline {
-            eprintln!("QEMU timed out after {TIMEOUT_SECS}s -- killing");
+            eprintln!("QEMU timed out after {timeout}s -- killing");
             let _ = child.kill();
             let _ = child.wait();
             return i32::MIN;
