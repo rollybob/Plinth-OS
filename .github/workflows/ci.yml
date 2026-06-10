@@ -32,7 +32,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # Keyed on the toolchain too: artifacts built by a different
+          # rustc must not be restored after a toolchain change.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Clobber lint
         run: cargo xtask check
