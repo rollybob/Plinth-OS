@@ -321,6 +321,10 @@ fn run(uefi_path: &Path, gdb: bool) {
 fn run_capture(uefi_path: &Path) -> String {
     use std::io::Read;
     let mut cmd = build_qemu_cmd(uefi_path, false);
+    // Headless: all output we care about arrives over serial. Without
+    // this, QEMU tries to open its default (GTK) display and dies on
+    // CI runners that have no display server at all.
+    cmd.args(["-display", "none"]);
     cmd.stdout(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().expect("failed to launch qemu-system-x86_64");
