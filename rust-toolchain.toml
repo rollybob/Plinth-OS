@@ -3,6 +3,8 @@
 # crate for core" as of nightly 2026-06). An undated "nightly" channel
 # means every fresh machine gets a different compiler -- this date is
 # the one the test suite is verified against.
+# llvm-tools-preview: the bootloader crate's build script needs the LLVM
+# binutils (llvm-objcopy et al.) to package its boot-stage binaries.
 [toolchain]
 channel = "nightly-2026-04-02"
-components = ["rust-src"]
+components = ["rust-src", "llvm-tools-preview"]
