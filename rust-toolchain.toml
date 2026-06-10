@@ -1,3 +1,8 @@
+# Pinned to a dated nightly: bootloader 0.11's build script breaks on
+# newer nightlies (its BIOS-stage builds fail with E0463 "can't find
+# crate for core" as of nightly 2026-06). An undated "nightly" channel
+# means every fresh machine gets a different compiler -- this date is
+# the one the test suite is verified against.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-04-02"
 components = ["rust-src"]

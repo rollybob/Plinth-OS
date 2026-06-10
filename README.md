@@ -210,6 +210,12 @@ Hard-won, possibly useful to other no_std kernel people:
   hangs with zero serial output (not even BdsDxe lines) under
   qemu-system-x86_64 with q35 + pflash. If you bump the pin, re-test
   boot before trusting anything else.
+- **Pin your nightly by date.** `channel = "nightly"` means a different
+  compiler on every fresh machine. This repo built green locally for
+  days while CI failed instantly: the runner pulled that morning's
+  nightly, on which bootloader 0.11's BIOS-stage builds die with E0463.
+  `rust-toolchain.toml` now names the exact dated nightly the suite is
+  verified against.
 - **syscall asm clobbers are a lint, not a comment.** The kernel's C
   dispatcher may clobber every caller-saved register; one missing
   declaration means the compiler caches a value in a register the
