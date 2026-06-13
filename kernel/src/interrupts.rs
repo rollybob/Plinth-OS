@@ -9,13 +9,19 @@
 //! handler dereferences a user pointer takes the kernel-fatal path. The
 //! syscall layer validates user pointers against the page tables first,
 //! so a user process cannot steer the kernel into that path.
+//!
+//! The #PF gate is the exception: it points at a naked stub in `fault`,
+//! which captures the full register context so a user fault in a process's
+//! lazy region can be delivered to a ring-3 handler (self-paging) and the
+//! faulting instruction resumed. Every other exception goes through the
+//! shared `handle_fault` path below.
 
 use core::fmt::Write;
 use core::ptr::{addr_of, addr_of_mut};
 
-use x86_64::registers::control::Cr2;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
+use crate::fault;
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 use crate::serial;
 use crate::usermode;
@@ -31,7 +37,8 @@ pub fn init() {
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
         idt.stack_segment_fault.set_handler_fn(stack_segment_handler);
         idt.general_protection_fault.set_handler_fn(general_protection_handler);
-        idt.page_fault.set_handler_fn(page_fault_handler);
+        // #PF gets a naked stub (full register capture) for self-paging.
+        fault::install_page_fault_handler(idt);
         idt.double_fault
             .set_handler_fn(double_fault_handler)
             .set_stack_index(DOUBLE_FAULT_IST_INDEX);
@@ -85,11 +92,6 @@ extern "x86-interrupt" fn stack_segment_handler(frame: InterruptStackFrame, err:
 
 extern "x86-interrupt" fn general_protection_handler(frame: InterruptStackFrame, err: u64) {
     handle_fault("#GP general protection", &frame, Some(err), None);
-}
-
-extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, err: PageFaultErrorCode) {
-    let cr2 = Cr2::read().as_u64();
-    handle_fault("#PF page fault", &frame, Some(err.bits()), Some(cr2));
 }
 
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _err: u64) -> ! {

@@ -44,4 +44,39 @@ demo: c reused a freed block
 demo: kernel frames used: 1
 plinth: list-demo exited (code 0)
 
+# CPU time as a capability: greedy-demo is minted a fixed CPU budget at
+# spawn and spends it in a loop until the kernel cuts it off -- the
+# resource-bound twin of the fault demo. Same teardown path, no leak.
+plinth: running greedy-demo
+greedy: spending CPU budget
+greedy: charged 256, remaining = 768
+greedy: charged 256, remaining = 512
+greedy: charged 256, remaining = 256
+greedy: charged 256, remaining = 0
+plinth: [out of budget] terminating user process
+plinth: greedy-demo out of budget
+
+# Self-paging: lazy-demo registers a ring-3 fault handler, then touches
+# unmapped pages. Each first touch faults; the kernel upcalls the handler,
+# which maps a frame and resumes the instruction. Same #PF as crash-demo,
+# opposite outcome -- the policy lives in userspace.
+plinth: running lazy-demo
+lazy: registering fault handler
+lazy: serviced fault at 0x18000000
+lazy: serviced fault at 0x18001000
+lazy: serviced fault at 0x18002000
+lazy: serviced fault at 0x18003000
+lazy: all pages materialized on demand
+plinth: lazy-demo exited (code 0)
+
+# Capability transfer across isolated address spaces: spawner allocates a
+# frame and spawns a child, granting it the capability. The child runs in
+# its own page tables, maps and uses a frame it never allocated (it only
+# has the transferred capability), and returns a result the parent reads.
+plinth: running spawner-demo
+spawner: allocated a frame, granting it to a child
+grantee: used granted frame at 0x10004000
+spawner: child returned 42
+plinth: spawner-demo exited (code 0)
+
 plinth: boot ok

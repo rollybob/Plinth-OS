@@ -14,6 +14,11 @@
 pub const RIGHT_READ: u8 = 1 << 0;
 pub const RIGHT_WRITE: u8 = 1 << 1;
 pub const RIGHT_MAP: u8 = 1 << 2;
+/// The right to spend a CpuTime budget via cpu_charge. Disjoint from the
+/// frame rights on purpose: a Frame capability never carries RIGHT_CONSUME
+/// and a CpuTime capability never carries RIGHT_MAP, so the rights check
+/// alone keeps the two syscall families from touching the wrong object.
+pub const RIGHT_CONSUME: u8 = 1 << 3;
 
 pub const MAX_CAPS: usize = 16;
 
@@ -21,6 +26,13 @@ pub const MAX_CAPS: usize = 16;
 pub enum CapObject {
     /// Ownership of one physical frame (frame-aligned address).
     Frame { addr: u64 },
+    /// A budget of CPU "ticks" the holder may consume. Unlike a frame --
+    /// which the holder owns until it is revoked -- this capability is
+    /// depleted by use: cpu_charge debits the budget, and a holder that
+    /// tries to spend past zero has overdrawn a resource it does not have.
+    /// The kernel mints it at spawn; teardown reclaims the slot but the
+    /// "resource" (CPU time) is not poolable, so nothing returns anywhere.
+    CpuTime { budget: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +50,12 @@ pub enum CapError {
     EmptySlot,
     /// Capability exists but lacks a required right.
     RightsDenied,
+    /// Operation does not apply to this object kind (e.g. charging a Frame).
+    WrongType,
+    /// A CpuTime budget cannot cover the requested charge. The capability
+    /// is left untouched; the caller decides what an overdraw means (the
+    /// syscall layer terminates the offending process).
+    Insufficient,
 }
 
 pub struct CapTable {
@@ -68,6 +86,29 @@ impl CapTable {
             return Err(CapError::RightsDenied);
         }
         Ok(cap)
+    }
+
+    /// Debit `amount` from the CpuTime capability at `slot`, requiring
+    /// every right in `required` (RIGHT_CONSUME). Returns the remaining
+    /// budget on success. Fails with WrongType if the slot holds anything
+    /// but a CpuTime budget, and Insufficient if the budget cannot cover
+    /// the charge -- in which case the budget is left exactly as it was.
+    pub fn charge(&mut self, slot: usize, amount: u64, required: u8) -> Result<u64, CapError> {
+        let cap = self
+            .slots
+            .get_mut(slot)
+            .ok_or(CapError::BadSlot)?
+            .as_mut()
+            .ok_or(CapError::EmptySlot)?;
+        if cap.rights & required != required {
+            return Err(CapError::RightsDenied);
+        }
+        let CapObject::CpuTime { budget } = &mut cap.object else {
+            return Err(CapError::WrongType);
+        };
+        let remaining = budget.checked_sub(amount).ok_or(CapError::Insufficient)?;
+        *budget = remaining;
+        Ok(remaining)
     }
 
     /// Remove and return the capability at `slot`. Revocation is

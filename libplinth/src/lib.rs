@@ -7,13 +7,17 @@
 //!
 //! ## Syscall numbers (RAX), args in RDI/RSI/RDX
 //!
-//! | Nr | Name        | Args      | Returns                 |
-//! |----|-------------|-----------|-------------------------|
-//! |  1 | write       | ptr, len  | len, or SYS_ERR         |
-//! |  2 | exit        | code      | (never returns)         |
-//! |  3 | frame_alloc | --        | cap slot, or SYS_ERR    |
-//! |  4 | frame_map   | slot, va  | 0, or SYS_ERR           |
-//! |  5 | frame_free  | slot      | 0, or SYS_ERR           |
+//! | Nr | Name        | Args         | Returns                  |
+//! |----|-------------|--------------|--------------------------|
+//! |  1 | write       | ptr, len     | len, or SYS_ERR          |
+//! |  2 | exit        | code         | (never returns)          |
+//! |  3 | frame_alloc | --           | cap slot, or SYS_ERR     |
+//! |  4 | frame_map   | slot, va     | 0, or SYS_ERR            |
+//! |  5 | frame_free  | slot         | 0, or SYS_ERR            |
+//! |  6 | cpu_charge  | slot, amount | remaining, or terminates |
+//! |  7 | fault_reg   | entry, stack | 0, or SYS_ERR            |
+//! |  8 | fault_return| --           | (resumes faulting insn)  |
+//! |  9 | spawn       | child_id, slot| child exit code, or ERR |
 
 #![no_std]
 
@@ -26,6 +30,23 @@ pub const MAP_BASE: u64 = 0x1000_0000;
 pub const MAP_END: u64 = 0x2000_0000;
 
 pub const PAGE_SIZE: u64 = 4096;
+
+/// The kernel mints each process a CPU-time capability at spawn, and it
+/// always lands in this slot -- a well-known initial capability, the way
+/// fd 0 is on Unix. Pass it to sys_cpu_charge.
+pub const CPU_CAP_SLOT: u64 = 0;
+
+/// A capability a parent transfers into a child via sys_spawn lands here,
+/// in the child's table -- the next slot after the CPU budget. A spawned
+/// child reads its inherited capability from this slot.
+pub const GRANT_SLOT: u64 = 1;
+
+/// Demand-paged window. A not-present access here, once the process has
+/// registered a fault handler (sys_fault_reg), is delivered to that handler
+/// instead of killing the process. Inside [MAP_BASE, MAP_END), so the
+/// handler can satisfy the fault with the ordinary sys_frame_map.
+pub const LAZY_BASE: u64 = 0x1800_0000;
+pub const LAZY_END: u64 = 0x1900_0000;
 
 /// Shared three-argument syscall stub.
 ///
@@ -91,6 +112,43 @@ pub fn sys_frame_map(slot: u64, va: u64) -> u64 {
 #[inline]
 pub fn sys_frame_free(slot: u64) -> u64 {
     syscall3(5, slot, 0, 0)
+}
+
+/// Charge `amount` CPU ticks against the CpuTime capability at `slot`
+/// (normally CPU_CAP_SLOT). Returns the remaining budget. There is no
+/// error return for overdraw: if the process charges more than it holds,
+/// the kernel terminates it and this call never returns.
+#[inline]
+pub fn sys_cpu_charge(slot: u64, amount: u64) -> u64 {
+    syscall3(6, slot, amount, 0)
+}
+
+/// Run the embedded child binary `child_id` to completion in its own
+/// isolated address space, transferring the capability at `slot` into the
+/// child (where it appears at GRANT_SLOT). Returns the child's exit code,
+/// or SYS_ERR if it faulted, overran its budget, or could not be started.
+#[inline]
+pub fn sys_spawn(child_id: u64, slot: u64) -> u64 {
+    syscall3(9, child_id, slot, 0)
+}
+
+/// Register `entry` as this process's page-fault handler, to run on the
+/// stack ending at `stack_top`. A not-present fault in [LAZY_BASE, LAZY_END)
+/// then upcalls `entry` with the fault address in the first argument,
+/// instead of terminating. Returns 0, or SYS_ERR if either value is zero.
+#[inline]
+pub fn sys_fault_reg(entry: u64, stack_top: u64) -> u64 {
+    syscall3(7, entry, stack_top, 0)
+}
+
+/// Return from a fault handler: resume the instruction that faulted. Does
+/// not return to the handler on success. If called outside a fault (or it
+/// otherwise fails), it falls through; the safety net exits the process.
+#[inline]
+pub fn sys_fault_return() -> ! {
+    syscall3(8, 0, 0, 0);
+    // Reached only if the kernel refused the resume -- treat as fatal.
+    sys_exit(120)
 }
 
 // ---------------------------------------------------------------------------

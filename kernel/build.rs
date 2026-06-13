@@ -2,7 +2,8 @@
 // so main.rs can embed them with include_bytes!. Run `cargo xtask build`
 // at least once before building the kernel directly.
 
-const USER_BINARIES: &[&str] = &["hello", "bump", "list", "crash"];
+const USER_BINARIES: &[&str] =
+    &["hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee"];
 
 fn main() {
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -55,6 +55,9 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "capability::table_full", run: capability::table_full },
     TestCase { name: "capability::bad_slot", run: capability::bad_slot },
     TestCase { name: "capability::frame_cap_lifecycle", run: capability::frame_cap_lifecycle },
+    TestCase { name: "capability::cpu_charge_lifecycle", run: capability::cpu_charge_lifecycle },
+    TestCase { name: "capability::cpu_charge_rights_denied", run: capability::cpu_charge_rights_denied },
+    TestCase { name: "capability::cpu_charge_wrong_type", run: capability::cpu_charge_wrong_type },
 ];
 
 /// Run every registered test. Returns true if all passed.

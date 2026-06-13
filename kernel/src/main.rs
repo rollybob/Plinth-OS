@@ -10,6 +10,10 @@
 #![feature(abi_x86_interrupt)]
 
 mod capability;
+// The #PF path (self-paging upcall) is only exercised from userspace, which
+// the test build never reaches; silence its dead-code noise there.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod fault;
 mod frame_alloc;
 mod gdt;
 mod interrupts;
@@ -99,11 +103,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // then the same workload runs under two different library OSes
         // with a deliberate crash between them -- the kernel logs the
         // fault, reclaims the process, and keeps going.
+        // Binaries a process may launch with spawn, by id. id 0 = grantee.
+        const SPAWNABLE: &[&[u8]] = &[include_bytes!(env!("GRANTEE_BIN"))];
+        process::set_phys_offset(phys_offset);
+        process::set_spawnable(SPAWNABLE);
+
         const DEMOS: &[(&str, &[u8])] = &[
             ("hello", include_bytes!(env!("HELLO_BIN"))),
             ("bump-demo", include_bytes!(env!("BUMP_BIN"))),
             ("crash-demo", include_bytes!(env!("CRASH_BIN"))),
             ("list-demo", include_bytes!(env!("LIST_BIN"))),
+            ("greedy-demo", include_bytes!(env!("GREEDY_BIN"))),
+            ("lazy-demo", include_bytes!(env!("LAZY_BIN"))),
+            ("spawner-demo", include_bytes!(env!("SPAWNER_BIN"))),
         ];
 
         for (name, binary) in DEMOS {
@@ -114,6 +126,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 }
                 Ok(process::Outcome::Faulted) => {
                     let _ = writeln!(serial, "plinth: {name} faulted");
+                }
+                Ok(process::Outcome::OutOfBudget) => {
+                    let _ = writeln!(serial, "plinth: {name} out of budget");
                 }
                 Err(e) => {
                     let _ = writeln!(serial, "plinth: failed to run {name}: {e}");

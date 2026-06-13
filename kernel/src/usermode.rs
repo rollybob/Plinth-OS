@@ -19,6 +19,11 @@ use core::arch::global_asm;
 /// collide with a real exit code.
 pub const EXIT_FAULTED: u64 = 0xFFFF_FFFF_FFFF_FFFE;
 
+/// kernel_resume value meaning "the process overdrew its CPU budget"
+/// (cpu_charge with no budget left). Like EXIT_FAULTED, it sits above the
+/// 32-bit exit-code range and cannot collide with a real exit code.
+pub const EXIT_OUT_OF_BUDGET: u64 = 0xFFFF_FFFF_FFFF_FFFD;
+
 /// Kernel rsp at the moment enter_user committed to ring 3. Written by
 /// enter_user_asm, read by kernel_resume. Single CPU, no reentrancy.
 #[no_mangle]
@@ -71,6 +76,23 @@ extern "C" {
     /// Abandon the current kernel stack and return from enter_user with
     /// `value`. Only call when user code (or its handler) is on the CPU.
     pub fn kernel_resume(value: u64) -> !;
+}
+
+/// Read the saved kernel-resume anchor. `spawn` snapshots it before a
+/// nested `enter_user` (which overwrites it) and restores it after, so the
+/// parent's eventual exit still longjmps to the right place.
+pub fn kernel_anchor() -> u64 {
+    // SAFETY: scalar read of a single-CPU static; no reference escapes.
+    unsafe { KERNEL_SAVED_RSP }
+}
+
+/// Restore a previously read anchor. See `kernel_anchor`.
+///
+/// # Safety
+/// `value` must be an anchor produced by `kernel_anchor` whose target stack
+/// frame is still live, or the next `kernel_resume` will jump into garbage.
+pub unsafe fn set_kernel_anchor(value: u64) {
+    KERNEL_SAVED_RSP = value;
 }
 
 /// Run user code at `entry` with `user_rsp`. Returns the exit syscall's
