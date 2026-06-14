@@ -29,6 +29,10 @@ mod memory;
 mod process;
 mod serial;
 mod syscall;
+// The timer's IRQ vector is installed in every build (interrupts::init),
+// but it is armed and read only on the userspace boot path.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod timer;
 #[cfg(feature = "tests")]
 mod tests;
 #[cfg_attr(feature = "tests", allow(dead_code))]
@@ -114,6 +118,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
 
+        // Arm the periodic timer. It fires only once a process is in ring 3
+        // (where interrupts are enabled); Stage 1 just counts the ticks, it
+        // does not yet switch processes.
+        timer::arm(100);
+        let _ = writeln!(serial, "plinth: timer armed (100 Hz)");
+
         const DEMOS: &[(&str, &[u8])] = &[
             ("hello", include_bytes!(env!("HELLO_BIN"))),
             ("bump-demo", include_bytes!(env!("BUMP_BIN"))),
@@ -148,7 +158,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
         }
 
-        let _ = writeln!(serial, "plinth: boot ok");
+        // The tick count is proof the timer fired during ring-3 execution.
+        // It is nondeterministic under wall-clock timing (it varies with how
+        // long the demos took) and deterministic only under -icount; nothing
+        // asserts the number, only that "boot ok" was reached.
+        let _ = writeln!(serial, "plinth: boot ok ({} ticks)", timer::ticks());
         qemu_exit(ExitCode::Success)
     }
 }

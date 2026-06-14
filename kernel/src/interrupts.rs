@@ -42,6 +42,10 @@ pub fn init() {
         idt.double_fault
             .set_handler_fn(double_fault_handler)
             .set_stack_index(DOUBLE_FAULT_IST_INDEX);
+        // IRQ0 (the PIT timer) once the PIC is remapped above the exception
+        // range. The vector is installed now; the timer is armed and fires
+        // only later, and only in ring 3 (see `timer`).
+        crate::timer::register(idt);
         (*addr_of!(IDT_STORAGE)).as_ref().unwrap().load();
     }
 }

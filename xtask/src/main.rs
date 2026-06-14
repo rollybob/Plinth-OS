@@ -225,6 +225,16 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool) -> Command {
     // Log CPU resets and exceptions for post-mortem debugging.
     cmd.args(["-D", "qemu_debug.log", "-d", "cpu_reset,int"]);
 
+    // Opt-in deterministic timing: PLINTH_ICOUNT=N ties the guest clock to
+    // retired instructions (shift=N), so timer interrupts fire at the same
+    // instruction every run -- reproducible preemption and reverse-debugging.
+    // Off by default; the kernel never depends on it (it must be correct
+    // under real, nondeterministic timing). PLINTH_ICOUNT set but empty -> 5.
+    if let Ok(v) = std::env::var("PLINTH_ICOUNT") {
+        let shift = if v.trim().is_empty() { "5".to_string() } else { v };
+        cmd.args(["-icount", &format!("shift={shift}")]);
+    }
+
     if gdb {
         // -s: GDB server on :1234; -S: pause until GDB sends 'continue'.
         cmd.args(["-s", "-S"]);

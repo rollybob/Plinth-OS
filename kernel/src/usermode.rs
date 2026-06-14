@@ -44,12 +44,14 @@ enter_user_asm:
 
     // iretq frame, pushed SS / RSP / RFLAGS / CS / RIP.
     // Selectors are asserted against the GDT in gdt::init.
-    // RFLAGS = 0x2: just the reserved bit -- IF clear, ring 3 runs with
-    // interrupts off (no timer exists to deliver; exceptions still fire).
+    // RFLAGS = 0x202: the reserved bit plus IF -- ring 3 runs with
+    // interrupts ENABLED, so the PIT timer fires while a user process is on
+    // the CPU. The kernel still runs with IF clear (SFMask on syscalls,
+    // interrupt gates on traps), so it is never reentered by the timer.
     mov rax, 0x1b
     push rax
     push rsi
-    push 0x2
+    push 0x202
     mov rax, 0x23
     push rax
     push rdi

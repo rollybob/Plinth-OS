@@ -6,6 +6,7 @@ plinth: frame allocator ready
 plinth: GDT + TSS loaded
 plinth: IDT loaded
 plinth: syscall interface ready
+plinth: timer armed
 plinth: running hello
 hello: ring 3
 hello: frame mapped and writable
