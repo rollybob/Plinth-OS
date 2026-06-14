@@ -10,6 +10,11 @@
 #![feature(abi_x86_interrupt)]
 
 mod capability;
+// The ELF loader's parser is exercised by the test suite, but its mapping
+// helpers are only reached from the userspace boot path; silence their
+// dead-code noise in the test build.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod elf;
 // The #PF path (self-paging upcall) is only exercised from userspace, which
 // the test build never reaches; silence its dead-code noise there.
 #[cfg_attr(feature = "tests", allow(dead_code))]
@@ -98,7 +103,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     #[cfg(not(feature = "tests"))]
     {
-        // Built by xtask from the *-user crates, linked at USER_CODE_VA.
+        // Built by xtask from the *-user crates as static ET_EXEC ELFs,
+        // embedded here and parsed by the kernel's ELF loader at run time.
         // The sequence is the demo: hello proves the syscall surface,
         // then the same workload runs under two different library OSes
         // with a deliberate crash between them -- the kernel logs the
@@ -119,7 +125,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ];
 
         for (name, binary) in DEMOS {
-            let _ = writeln!(serial, "plinth: running {name} ({} bytes)", binary.len());
+            let _ = writeln!(serial, "plinth: running {name} ({} bytes)", process::image_size(binary));
             match process::run(binary, phys_offset) {
                 Ok(process::Outcome::Exited(code)) => {
                     let _ = writeln!(serial, "plinth: {name} exited (code {code})");

@@ -14,7 +14,6 @@ use libplinth::{sys_exit, sys_frame_alloc, sys_spawn, sys_write, write_dec, SYS_
 /// Spawnable child id (see the kernel's SPAWNABLE table).
 const GRANTEE_ID: u64 = 0;
 
-#[link_section = ".text.entry"]
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let slot = sys_frame_alloc();

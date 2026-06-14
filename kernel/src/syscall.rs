@@ -470,10 +470,13 @@ fn sys_spawn(child_id: u64, slot: u64) -> u64 {
     let phys = process::phys_offset();
     let mut boot_frames: [Option<(u64, u64)>; process::MAX_BOOT_FRAMES] =
         [None; process::MAX_BOOT_FRAMES];
-    if process::load_and_map(binary, phys, child_l4, &mut boot_frames).is_err() {
-        free_child(child_l4, &boot_frames);
-        return ERR;
-    }
+    let entry = match process::load_and_map(binary, phys, child_l4, &mut boot_frames) {
+        Ok(entry) => entry,
+        Err(_) => {
+            free_child(child_l4, &boot_frames);
+            return ERR;
+        }
+    };
 
     // Commit: move the granted capability out of the parent's table.
     let revoked = {
@@ -498,7 +501,7 @@ fn sys_spawn(child_id: u64, slot: u64) -> u64 {
     // parent is parked in this frame.
     let raw = unsafe {
         spawn_enter(
-            process::USER_CODE_VA,
+            entry,
             process::USER_STACK_TOP,
             child_depth,
             child_l4,

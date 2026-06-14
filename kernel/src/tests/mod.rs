@@ -11,6 +11,7 @@
 //!   [SUITE] N passed, M failed
 
 mod capability;
+mod elf;
 mod frame_alloc;
 
 use crate::frame_alloc::FrameAlloc;
@@ -58,6 +59,25 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "capability::cpu_charge_lifecycle", run: capability::cpu_charge_lifecycle },
     TestCase { name: "capability::cpu_charge_rights_denied", run: capability::cpu_charge_rights_denied },
     TestCase { name: "capability::cpu_charge_wrong_type", run: capability::cpu_charge_wrong_type },
+    TestCase { name: "elf::valid_minimal", run: elf::valid_minimal },
+    TestCase { name: "elf::valid_three_segments", run: elf::valid_three_segments },
+    TestCase { name: "elf::too_small", run: elf::too_small },
+    TestCase { name: "elf::bad_magic", run: elf::bad_magic },
+    TestCase { name: "elf::bad_class", run: elf::bad_class },
+    TestCase { name: "elf::not_exec", run: elf::not_exec },
+    TestCase { name: "elf::bad_machine", run: elf::bad_machine },
+    TestCase { name: "elf::phdrs_out_of_bounds", run: elf::phdrs_out_of_bounds },
+    TestCase { name: "elf::segment_file_range", run: elf::segment_file_range },
+    TestCase { name: "elf::segment_sizes", run: elf::segment_sizes },
+    TestCase { name: "elf::segment_unaligned", run: elf::segment_unaligned },
+    TestCase { name: "elf::segment_out_of_window", run: elf::segment_out_of_window },
+    TestCase { name: "elf::wx_violation", run: elf::wx_violation },
+    TestCase { name: "elf::bad_flags_unreadable", run: elf::bad_flags_unreadable },
+    TestCase { name: "elf::dynamic_interp", run: elf::dynamic_interp },
+    TestCase { name: "elf::no_loadable", run: elf::no_loadable },
+    TestCase { name: "elf::too_large", run: elf::too_large },
+    TestCase { name: "elf::bad_entry", run: elf::bad_entry },
+    TestCase { name: "elf::segment_overlap", run: elf::segment_overlap },
 ];
 
 /// Run every registered test. Returns true if all passed.

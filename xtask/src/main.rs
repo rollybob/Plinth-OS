@@ -11,7 +11,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use object::{Object, ObjectSegment};
 use ovmf_prebuilt::{Arch, FileType, Prebuilt, Source};
 
 fn main() {
@@ -29,10 +28,13 @@ fn main() {
     }
 }
 
-/// User binaries embedded into the kernel. Crate directories are named
-/// {name}-user; flat binaries land in target/user/{name}.bin.
+/// User binaries built by xtask. Crate directories are named {name}-user.
+/// Most are embedded into the kernel (see kernel/build.rs) and the in-kernel
+/// ELF loader maps their PT_LOAD segments. `template` is the build-only
+/// skeleton from GUIDE.md: compiled every build so it cannot rot, but not
+/// embedded or booted.
 const USER_CRATES: &[&str] =
-    &["hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee"];
+    &["hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "template"];
 
 /// Build all user crates, then the kernel + disk image.
 fn build_all() -> PathBuf {
@@ -43,8 +45,10 @@ fn build_all() -> PathBuf {
 }
 
 /// Build one user crate (release: small enough to stay within its page
-/// budget, and the optimizer behavior is what actually ships) and extract
-/// a flat binary from its PT_LOAD segments.
+/// budget, and the optimizer behavior is what actually ships). The crate's
+/// build.rs links it as a static non-PIE ET_EXEC with page-aligned
+/// segments; the kernel embeds the ELF directly and parses it at load time,
+/// so there is no flat-binary step.
 fn build_user_crate(name: &str) {
     let root = workspace_root();
     let crate_dir = root.join(format!("{name}-user"));
@@ -61,51 +65,10 @@ fn build_user_crate(name: &str) {
     assert!(status.success(), "{name}-user build failed");
 
     let elf_path = root.join(format!("target/x86_64-unknown-none/release/{name}-user"));
-    let elf_bytes = std::fs::read(&elf_path)
-        .unwrap_or_else(|e| panic!("failed to read {name}-user ELF: {e}"));
-
-    let flat = extract_flat_binary(&elf_bytes);
-
-    let out_dir = root.join("target/user");
-    std::fs::create_dir_all(&out_dir).expect("failed to create target/user");
-    let bin_path = out_dir.join(format!("{name}.bin"));
-    std::fs::write(&bin_path, &flat).unwrap_or_else(|e| panic!("failed to write {name}.bin: {e}"));
-
-    println!("{name}.bin: {} bytes", flat.len());
-}
-
-/// Project all PT_LOAD segments into one contiguous buffer starting at the
-/// lowest virtual address; gaps (including .bss tails) are zero-filled.
-/// The kernel maps the buffer verbatim at the linker base address.
-fn extract_flat_binary(elf_bytes: &[u8]) -> Vec<u8> {
-    let elf = object::File::parse(elf_bytes).expect("failed to parse user ELF");
-
-    let mut min_va = u64::MAX;
-    let mut max_va = 0u64;
-    for seg in elf.segments() {
-        let size = seg.size();
-        if size == 0 {
-            continue;
-        }
-        let va = seg.address();
-        min_va = min_va.min(va);
-        max_va = max_va.max(va + size);
-    }
-    if min_va == u64::MAX {
-        return Vec::new();
-    }
-
-    let mut flat = vec![0u8; (max_va - min_va) as usize];
-    for seg in elf.segments() {
-        let data = match seg.data() {
-            Ok(d) if !d.is_empty() => d,
-            _ => continue,
-        };
-        let offset = (seg.address() - min_va) as usize;
-        let copy_len = data.len().min(flat.len().saturating_sub(offset));
-        flat[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
-    }
-    flat
+    let size = std::fs::metadata(&elf_path)
+        .unwrap_or_else(|e| panic!("failed to stat {name}-user ELF: {e}"))
+        .len();
+    println!("{name}-user: {size} bytes (ELF)");
 }
 
 // Registers every non-noreturn syscall asm! block in libplinth must

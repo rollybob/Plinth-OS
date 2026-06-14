@@ -42,7 +42,6 @@ extern "C" fn fault_handler(fault_addr: u64) -> ! {
     sys_fault_return()
 }
 
-#[link_section = ".text.entry"]
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     sys_write(b"lazy: registering fault handler\n");

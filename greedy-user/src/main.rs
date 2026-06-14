@@ -16,7 +16,6 @@ use libplinth::{sys_cpu_charge, sys_exit, sys_write, write_dec, CPU_CAP_SLOT};
 /// the budget steps cleanly to zero before the overdraw (1024 / 256 = 4).
 const CHARGE: u64 = 256;
 
-#[link_section = ".text.entry"]
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     sys_write(b"greedy: spending CPU budget\n");

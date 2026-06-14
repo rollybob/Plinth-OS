@@ -13,7 +13,6 @@ const MAP_VA: u64 = libplinth::MAP_BASE + 0x4000;
 
 const PATTERN: u64 = 0xc0de_f00d_0000_0042;
 
-#[link_section = ".text.entry"]
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     sys_write(b"hello: ring 3\n");

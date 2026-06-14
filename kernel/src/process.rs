@@ -17,14 +17,22 @@ use spin::Mutex;
 use x86_64::structures::paging::PageTableFlags;
 
 use crate::capability::{Capability, CapObject, CapTable, RIGHT_CONSUME};
+use crate::elf;
 use crate::frame_alloc::{FRAME_ALLOC, FRAME_SIZE};
 use crate::memory;
 use crate::usermode;
 
-/// Where user binaries are loaded. Must match the user crates' linker.ld.
-pub const USER_CODE_VA: u64 = 0x40_0000;
-/// Top of the user stack; pages are mapped below this address.
-pub const USER_STACK_TOP: u64 = 0x80_0000;
+/// The window an ELF image's PT_LOAD segments must fall within. The base
+/// matches the user crates' linker.ld; the end sits below the stack and map
+/// windows, so a segment can never collide with them -- the loader only has
+/// to check containment in this range (see elf::parse).
+pub const USER_IMAGE_BASE: u64 = 0x40_0000;
+pub const USER_IMAGE_END: u64 = 0x0F00_0000;
+
+/// Top of the user stack; pages are mapped below this address. It sits in a
+/// reserved gap above the image window and below the map window, so the
+/// stack is disjoint from both.
+pub const USER_STACK_TOP: u64 = 0x0FF0_0000;
 const USER_STACK_PAGES: u64 = 4;
 
 /// Window in which frame_map accepts user-chosen virtual addresses.
@@ -133,54 +141,59 @@ pub enum Outcome {
     OutOfBudget,
 }
 
-/// Allocate, copy, and map a flat user image's code + stack pages into the
-/// current address space, recording every (va, phys) pair in `boot_frames`
-/// (which the caller must pass zeroed, sized to bound the image). Rolls its
-/// own mappings back on failure. Shared by the top-level loop and `spawn`.
+/// Parse `binary` as a static ET_EXEC ELF, then allocate, copy, and map its
+/// PT_LOAD segments plus a fresh stack into the current address space,
+/// recording every (va, phys) pair in `boot_frames` (which the caller must
+/// pass zeroed, sized to bound the image). Returns the image's entry point.
+/// Rolls its own mappings back on failure. Shared by the top-level loop and
+/// `spawn`.
 pub fn load_and_map(
     binary: &[u8],
     phys_offset: u64,
     l4: u64,
     boot_frames: &mut [Option<(u64, u64)>],
-) -> Result<(), &'static str> {
-    let code_pages = (binary.len() as u64).div_ceil(FRAME_SIZE);
-    if code_pages == 0 {
-        return Err("empty user binary");
-    }
-    if code_pages + USER_STACK_PAGES > boot_frames.len() as u64 {
-        return Err("user binary too large");
-    }
+) -> Result<u64, &'static str> {
+    // Validate before touching a single frame. The page budget for the
+    // image leaves room for the stack in the same boot_frames array.
+    let max_image_pages = (boot_frames.len() as u64).saturating_sub(USER_STACK_PAGES);
+    let image = elf::parse(binary, USER_IMAGE_BASE, USER_IMAGE_END, max_image_pages)
+        .map_err(elf::ElfError::as_str)?;
 
     let mut fa_guard = FRAME_ALLOC.lock();
     let fa = fa_guard.as_mut().ok_or("frame allocator not initialised")?;
 
     let mut next = 0usize;
     let mut setup = || -> Result<(), &'static str> {
-        // Code pages: copied from the embedded binary, zero-padded.
-        // Mapped writable because the flat image carries .data/.bss,
-        // and executable because it carries .text -- page-level W^X
-        // is not worth a segment-aware loader in a toy.
-        for i in 0..code_pages {
-            let phys = fa.alloc().map_err(|_| "out of frames for user code")?;
-            // SAFETY: phys is a freshly allocated frame, reachable
-            // through the bootloader's full physical mapping.
-            unsafe {
-                let dst = (phys_offset + phys) as *mut u8;
-                core::ptr::write_bytes(dst, 0, FRAME_SIZE as usize);
-                let off = (i * FRAME_SIZE) as usize;
-                let end = usize::min(off + FRAME_SIZE as usize, binary.len());
-                core::ptr::copy_nonoverlapping(binary.as_ptr().add(off), dst, end - off);
+        // Image: one frame per page of each PT_LOAD segment. The frame is
+        // zeroed first, then p_filesz bytes are copied in; whatever is left
+        // (the .bss tail past filesz) stays zero. Each page carries the
+        // segment's own W^X permissions -- real per-segment protection,
+        // unlike the old flat loader that mapped everything writable.
+        for seg in image.segments() {
+            let flags = seg.page_flags();
+            for i in 0..seg.pages() {
+                let phys = fa.alloc().map_err(|_| "out of frames for user image")?;
+                // SAFETY: phys is a freshly allocated frame, reachable
+                // through the bootloader's full physical mapping.
+                unsafe {
+                    let dst = (phys_offset + phys) as *mut u8;
+                    core::ptr::write_bytes(dst, 0, FRAME_SIZE as usize);
+                    // Bytes of this segment's file image that land in page i.
+                    let page_lo = (i * FRAME_SIZE) as usize;
+                    if page_lo < seg.filesz {
+                        let copy = usize::min(FRAME_SIZE as usize, seg.filesz - page_lo);
+                        let src = binary.as_ptr().add(seg.offset + page_lo);
+                        core::ptr::copy_nonoverlapping(src, dst, copy);
+                    }
+                }
+                let va = seg.vaddr + i * FRAME_SIZE;
+                memory::map_user_page(l4, fa, va, phys, flags)?;
+                boot_frames[next] = Some((va, phys));
+                next += 1;
             }
-            let va = USER_CODE_VA + i * FRAME_SIZE;
-            let flags = PageTableFlags::PRESENT
-                | PageTableFlags::WRITABLE
-                | PageTableFlags::USER_ACCESSIBLE;
-            memory::map_user_page(l4, fa, va, phys, flags)?;
-            boot_frames[next] = Some((va, phys));
-            next += 1;
         }
 
-        // Stack pages: zeroed, non-executable, below USER_STACK_TOP.
+        // Stack pages: zeroed, writable, non-executable, below USER_STACK_TOP.
         for i in 0..USER_STACK_PAGES {
             let phys = fa.alloc().map_err(|_| "out of frames for user stack")?;
             // SAFETY: as above.
@@ -200,13 +213,23 @@ pub fn load_and_map(
     };
     let result = setup();
     if result.is_err() {
-        // Partial spawn: roll back whatever was mapped before failing.
+        // Partial load: roll back whatever was mapped before failing.
         for entry in boot_frames.iter().flatten() {
             memory::unmap_user_page(l4, entry.0);
             let _ = fa.dealloc(entry.1);
         }
     }
-    result
+    result.map(|()| image.entry)
+}
+
+/// The in-memory footprint of `binary`'s loadable image (sum of PT_LOAD
+/// memsz), for the boot announcement. Returns 0 if the image does not
+/// parse -- the subsequent load surfaces the real error.
+pub fn image_size(binary: &[u8]) -> u64 {
+    let max_image_pages = (MAX_BOOT_FRAMES as u64).saturating_sub(USER_STACK_PAGES);
+    elf::parse(binary, USER_IMAGE_BASE, USER_IMAGE_END, max_image_pages)
+        .map(|img| img.image_bytes())
+        .unwrap_or(0)
 }
 
 /// Build a fresh process: mint its CPU-time budget (always CPU_CAP_SLOT),
@@ -229,18 +252,21 @@ pub fn spawn_process(transferred: Option<Capability>) -> Process {
     proc
 }
 
-/// Load `binary` (a flat image linked at USER_CODE_VA), run it in ring 3
-/// to completion, and tear it down. Returns how it ended.
+/// Load `binary` (a static ET_EXEC ELF), run it in ring 3 to completion,
+/// and tear it down. Returns how it ended.
 pub fn run(binary: &[u8], phys_offset: u64) -> Result<Outcome, &'static str> {
     // A private address space for this process.
     let l4 = memory::create_address_space()?;
 
     // (va, phys) for every page the kernel maps on the process's behalf.
     let mut boot_frames: [Option<(u64, u64)>; MAX_BOOT_FRAMES] = [None; MAX_BOOT_FRAMES];
-    if let Err(e) = load_and_map(binary, phys_offset, l4, &mut boot_frames) {
-        memory::destroy_address_space(l4);
-        return Err(e);
-    }
+    let entry = match load_and_map(binary, phys_offset, l4, &mut boot_frames) {
+        Ok(entry) => entry,
+        Err(e) => {
+            memory::destroy_address_space(l4);
+            return Err(e);
+        }
+    };
 
     let mut proc = spawn_process(None);
     proc.l4 = l4;
@@ -248,7 +274,7 @@ pub fn run(binary: &[u8], phys_offset: u64) -> Result<Outcome, &'static str> {
 
     // Run under the process's own address space; locks are all released here.
     memory::switch_to(l4);
-    let raw = usermode::enter_user(USER_CODE_VA, USER_STACK_TOP);
+    let raw = usermode::enter_user(entry, USER_STACK_TOP);
     memory::switch_to_kernel();
 
     let proc = CURRENT.lock().take().expect("CURRENT vanished during user execution");

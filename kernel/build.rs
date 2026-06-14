@@ -1,6 +1,6 @@
-// Expose the user binaries (built by xtask into target/user/) as env vars
-// so main.rs can embed them with include_bytes!. Run `cargo xtask build`
-// at least once before building the kernel directly.
+// Expose the user-crate release ELFs as env vars so main.rs can embed them
+// with include_bytes!. The kernel's ELF loader parses each at load time.
+// Run `cargo xtask build` at least once before building the kernel directly.
 
 const USER_BINARIES: &[&str] =
     &["hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee"];
@@ -10,8 +10,8 @@ fn main() {
     let workspace_root = manifest_dir.parent().unwrap();
 
     for name in USER_BINARIES {
-        let bin = workspace_root.join(format!("target/user/{name}.bin"));
-        println!("cargo:rerun-if-changed={}", bin.display());
-        println!("cargo:rustc-env={}_BIN={}", name.to_uppercase(), bin.display());
+        let elf = workspace_root.join(format!("target/x86_64-unknown-none/release/{name}-user"));
+        println!("cargo:rerun-if-changed={}", elf.display());
+        println!("cargo:rustc-env={}_BIN={}", name.to_uppercase(), elf.display());
     }
 }

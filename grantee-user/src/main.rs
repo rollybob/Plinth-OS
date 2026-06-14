@@ -16,7 +16,6 @@ const MAP_VA: u64 = MAP_BASE + 0x4000;
 
 const PATTERN: u64 = 0xfeed_face_0000_0042;
 
-#[link_section = ".text.entry"]
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Map the inherited capability at an address of our choosing.

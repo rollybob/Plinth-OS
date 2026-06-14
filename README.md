@@ -16,17 +16,17 @@ This is one boot, verified line-by-line in CI:
 
 ```text
 plinth: kernel entry
-plinth: frame allocator ready (61630 frames free)
+plinth: frame allocator ready (61583 frames free)
 plinth: GDT + TSS loaded
 plinth: IDT loaded
 plinth: syscall interface ready
-plinth: running hello (872 bytes)
+plinth: running hello (635 bytes)
 hello: ring 3
 hello: frame mapped and writable
 hello: done
 plinth: hello exited (code 0)
-plinth: 61630 frames free
-plinth: running bump-demo (4296 bytes)
+plinth: 61583 frames free
+plinth: running bump-demo (4061 bytes)
 demo: policy = bump
 demo: a = 0x10000000
 demo: b = 0x10000600
@@ -35,14 +35,14 @@ demo: c = 0x10000c00
 demo: c got a new address
 demo: kernel frames used: 2
 plinth: bump-demo exited (code 0)
-plinth: 61630 frames free
-plinth: running crash-demo (384 bytes)
+plinth: 61583 frames free
+plinth: running crash-demo (147 bytes)
 crash: about to dereference null
 plinth: [user fault] #PF page fault rip=0x40001a err=0x6 addr=0x0
 plinth: terminating user process
 plinth: crash-demo faulted
-plinth: 61630 frames free
-plinth: running list-demo (6064 bytes)
+plinth: 61583 frames free
+plinth: running list-demo (5822 bytes)
 demo: policy = freelist
 demo: a = 0x10000000
 demo: b = 0x10000600
@@ -51,8 +51,8 @@ demo: c = 0x10000000
 demo: c reused a freed block
 demo: kernel frames used: 1
 plinth: list-demo exited (code 0)
-plinth: 61630 frames free
-plinth: running greedy-demo (1832 bytes)
+plinth: 61583 frames free
+plinth: running greedy-demo (1593 bytes)
 greedy: spending CPU budget
 greedy: charged 256, remaining = 768
 greedy: charged 256, remaining = 512
@@ -60,8 +60,8 @@ greedy: charged 256, remaining = 256
 greedy: charged 256, remaining = 0
 plinth: [out of budget] terminating user process
 plinth: greedy-demo out of budget
-plinth: 61630 frames free
-plinth: running lazy-demo (5712 bytes)
+plinth: 61583 frames free
+plinth: running lazy-demo (5469 bytes)
 lazy: registering fault handler
 lazy: serviced fault at 0x18000000
 lazy: serviced fault at 0x18001000
@@ -69,13 +69,13 @@ lazy: serviced fault at 0x18002000
 lazy: serviced fault at 0x18003000
 lazy: all pages materialized on demand
 plinth: lazy-demo exited (code 0)
-plinth: 61630 frames free
-plinth: running spawner-demo (1888 bytes)
+plinth: 61583 frames free
+plinth: running spawner-demo (1646 bytes)
 spawner: allocated a frame, granting it to a child
 grantee: used granted frame at 0x10004000
 spawner: child returned 42
 plinth: spawner-demo exited (code 0)
-plinth: 61630 frames free
+plinth: 61583 frames free
 plinth: boot ok
 ```
 
@@ -97,8 +97,10 @@ terminates the process, and runs the next one.
 
 **Nothing leaks.** The free-frame count after every teardown is
 identical -- including after the crash, and including bump-demo, whose
-allocator never frees anything. Policies can be lazy; the kernel's
-capability accounting is not.
+allocator never frees anything. (The absolute number tracks the kernel's
+own footprint and shifts as the kernel grows; only its flatness across the
+boot is the point.) Policies can be lazy; the kernel's capability
+accounting is not.
 
 **CPU time is a capability too.** greedy-demo is minted a fixed CPU
 budget at spawn and spends it with `cpu_charge`, watching the balance
@@ -195,7 +197,8 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
   fault.rs         self-paging: #PF upcall to a ring-3 handler + resume
   gdt.rs           GDT/TSS, sysret-compatible selector layout
   memory.rs        per-process address spaces: clone, map, switch, destroy
-  tests/           in-kernel test suite (13 tests, run in QEMU)
+  elf.rs           ELF loader: validate a static ET_EXEC, map PT_LOAD W^X
+  tests/           in-kernel test suite (32 tests, run in QEMU)
 libplinth/   user-side syscall shim -- deliberately NOT a library OS
 libos/       two library OSes: BumpAlloc and FreeListAlloc
 demo-app/    the shared workload, generic over the memory policy
@@ -205,6 +208,7 @@ greedy-user/ deliberate CPU-budget overdraw
 lazy-user/   self-paging: a ring-3 fault handler maps pages on demand
 spawner-user/ allocates a frame and spawns a child, granting the cap
 grantee-user/ spawned child: uses a frame it only holds by transfer
+template-user/ minimal skeleton to copy for a new program (see GUIDE.md)
 xtask/       build orchestration: user binaries, disk image, QEMU,
              smoke + test harnesses, asm clobber lint
 ```
@@ -228,6 +232,16 @@ xtask/       build orchestration: user binaries, disk image, QEMU,
   leaks nothing -- the free-frame count is flat across the whole boot,
   including the spawn, which builds and tears down two. Isolation is what
   lets `spawn` transfer a capability into a genuinely separate domain.
+- **Programs are real ELF images, loaded with W^X.** The kernel parses a
+  static `ET_EXEC` ELF and maps each `PT_LOAD` segment at its own address
+  with exactly the access it asks for: code executable and read-only, data
+  writable and non-executable, never both on one page. Parsing is strict
+  and allocation-free -- every field is bounds-checked against the file and
+  rejected if it is malformed or would place a segment outside the image
+  window, so a bad binary fails to load rather than corrupting anything.
+  This is the same code path an on-disk program would take; today the
+  images are still embedded at build time. (Earlier versions mapped a flat
+  blob writable-and-executable; real per-segment protection replaced that.)
 - **Uniprocessor, on purpose.** SMP would triple the kernel and teach
   nothing about exokernels.
 - **Nine syscalls, and each one past the core five had to earn it.** The
@@ -277,25 +291,43 @@ First build downloads OVMF firmware (cached in `target/ovmf/`) and
 compiles the bootloader; expect a few minutes. Slow machine or CI?
 `PLINTH_QEMU_TIMEOUT=180` extends the QEMU watchdog.
 
+## Writing your own programs
+
+Plinth runs your code in ring 3 over a stable syscall interface.
+[ABI.md](ABI.md) is the contract -- syscalls, executable format, and entry
+state, frozen as v1 -- and [GUIDE.md](GUIDE.md) is the walkthrough: copy
+`template-user/` to start a program, and see how memory policy goes in a
+library OS rather than the kernel. Where the project is headed is in
+[ROADMAP.md](ROADMAP.md); how to contribute is in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Testing
 
 Three layers, all in CI on every push:
 
-1. `cargo xtask test` -- 13 in-kernel unit tests (frame allocator,
-   capability table, CPU-budget charging) executed inside QEMU, reported
+1. `cargo xtask test` -- 32 in-kernel unit tests (frame allocator,
+   capability table, CPU-budget charging, and the ELF loader/validator,
+   whose parser is a pure function over a byte slice) executed inside QEMU,
+   reported
    over a serial protocol (`[PASS]`/`[FAIL]`/`[SUITE]`) that xtask parses.
 2. `cargo xtask smoke` -- full boot with captured serial output,
    asserting every line of the demo narrative above, in order.
 3. `cargo xtask check` -- static lint: every syscall `asm!` block in
    libplinth must declare the full clobber set the kernel ABI implies.
 
-## Limitations (deliberate)
+## Current limitations
 
 Single CPU, single process at a time, no preemption, no disk, no
 network, frames and CPU budgets are the only resource types, and `write`
-is uncapability-gated console output for demo legibility. Each of these
-is a scoping decision, not a roadmap: the project demonstrates the
-exokernel architecture, and stops.
+is uncapability-gated console output for demo legibility. Programs are
+real ELF binaries, but they are still embedded at build time -- there is
+no disk to load them from yet.
+
+These are where Plinth is today, not where it stops. The syscall
+interface is now a documented, versioned contract (see [ABI.md](ABI.md)),
+so you can write your own programs and library OSes against it; growing
+Plinth toward a genuinely usable general-purpose exokernel is the ongoing
+direction.
 
 CPU-budget enforcement is **cooperative**: `cpu_charge` debits the
 budget at points the process chooses, and a process that spins without

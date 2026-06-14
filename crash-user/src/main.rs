@@ -9,7 +9,6 @@
 
 use libplinth::{sys_exit, sys_write};
 
-#[link_section = ".text.entry"]
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     sys_write(b"crash: about to dereference null\n");
