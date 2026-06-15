@@ -46,8 +46,11 @@ against the cost to determinism rather than taken for granted.
   kernel is non-preemptible (it reschedules only out of ring 3). Testing moved
   off the exact boot trace: per-process ordering plus no-leak invariants for
   the interleaving demo, and `pick_next` as unit tests.
-- [ ] **Inter-process communication.** Once processes are concurrent, they
-  need a way to talk.
+- [x] **Inter-process communication.** Synchronous capability-named endpoints
+  (`kernel/src/ipc.rs`): `send`/`recv` rendezvous, capability transfer through
+  messages (zero-copy frame handoff), and `call`/`reply` RPC with a one-shot
+  reply capability. `spawn` is reconciled with the scheduler -- it launches an
+  independent scheduled process and the parent waits with `recv` (the join).
 - [ ] **Storage and a filesystem.** A block device driver and a minimal
   filesystem -- the path to loading programs from disk rather than
   embedding them at build time.

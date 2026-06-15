@@ -420,7 +420,7 @@ fn setup_process(
     id: usize,
     binary: &[u8],
     phys_offset: u64,
-    extra: Option<Capability>,
+    caps: &[Option<Capability>],
 ) -> Result<(), &'static str> {
     let l4 = memory::create_address_space()?;
     let mut boot_frames: [Option<(u64, u64)>; MAX_BOOT_FRAMES] = [None; MAX_BOOT_FRAMES];
@@ -433,9 +433,10 @@ fn setup_process(
     };
 
     let mut proc = process::spawn_process(None);
-    // An optional grant (e.g. an endpoint capability) lands right after the
-    // CPU-time budget -- the next mint -- so it is at a well-known slot.
-    if let Some(cap) = extra {
+    // Grants (e.g. endpoint capabilities) land right after the CPU-time budget,
+    // in mint order, so each is at a well-known slot (the first at
+    // ENDPOINT_SLOT/GRANT_SLOT, the next after, ...).
+    for cap in caps.iter().flatten() {
         if proc.caps.mint(cap.object, cap.rights).is_err() {
             memory::destroy_address_space(l4);
             return Err("capability table full");
@@ -487,7 +488,7 @@ pub fn run(label: &str, binaries: &[&[u8]], phys_offset: u64, extra: &[Option<Ca
 
     for (id, binary) in binaries.iter().take(count).enumerate() {
         let grant = extra.get(id).copied().flatten();
-        if let Err(e) = setup_process(id, binary, phys_offset, grant) {
+        if let Err(e) = setup_process(id, binary, phys_offset, &[grant]) {
             let _ = writeln!(serial, "plinth: {label}: setup of process {id} failed: {e}");
             // Reclaim whatever was set up before aborting the demo.
             teardown_all();
@@ -716,6 +717,24 @@ pub fn block_current(frame_ptr: u64) -> ! {
         table[cur].state = State::Blocked;
         switch_to_next(LauncherOnIdle::Deadlock)
     }
+}
+
+/// Launch `binary` as a new scheduled process while the scheduler is running,
+/// minting `caps` into it. Returns its slot, or None if the process table is
+/// full or setup failed. The new process is Ready and joins the round-robin;
+/// this does not switch to it. Used by `sys_spawn` to make spawn a scheduler
+/// operation (the child runs alongside its parent) rather than synchronous
+/// nesting.
+pub fn spawn(binary: &[u8], phys_offset: u64, caps: &[Option<Capability>]) -> Option<usize> {
+    let id = find_free_slot()?;
+    setup_process(id, binary, phys_offset, caps).ok()?;
+    Some(id)
+}
+
+/// Index of the first Empty table slot, if any.
+fn find_free_slot() -> Option<usize> {
+    // SAFETY: scalar reads of the single-CPU table.
+    unsafe { (*addr_of!(TABLE)).iter().position(|s| s.state == State::Empty) }
 }
 
 /// Reclaim any processes that were set up before a launch aborted. Only used

@@ -134,6 +134,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         timer::arm(100);
         let _ = writeln!(serial, "plinth: timer armed (100 Hz)");
 
+        // The synchronous, one-at-a-time demos (run via process::run). spawn
+        // is no longer synchronous, so the spawner demo now runs under the
+        // scheduler instead (see the spawn demo below).
         const DEMOS: &[(&str, &[u8])] = &[
             ("hello", include_bytes!(env!("HELLO_BIN"))),
             ("bump-demo", include_bytes!(env!("BUMP_BIN"))),
@@ -141,7 +144,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             ("list-demo", include_bytes!(env!("LIST_BIN"))),
             ("greedy-demo", include_bytes!(env!("GREEDY_BIN"))),
             ("lazy-demo", include_bytes!(env!("LAZY_BIN"))),
-            ("spawner-demo", include_bytes!(env!("SPAWNER_BIN"))),
         ];
 
         for (name, binary) in DEMOS {
@@ -275,6 +277,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         let after_rpc = free_frames();
         let _ = writeln!(serial, "plinth: {after_rpc} frames free after rpc");
+
+        // Spawn + wait demo: the kernel launches a single parent process; the
+        // parent `spawn`s a worker (an independent scheduled process), the
+        // worker sends its result back over the channel spawn set up, and the
+        // parent collects it with recv -- the join. This is spawn reconciled
+        // with the scheduler: no synchronous nesting.
+        const SPAWNER_BIN: &[u8] = include_bytes!(env!("SPAWNER_BIN"));
+        let before_spawn = free_frames();
+        let _ = writeln!(serial, "plinth: {before_spawn} frames free before spawn");
+        scheduler::run("spawn demo", &[SPAWNER_BIN], phys_offset, &[None]);
+        let after_spawn = free_frames();
+        let _ = writeln!(serial, "plinth: {after_spawn} frames free after spawn");
 
         // The tick count is proof the timer fired during ring-3 execution.
         // It is nondeterministic under wall-clock timing (it varies with how

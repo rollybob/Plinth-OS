@@ -383,6 +383,10 @@ const SHARE_PATTERN: u64 = 12345;
 const RPC_CALLS: u64 = 3;
 const RPC_OFFSET: u64 = 1000;
 
+/// The result the spawned worker sends back; the parent must report it. Must
+/// match grantee-user's RESULT.
+const SPAWN_RESULT: u64 = 42;
+
 /// Assert each scheduled process printed its own lines in program order.
 /// Under preemption the processes' lines interleave arbitrarily, but a single
 /// process's output is always in program order -- so for each id the counters
@@ -560,6 +564,31 @@ fn check_rpc(actual: &str, calls: u64, offset: u64) {
     println!("smoke: rpc call/reply ok ({calls} calls, replies verified)");
 }
 
+/// Verify spawn + wait: the parent must report the value its spawned worker
+/// sent back over the result channel -- proving the child ran as a scheduled
+/// process and the join (recv on spawn's handle) collected its result.
+fn check_spawn(actual: &str, result: u64) {
+    let marker = "spawner: worker returned ";
+    let got = actual
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix(marker))
+        .and_then(|rest| rest.trim().parse::<u64>().ok());
+    match got {
+        Some(v) if v == result => {
+            println!("smoke: spawn+wait ok (parent collected worker result {v})");
+        }
+        Some(v) => {
+            eprintln!("smoke: FAIL spawn+wait: parent got {v}, expected {result}");
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("smoke: FAIL spawn+wait: no parent result line found");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn smoke(uefi_path: &Path) {
     let actual = run_capture(uefi_path);
     let expected_path = workspace_root().join("expected_boot_log.txt");
@@ -572,6 +601,8 @@ fn smoke(uefi_path: &Path) {
     check_frames_baseline(&actual, "share");
     check_rpc(&actual, RPC_CALLS, RPC_OFFSET);
     check_frames_baseline(&actual, "rpc");
+    check_spawn(&actual, SPAWN_RESULT);
+    check_frames_baseline(&actual, "spawn");
 }
 
 /// Build the kernel with the test suite compiled in. Uses a separate

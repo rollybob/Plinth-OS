@@ -80,23 +80,6 @@ extern "C" {
     pub fn kernel_resume(value: u64) -> !;
 }
 
-/// Read the saved kernel-resume anchor. `spawn` snapshots it before a
-/// nested `enter_user` (which overwrites it) and restores it after, so the
-/// parent's eventual exit still longjmps to the right place.
-pub fn kernel_anchor() -> u64 {
-    // SAFETY: scalar read of a single-CPU static; no reference escapes.
-    unsafe { KERNEL_SAVED_RSP }
-}
-
-/// Restore a previously read anchor. See `kernel_anchor`.
-///
-/// # Safety
-/// `value` must be an anchor produced by `kernel_anchor` whose target stack
-/// frame is still live, or the next `kernel_resume` will jump into garbage.
-pub unsafe fn set_kernel_anchor(value: u64) {
-    KERNEL_SAVED_RSP = value;
-}
-
 /// Run user code at `entry` with `user_rsp`. Returns the exit syscall's
 /// code, or EXIT_FAULTED if an exception terminated the process.
 pub fn enter_user(entry: u64, user_rsp: u64) -> u64 {

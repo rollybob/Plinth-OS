@@ -129,13 +129,17 @@ pub fn sys_cpu_charge(slot: u64, amount: u64) -> u64 {
     syscall3(6, slot, amount, 0)
 }
 
-/// Run the embedded child binary `child_id` to completion in its own
-/// isolated address space, transferring the capability at `slot` into the
-/// child (where it appears at GRANT_SLOT). Returns the child's exit code,
-/// or SYS_ERR if it faulted, overran its budget, or could not be started.
+/// Launch the embedded child binary `child_id` as an independent, concurrently
+/// scheduled process, and return a handle to wait on its result. The kernel
+/// sets up a result channel: the child receives a send capability to it (at
+/// ENDPOINT_SLOT) and this process receives the matching receive capability --
+/// the returned handle. `sys_recv(handle)` collects the child's result (and is
+/// the wait). `transfer_slot` optionally moves one capability into the child
+/// (landing at GRANT_SLOT); pass `NO_CAP` for none. Returns the handle, or
+/// SYS_ERR. Non-blocking -- the child runs alongside the caller.
 #[inline]
-pub fn sys_spawn(child_id: u64, slot: u64) -> u64 {
-    syscall3(9, child_id, slot, 0)
+pub fn sys_spawn(child_id: u64, transfer_slot: u64) -> u64 {
+    syscall3(9, child_id, transfer_slot, 0)
 }
 
 /// Register `entry` as this process's page-fault handler, to run on the

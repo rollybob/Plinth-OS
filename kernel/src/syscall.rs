@@ -44,12 +44,17 @@ use x86_64::registers::rflags::RFlags;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
-use crate::capability::{CapError, CapObject, RIGHT_CONSUME, RIGHT_MAP, RIGHT_READ, RIGHT_WRITE};
+use crate::capability::{
+    CapError, CapObject, Capability, RIGHT_CONSUME, RIGHT_MAP, RIGHT_READ, RIGHT_RECV, RIGHT_SEND,
+    RIGHT_WRITE,
+};
 use crate::fault;
 use crate::frame_alloc::{FRAME_ALLOC, FRAME_SIZE};
 use crate::gdt::Selectors;
+use crate::ipc;
 use crate::memory;
 use crate::process::{self, FaultReg, USER_MAP_BASE, USER_MAP_END};
+use crate::scheduler;
 use crate::serial;
 use crate::usermode;
 
@@ -59,29 +64,24 @@ const MAX_WRITE: u64 = 4096;
 
 const STACK_SIZE: usize = 16 * 4096;
 
-/// Maximum spawn nesting. Each level runs on its own syscall stack so a
-/// child's syscalls never clobber the parent's suspended kernel frame --
-/// the irreducible cost of synchronous spawn-with-return. Fixed, no heap;
-/// depth 0 is the top-level loop.
-pub const MAX_SPAWN_DEPTH: usize = 4;
-
 // The field is storage only -- referenced by address, never read as data.
 #[repr(align(16))]
 struct Stack(#[allow(dead_code)] [u8; STACK_SIZE]);
 
-// One syscall stack per nesting level, laid out contiguously so a level's
-// top is base + (level + 1) * STACK_SIZE.
-static mut SYSCALL_STACKS: [Stack; MAX_SPAWN_DEPTH] =
-    [const { Stack([0; STACK_SIZE]) }; MAX_SPAWN_DEPTH];
+/// The single kernel stack syscalls run on. One suffices: a syscall always
+/// runs to completion before any context switch -- the kernel is
+/// non-preemptible, and the blocking IPC operations enter through their own
+/// interrupt gate (per-process kernel stacks), not `syscall` -- so this stack
+/// is empty whenever another process is scheduled. (Synchronous nested spawn,
+/// which needed a stack per depth, is gone: spawn now launches a scheduled
+/// process instead.)
+static mut SYSCALL_STACK: Stack = Stack([0; STACK_SIZE]);
 
-/// Current spawn nesting depth; selects the active syscall stack.
-static mut SPAWN_DEPTH: usize = 0;
-
-/// Top of the active syscall stack; loaded into rsp by the entry stub.
+/// Top of the syscall stack; loaded into rsp by the entry stub.
 #[no_mangle]
 static mut SYSCALL_STACK_PTR: u64 = 0;
 
-/// User rsp across the syscall. Single CPU, no nesting.
+/// User rsp across the syscall. Single CPU; a syscall never yields.
 #[no_mangle]
 static mut USER_RSP_SAVE: u64 = 0;
 
@@ -120,7 +120,7 @@ pub fn init(sel: &Selectors) {
     // SAFETY: single-threaded boot; MSR writes configure syscall entry
     // exactly once, with selectors asserted by gdt::init.
     unsafe {
-        SYSCALL_STACK_PTR = syscall_stack_top(0);
+        SYSCALL_STACK_PTR = syscall_stack_top();
         Efer::update(|f| f.insert(EferFlags::SYSTEM_CALL_EXTENSIONS));
         Star::write(sel.ucode, sel.udata, sel.kcode, sel.kdata)
             .expect("GDT selector layout incompatible with STAR");
@@ -136,55 +136,10 @@ pub fn init(sel: &Selectors) {
     }
 }
 
-/// Top of the syscall stack for nesting level `depth`.
-fn syscall_stack_top(depth: usize) -> u64 {
-    // SAFETY: address arithmetic over the static array; no reference taken.
-    let base = addr_of!(SYSCALL_STACKS) as u64;
-    base + (depth as u64 + 1) * STACK_SIZE as u64
-}
-
-/// Nesting depth of the currently running process.
-fn current_spawn_depth() -> usize {
-    // SAFETY: scalar read of a single-CPU static.
-    unsafe { SPAWN_DEPTH }
-}
-
-/// Run a child at `entry`/`stack` one nesting level down, in its own address
-/// space (`child_l4`), on its own syscall stack. Saves every transient
-/// global the parent's syscall-return path depends on -- the kernel-resume
-/// anchor, the saved user rsp, the syscall stack pointer, the depth, and the
-/// active address space -- and restores them once the child exits, because
-/// the child's own execution overwrites all of them. `return_l4` is the
-/// parent's address space, made active again before control returns.
-///
-/// # Safety
-/// `child_depth` must be < MAX_SPAWN_DEPTH, the child must be installed as
-/// CURRENT, and the parent must be suspended with its frame live on the
-/// parent's syscall stack.
-unsafe fn spawn_enter(
-    entry: u64,
-    stack: u64,
-    child_depth: usize,
-    child_l4: u64,
-    return_l4: u64,
-) -> u64 {
-    let saved_anchor = usermode::kernel_anchor();
-    let saved_user_rsp = USER_RSP_SAVE;
-    let saved_stack_ptr = SYSCALL_STACK_PTR;
-    let saved_depth = SPAWN_DEPTH;
-
-    SPAWN_DEPTH = child_depth;
-    SYSCALL_STACK_PTR = syscall_stack_top(child_depth);
-    memory::switch_to(child_l4);
-
-    let raw = usermode::enter_user(entry, stack);
-
-    memory::switch_to(return_l4);
-    SPAWN_DEPTH = saved_depth;
-    SYSCALL_STACK_PTR = saved_stack_ptr;
-    USER_RSP_SAVE = saved_user_rsp;
-    usermode::set_kernel_anchor(saved_anchor);
-    raw
+/// Top of the syscall stack.
+fn syscall_stack_top() -> u64 {
+    // SAFETY: address arithmetic over the static; no reference taken.
+    addr_of!(SYSCALL_STACK) as u64 + STACK_SIZE as u64
 }
 
 #[no_mangle]
@@ -441,92 +396,62 @@ fn sys_fault_return() -> u64 {
     fault::resume()
 }
 
-/// spawn(child_id, slot): run an embedded child binary to completion in a
-/// fresh, isolated address space, transferring the capability at `slot` from
-/// the caller into the child (where it lands at GRANT_SLOT). Returns the
-/// child's exit code, or ERR if the child faulted, overran its budget, or
-/// the spawn could not be set up. The child runs synchronously, one nesting
-/// level down, on its own syscall stack and its own page tables.
-fn sys_spawn(child_id: u64, slot: u64) -> u64 {
+/// spawn(child_id, transfer_slot): launch the embedded child `child_id` as an
+/// independent *scheduled* process, and return a handle to wait on its result.
+/// This is the reconciliation of spawn with the preemptive scheduler: instead
+/// of running the child synchronously nested under the caller, the kernel
+/// creates a fresh result endpoint, mints the child a SEND capability to it
+/// (at ENDPOINT_SLOT) and the caller a RECV capability (the returned handle),
+/// and adds the child to the ready set. The child sends its result and exits;
+/// the caller `recv`s the handle to collect it -- that recv IS the wait.
+///
+/// `transfer_slot` optionally moves one capability from the caller into the
+/// child (landing after its endpoint cap); pass `ERR`/`u64::MAX` for none.
+/// Returns the handle slot, or ERR. Non-blocking: the child runs concurrently.
+fn sys_spawn(child_id: u64, transfer_slot: u64) -> u64 {
     let Some(binary) = process::spawnable(child_id as usize) else {
         return ERR;
     };
-    let child_depth = current_spawn_depth() + 1;
-    if child_depth >= MAX_SPAWN_DEPTH {
-        return ERR;
-    }
-    // The parent's address space, to restore when the child returns.
-    let parent_l4 = {
-        let cur = process::CURRENT.lock();
-        match cur.as_ref() {
-            Some(parent) => parent.l4,
-            None => return ERR,
-        }
-    };
-
-    // Build the child's address space and load its image into it.
-    let Ok(child_l4) = memory::create_address_space() else {
-        return ERR;
-    };
     let phys = process::phys_offset();
-    let mut boot_frames: [Option<(u64, u64)>; process::MAX_BOOT_FRAMES] =
-        [None; process::MAX_BOOT_FRAMES];
-    let entry = match process::load_and_map(binary, phys, child_l4, &mut boot_frames) {
-        Ok(entry) => entry,
-        Err(_) => {
-            free_child(child_l4, &boot_frames);
-            return ERR;
-        }
-    };
 
-    // Commit: move the granted capability out of the parent's table.
-    let revoked = {
-        let mut cur = process::CURRENT.lock();
-        cur.as_mut().and_then(|p| p.caps.revoke(slot as usize).ok())
-    };
-    let Some(transferred) = revoked else {
-        free_child(child_l4, &boot_frames);
+    // A fresh result channel for this spawn.
+    let Some(ep) = ipc::create_endpoint() else {
         return ERR;
     };
 
-    // Suspend the parent (it stays in this stack frame, on the parent's
-    // syscall stack, which the child never touches) and install the child.
-    let parent = process::CURRENT.lock().take();
-    let mut child = process::spawn_process(Some(transferred));
-    child.l4 = child_l4;
-    *process::CURRENT.lock() = Some(child);
-
-    // Run the child to completion; spawn_enter switches address space and
-    // syscall stack down and back.
-    // SAFETY: child_depth < MAX_SPAWN_DEPTH; the child is CURRENT and the
-    // parent is parked in this frame.
-    let raw = unsafe {
-        spawn_enter(
-            entry,
-            process::USER_STACK_TOP,
-            child_depth,
-            child_l4,
-            parent_l4,
-        )
+    // Optionally move one capability out of the caller into the child.
+    let transferred = if transfer_slot != ERR {
+        let mut cur = process::CURRENT.lock();
+        match cur.as_mut() {
+            Some(p) => process::revoke_and_unmap(p, transfer_slot as usize),
+            None => None,
+        }
+    } else {
+        None
     };
 
-    // Reclaim the child and its address space, then restore the parent.
-    let child = process::CURRENT.lock().take().expect("child vanished during spawn");
-    process::teardown(child, &boot_frames);
-    memory::destroy_address_space(child_l4);
-    *process::CURRENT.lock() = parent;
-
-    match raw {
-        usermode::EXIT_FAULTED | usermode::EXIT_OUT_OF_BUDGET => ERR,
-        code => code,
+    // Child capabilities: a SEND cap to the result endpoint (ENDPOINT_SLOT),
+    // then the optional transferred capability (GRANT_SLOT).
+    let send_cap = Capability {
+        object: CapObject::Endpoint { id: ep },
+        rights: RIGHT_SEND,
+    };
+    if scheduler::spawn(binary, phys, &[Some(send_cap), transferred]).is_none() {
+        // Could not create the child: undo the capability move (best effort).
+        if let Some(cap) = transferred {
+            let mut cur = process::CURRENT.lock();
+            if let Some(p) = cur.as_mut() {
+                let _ = p.caps.mint(cap.object, cap.rights);
+            }
+        }
+        return ERR;
     }
-}
 
-/// Tear down a half-built child address space (mapped image + page tables)
-/// when a spawn aborts before the child runs.
-fn free_child(child_l4: u64, boot_frames: &[Option<(u64, u64)>]) {
-    let mut throwaway = process::Process::new();
-    throwaway.l4 = child_l4;
-    process::teardown(throwaway, boot_frames);
-    memory::destroy_address_space(child_l4);
+    // The caller's RECV handle on the result channel; recv on it = wait.
+    let handle = {
+        let mut cur = process::CURRENT.lock();
+        cur.as_mut()
+            .and_then(|p| p.caps.mint(CapObject::Endpoint { id: ep }, RIGHT_RECV).ok())
+    };
+    handle.map(|h| h as u64).unwrap_or(ERR)
 }

@@ -8,6 +8,24 @@ released versions do not break it.
 ## [Unreleased]
 
 ### Added
+- Synchronous IPC: capability-named endpoints (`kernel/src/ipc.rs`).
+  `send`/`recv` are a bufferless rendezvous; a message can transfer a
+  capability (a zero-copy frame handoff -- the receiver maps the same physical
+  frame); `call`/`reply` is request/response RPC, where the server answers via
+  a one-shot reply capability and needs no send right of its own. Blocking
+  operations enter through a software-interrupt gate so they reuse the
+  scheduler's context-switch path.
+- `spawn` is reconciled with the scheduler: it launches the child as an
+  independent scheduled process and returns a handle (a receive capability on
+  a result channel); the parent waits by `recv`-ing it. This removed the old
+  synchronous spawn nesting (per-depth syscall stacks and depth limit).
+
+### Changed
+- `spawn` no longer returns the child's exit code synchronously; it returns a
+  wait handle and the child reports results over IPC. (An ABI v2 note is owed
+  before release; ABI v1 still documents the old behavior.)
+
+### Added (scheduler, earlier this cycle)
 - Preemptive round-robin scheduler (`kernel/src/scheduler.rs`): a 100 Hz PIT
   timer preempts ring-3 code, the kernel saves the full interrupted context,
   switches address space and per-process kernel stack, and resumes another
