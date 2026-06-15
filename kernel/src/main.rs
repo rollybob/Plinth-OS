@@ -244,6 +244,38 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let after_share = free_frames();
         let _ = writeln!(serial, "plinth: {after_share} frames free after share");
 
+        // RPC demo: a server and a client over one endpoint, with directional
+        // rights -- the server holds RIGHT_RECV only, the client RIGHT_SEND
+        // only. The client `call`s; the server `recv`s the request with a
+        // one-shot reply capability and answers it (no send right needed -- the
+        // reply cap is the authority).
+        const RPC_BIN: &[u8] = include_bytes!(env!("RPC_BIN"));
+        let before_rpc = free_frames();
+        let _ = writeln!(serial, "plinth: {before_rpc} frames free before rpc");
+        match ipc::create_endpoint() {
+            Some(ep) => {
+                let recv_cap = Capability {
+                    object: CapObject::Endpoint { id: ep },
+                    rights: RIGHT_RECV,
+                };
+                let send_cap = Capability {
+                    object: CapObject::Endpoint { id: ep },
+                    rights: RIGHT_SEND,
+                };
+                scheduler::run(
+                    "rpc demo",
+                    &[RPC_BIN, RPC_BIN],
+                    phys_offset,
+                    &[Some(recv_cap), Some(send_cap)],
+                );
+            }
+            None => {
+                let _ = writeln!(serial, "plinth: rpc demo: no endpoint available");
+            }
+        }
+        let after_rpc = free_frames();
+        let _ = writeln!(serial, "plinth: {after_rpc} frames free after rpc");
+
         // The tick count is proof the timer fired during ring-3 execution.
         // It is nondeterministic under wall-clock timing (it varies with how
         // long the demos took) and deterministic only under -icount; nothing

@@ -4,7 +4,7 @@
 
 const USER_BINARIES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "share",
+    "share", "rpc",
 ];
 
 fn main() {

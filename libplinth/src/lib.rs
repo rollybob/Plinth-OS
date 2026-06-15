@@ -169,6 +169,8 @@ pub fn sys_fault_return() -> ! {
 
 const IPC_SEND: u64 = 0;
 const IPC_RECV: u64 = 1;
+const IPC_CALL: u64 = 2;
+const IPC_REPLY: u64 = 3;
 
 /// No-capability sentinel: pass to a plain `send` (no cap), and the value
 /// `recv` reports for the landing slot when no capability was transferred.
@@ -238,6 +240,48 @@ pub fn sys_recv_cap(ep_slot: u64) -> (u64, u64) {
         );
     }
     (msg, cap_slot)
+}
+
+/// Send a request and block for a reply (RPC). Sends `req` on the endpoint at
+/// `ep_slot` and returns the reply word the server sends back. Returns SYS_ERR
+/// for a bad slot or missing send right. The kernel mints the server a one-shot
+/// reply capability naming this caller; the server answers with `sys_reply`.
+#[inline]
+pub fn sys_call(ep_slot: u64, req: u64) -> u64 {
+    let ret: u64;
+    // SAFETY: as sys_send_cap.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") IPC_CALL => ret,
+            in("rdi") ep_slot,
+            in("rsi") req,
+            out("rdx") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Reply to the caller named by the one-shot reply capability at `reply_slot`
+/// (which `sys_recv_cap` returned when it received a `call`), delivering `msg`
+/// as the caller's `sys_call` result. Consumes the capability. Returns 0, or
+/// SYS_ERR if the slot is not a live reply capability.
+#[inline]
+pub fn sys_reply(reply_slot: u64, msg: u64) -> u64 {
+    let ret: u64;
+    // SAFETY: as sys_send_cap.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") IPC_REPLY => ret,
+            in("rdi") reply_slot,
+            in("rsi") msg,
+            out("rdx") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
 }
 
 // ---------------------------------------------------------------------------

@@ -103,6 +103,10 @@ struct Slot {
     /// Capability slot a blocked *sender* wants transferred with the message,
     /// or `NO_CAP` for a word-only send (ipc.rs owns the sentinel).
     pending_cap: u64,
+    /// True if a blocked sender is a `call` (awaits a reply) rather than a
+    /// plain `send` (which a receiver wakes). Set when blocking, read by the
+    /// receiver to decide whether to wake the sender or mint it a reply cap.
+    pending_call: bool,
 }
 
 impl Slot {
@@ -115,6 +119,7 @@ impl Slot {
             wait_next: None,
             pending_msg: 0,
             pending_cap: u64::MAX,
+            pending_call: false,
         }
     }
 }
@@ -614,13 +619,14 @@ pub fn wait_next(slot: usize) -> Option<usize> {
     unsafe { (*addr_of!(TABLE))[slot].wait_next }
 }
 
-/// Stash / take the message and cap-slot a blocked sender is handing over.
-pub fn set_pending(slot: usize, msg: u64, cap: u64) {
+/// Stash the message, cap-slot, and call-flag a blocked sender carries.
+pub fn set_pending(slot: usize, msg: u64, cap: u64, is_call: bool) {
     // SAFETY: as above.
     unsafe {
         let table = &mut *addr_of_mut!(TABLE);
         table[slot].pending_msg = msg;
         table[slot].pending_cap = cap;
+        table[slot].pending_call = is_call;
     }
 }
 
@@ -632,6 +638,18 @@ pub fn take_pending(slot: usize) -> u64 {
 pub fn take_pending_cap(slot: usize) -> u64 {
     // SAFETY: as above.
     unsafe { (*addr_of!(TABLE))[slot].pending_cap }
+}
+
+pub fn take_pending_call(slot: usize) -> bool {
+    // SAFETY: as above.
+    unsafe { (*addr_of!(TABLE))[slot].pending_call }
+}
+
+/// Is the process in `slot` Blocked? `reply` uses this to confirm the caller a
+/// reply capability names is still awaiting its reply before waking it.
+pub fn is_blocked(slot: usize) -> bool {
+    // SAFETY: scalar read of the single-CPU table.
+    unsafe { (*addr_of!(TABLE))[slot].state == State::Blocked }
 }
 
 /// Wake a Blocked process: make it Ready and write `rax`/`rdx` into its saved

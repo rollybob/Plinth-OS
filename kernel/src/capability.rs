@@ -43,6 +43,13 @@ pub enum CapObject {
     /// endpoint itself owns no poolable resource, so teardown just drops the
     /// slot -- like a CpuTime budget.
     Endpoint { id: usize },
+    /// A one-shot reply capability minted into a server when it receives a
+    /// `call`: it authorizes replying exactly once to the specific caller
+    /// (named by its process-table slot), and is consumed on use. The caller
+    /// is Blocked-awaiting-reply and cannot run or exit until replied, so the
+    /// slot it names always denotes that same caller while the cap exists --
+    /// no generation counter is needed. Owns no poolable resource.
+    Reply { caller: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

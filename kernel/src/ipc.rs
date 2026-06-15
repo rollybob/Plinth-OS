@@ -32,7 +32,7 @@ use core::ptr::{addr_of, addr_of_mut};
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::{PrivilegeLevel, VirtAddr};
 
-use crate::capability::{CapObject, RIGHT_RECV, RIGHT_SEND};
+use crate::capability::{CapObject, Capability, RIGHT_RECV, RIGHT_SEND};
 use crate::process;
 use crate::scheduler::{self, TrapFrame, GP_RAX, GP_RDI, GP_RDX, GP_RSI};
 
@@ -42,6 +42,10 @@ const IPC_VECTOR: usize = 0x80;
 /// IPC operation selectors, passed in rax (mirroring the syscall-number ABI).
 const IPC_SEND: u64 = 0;
 const IPC_RECV: u64 = 1;
+/// call = send a request and block for a reply (RPC); reply = answer the
+/// caller named by a one-shot reply capability.
+const IPC_CALL: u64 = 2;
+const IPC_REPLY: u64 = 3;
 
 /// Error sentinel, same convention as the syscall layer (`u64::MAX`).
 const IPC_ERR: u64 = u64::MAX;
@@ -174,6 +178,8 @@ extern "C" fn ipc_dispatch(frame: *mut TrapFrame) -> u64 {
     match op {
         IPC_SEND => ipc_send(a1, a2, a3, frame as u64),
         IPC_RECV => ipc_recv(a1, frame as u64),
+        IPC_CALL => ipc_call(a1, a2, frame as u64),
+        IPC_REPLY => ipc_reply(a1, a2),
         _ => IPC_ERR,
     }
 }
@@ -199,7 +205,7 @@ fn ipc_send(ep_slot: u64, msg: u64, cap_slot: u64, frame_ptr: u64) -> u64 {
     }
     // No receiver waiting: stash the word + cap slot and block as a sender.
     let cur = scheduler::current_slot();
-    scheduler::set_pending(cur, msg, cap_slot);
+    scheduler::set_pending(cur, msg, cap_slot, false);
     enqueue_waiter(id, cur, true);
     scheduler::block_current(frame_ptr)
 }
@@ -213,9 +219,16 @@ fn ipc_recv(ep_slot: u64, frame_ptr: u64) -> u64 {
     };
     if let Some(sender) = take_waiting_sender(id) {
         let msg = scheduler::take_pending(sender);
+        if scheduler::take_pending_call(sender) {
+            // The sender is a caller awaiting a reply: mint it a one-shot
+            // reply capability into us and leave it Blocked (only `reply`
+            // wakes it). rdx carries the reply cap's slot.
+            let reply_slot = mint_reply_cap_into_current(sender);
+            write_rdx(frame_ptr, reply_slot);
+            return msg;
+        }
+        // Plain send: pull any transferred cap, then wake the sender.
         let sender_cap = scheduler::take_pending_cap(sender);
-        // Rendezvous now: this receiver pulls the transfer out of the blocked
-        // sender into its own table.
         let landing = if sender_cap != NO_CAP {
             transfer_blocked_to_current(sender, sender_cap)
         } else {
@@ -230,6 +243,88 @@ fn ipc_recv(ep_slot: u64, frame_ptr: u64) -> u64 {
     let cur = scheduler::current_slot();
     enqueue_waiter(id, cur, false);
     scheduler::block_current(frame_ptr)
+}
+
+/// call(ep_slot, req): send a request and block for a reply (RPC). Delivers
+/// `req` to a waiting server -- minting it a one-shot reply capability that
+/// names this caller -- and blocks until the server replies; or, if no server
+/// is waiting, blocks as a call-sender until one receives the request. Returns
+/// the reply word (delivered into rax by `reply` via `wake_with`).
+fn ipc_call(ep_slot: u64, req: u64, frame_ptr: u64) -> u64 {
+    let Some(id) = endpoint_id_for(ep_slot, RIGHT_SEND) else {
+        return IPC_ERR;
+    };
+    if let Some(server) = take_waiting_receiver(id) {
+        // A server is waiting: hand over the request with a reply cap naming
+        // us, wake the server, and block awaiting the reply.
+        let caller = scheduler::current_slot();
+        let reply_slot = mint_reply_cap_into_blocked(server, caller);
+        scheduler::wake_with(server, req, reply_slot);
+    } else {
+        // No server yet: block as a call-sender. The receiver will mint the
+        // reply cap and leave us blocked until `reply` wakes us.
+        let cur = scheduler::current_slot();
+        scheduler::set_pending(cur, req, NO_CAP, true);
+        enqueue_waiter(id, cur, true);
+    }
+    // Either way the caller blocks now -- it is not enqueued as a receiver, so
+    // only its reply capability can wake it.
+    scheduler::block_current(frame_ptr)
+}
+
+/// reply(reply_slot, msg): wake the caller named by the one-shot reply
+/// capability at `reply_slot`, delivering `msg` as its `call` result, and
+/// consume the capability. No endpoint right is needed -- holding the reply
+/// cap is the authority. Returns 0, or IPC_ERR if the slot is not a live reply
+/// cap or its caller is no longer awaiting.
+fn ipc_reply(reply_slot: u64, msg: u64) -> u64 {
+    let caller = {
+        let guard = process::CURRENT.lock();
+        match guard
+            .as_ref()
+            .and_then(|p| p.caps.lookup(reply_slot as usize, 0).ok())
+        {
+            Some(cap) => match cap.object {
+                CapObject::Reply { caller } => caller,
+                _ => return IPC_ERR,
+            },
+            None => return IPC_ERR,
+        }
+    };
+    // The caller is pinned Blocked until replied; if it is not Blocked the cap
+    // is stale (should not happen given one-shot consumption).
+    if !scheduler::is_blocked(caller) {
+        return IPC_ERR;
+    }
+    scheduler::wake_with(caller, msg, NO_CAP);
+    // One-shot: consume the reply capability.
+    let mut guard = process::CURRENT.lock();
+    if let Some(p) = guard.as_mut() {
+        let _ = p.caps.revoke(reply_slot as usize);
+    }
+    0
+}
+
+/// Mint a one-shot reply capability naming `caller` into the current (server)
+/// process. Returns its slot, or NO_CAP if the table is full.
+fn mint_reply_cap_into_current(caller: usize) -> u64 {
+    let cap = Capability { object: CapObject::Reply { caller }, rights: 0 };
+    let landing = {
+        let mut guard = process::CURRENT.lock();
+        guard
+            .as_mut()
+            .and_then(|p| p.caps.mint(cap.object, cap.rights).ok())
+    };
+    landing.map(|l| l as u64).unwrap_or(NO_CAP)
+}
+
+/// Mint a one-shot reply capability naming `caller` into the blocked server at
+/// `server`. Returns its slot, or NO_CAP if that table is full.
+fn mint_reply_cap_into_blocked(server: usize, caller: usize) -> u64 {
+    let cap = Capability { object: CapObject::Reply { caller }, rights: 0 };
+    scheduler::mint_into_blocked(server, cap)
+        .map(|l| l as u64)
+        .unwrap_or(NO_CAP)
 }
 
 /// Move the capability at `cap_slot` from the current (sending) process into

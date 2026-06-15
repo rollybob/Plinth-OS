@@ -35,7 +35,7 @@ fn main() {
 /// embedded or booted.
 const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "share", "template",
+    "share", "rpc", "template",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -379,6 +379,10 @@ const IPC_ROUNDS: u64 = 4;
 /// a usable frame, with the producer's data intact). Must match PATTERN.
 const SHARE_PATTERN: u64 = 12345;
 
+/// RPC demo parameters. Must match rpc-user's N and RESP_OFFSET.
+const RPC_CALLS: u64 = 3;
+const RPC_OFFSET: u64 = 1000;
+
 /// Assert each scheduled process printed its own lines in program order.
 /// Under preemption the processes' lines interleave arbitrarily, but a single
 /// process's output is always in program order -- so for each id the counters
@@ -518,6 +522,44 @@ fn check_share(actual: &str, pattern: u64) {
     }
 }
 
+/// Verify the RPC demo: the client's `call N` results must run 0..calls in
+/// program order, each returning `N + offset` -- proving the request reached
+/// the server and the right reply came back to the right caller.
+fn check_rpc(actual: &str, calls: u64, offset: u64) {
+    let lines: Vec<&str> = actual.lines().map(str::trim).collect();
+    let mut n = 0u64;
+    let mut failed = false;
+    for line in &lines {
+        let Some(rest) = line.strip_prefix("client: call ") else {
+            continue;
+        };
+        let Some((i_str, got_str)) = rest.split_once(" got ") else {
+            continue;
+        };
+        let (Ok(i), Ok(got)) = (i_str.trim().parse::<u64>(), got_str.trim().parse::<u64>()) else {
+            continue;
+        };
+        if i != n {
+            eprintln!("smoke: rpc out of order: saw call {i}, expected {n}");
+            failed = true;
+        }
+        if got != n + offset {
+            eprintln!("smoke: rpc call {n}: got {got}, expected {}", n + offset);
+            failed = true;
+        }
+        n += 1;
+    }
+    if n != calls {
+        eprintln!("smoke: rpc: saw {n} calls, expected {calls}");
+        failed = true;
+    }
+    if failed {
+        eprintln!("smoke: FAIL (rpc call/reply)");
+        std::process::exit(1);
+    }
+    println!("smoke: rpc call/reply ok ({calls} calls, replies verified)");
+}
+
 fn smoke(uefi_path: &Path) {
     let actual = run_capture(uefi_path);
     let expected_path = workspace_root().join("expected_boot_log.txt");
@@ -528,6 +570,8 @@ fn smoke(uefi_path: &Path) {
     check_frames_baseline(&actual, "ipc");
     check_share(&actual, SHARE_PATTERN);
     check_frames_baseline(&actual, "share");
+    check_rpc(&actual, RPC_CALLS, RPC_OFFSET);
+    check_frames_baseline(&actual, "rpc");
 }
 
 /// Build the kernel with the test suite compiled in. Uses a separate

@@ -104,4 +104,11 @@ plinth: ipc demo: all done
 plinth: share demo: 2 processes
 plinth: share demo: all done
 
+# Phase 2 IPC, call/reply (RPC): a client calls a server over one endpoint
+# (client SEND-only, server RECV-only). The server answers each call via a
+# one-shot reply capability. The client's "call N got .." lines and the
+# returned values are checked by xtask; frame counts must match.
+plinth: rpc demo: 2 processes
+plinth: rpc demo: all done
+
 plinth: boot ok
