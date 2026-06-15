@@ -170,11 +170,25 @@ pub fn sys_fault_return() -> ! {
 const IPC_SEND: u64 = 0;
 const IPC_RECV: u64 = 1;
 
+/// No-capability sentinel: pass to a plain `send` (no cap), and the value
+/// `recv` reports for the landing slot when no capability was transferred.
+/// A real slot is a small index, so `u64::MAX` is unambiguous.
+pub const NO_CAP: u64 = u64::MAX;
+
 /// Send the one-word message `msg` on the endpoint capability at `ep_slot`,
 /// blocking until a receiver takes it. Returns 0 on success, or SYS_ERR for a
 /// bad slot or missing send right.
 #[inline]
 pub fn sys_send(ep_slot: u64, msg: u64) -> u64 {
+    sys_send_cap(ep_slot, msg, NO_CAP)
+}
+
+/// Like `sys_send`, but also transfer the capability at `cap_slot` to the
+/// receiver (moving it out of this process's table -- and, if it is a mapped
+/// frame, unmapping it here). The receiver learns the cap's new slot from
+/// `sys_recv_cap`. Pass `NO_CAP` for a word-only send.
+#[inline]
+pub fn sys_send_cap(ep_slot: u64, msg: u64, cap_slot: u64) -> u64 {
     let ret: u64;
     // SAFETY: int 0x80 is the kernel's IPC gate; its handler saves and
     // restores every register except rax (the result), so the only state
@@ -185,7 +199,8 @@ pub fn sys_send(ep_slot: u64, msg: u64) -> u64 {
             inlateout("rax") IPC_SEND => ret,
             in("rdi") ep_slot,
             in("rsi") msg,
-            out("rdx") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            in("rdx") cap_slot,
+            out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
             options(nostack),
         );
     }
@@ -194,21 +209,35 @@ pub fn sys_send(ep_slot: u64, msg: u64) -> u64 {
 
 /// Receive a one-word message from the endpoint capability at `ep_slot`,
 /// blocking until a sender arrives. Returns the message, or SYS_ERR for a bad
-/// slot or missing receive right.
+/// slot or missing receive right. Any capability the sender transferred lands
+/// in this process's table but its slot is dropped -- use `sys_recv_cap` when
+/// you expect a capability.
 #[inline]
 pub fn sys_recv(ep_slot: u64) -> u64 {
-    let ret: u64;
-    // SAFETY: as sys_send.
+    let (msg, _cap_slot) = sys_recv_cap(ep_slot);
+    msg
+}
+
+/// Receive a message and any transferred capability. Returns `(msg,
+/// cap_slot)`, where `cap_slot` is where the capability landed in this
+/// process's table, or `NO_CAP` if none was sent.
+#[inline]
+pub fn sys_recv_cap(ep_slot: u64) -> (u64, u64) {
+    let msg: u64;
+    let cap_slot: u64;
+    // SAFETY: as sys_send_cap. recv returns msg in rax and the landing slot
+    // in rdx.
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            inlateout("rax") IPC_RECV => ret,
+            inlateout("rax") IPC_RECV => msg,
             in("rdi") ep_slot,
-            out("rsi") _, out("rdx") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            out("rdx") cap_slot,
+            out("rsi") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
             options(nostack),
         );
     }
-    ret
+    (msg, cap_slot)
 }
 
 // ---------------------------------------------------------------------------

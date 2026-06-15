@@ -35,7 +35,7 @@ fn main() {
 /// embedded or booted.
 const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "template",
+    "share", "template",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -374,6 +374,11 @@ const SCHED_ITERS: u64 = 6;
 /// Rounds the IPC ping-pong demo runs. Must match pingpong-user's ROUNDS.
 const IPC_ROUNDS: u64 = 4;
 
+/// The value share-user's producer writes into the frame it hands off; the
+/// consumer must read exactly this back (proving the capability transfer moved
+/// a usable frame, with the producer's data intact). Must match PATTERN.
+const SHARE_PATTERN: u64 = 12345;
+
 /// Assert each scheduled process printed its own lines in program order.
 /// Under preemption the processes' lines interleave arbitrarily, but a single
 /// process's output is always in program order -- so for each id the counters
@@ -488,6 +493,31 @@ fn find_frame_count(actual: &str, marker: &str) -> Option<u64> {
         .and_then(|l| l.split_whitespace().find_map(|t| t.parse::<u64>().ok()))
 }
 
+/// Verify the capability-transfer demo: the consumer must report reading the
+/// exact value the producer wrote into the handed-off frame. That proves the
+/// transferred capability named a usable frame whose data survived the move.
+fn check_share(actual: &str, pattern: u64) {
+    let marker = "share: consumer got ";
+    let read = actual
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix(marker))
+        .and_then(|rest| rest.trim().parse::<u64>().ok());
+    match read {
+        Some(v) if v == pattern => {
+            println!("smoke: cap-transfer ok (consumer read {v} from the handed-off frame)");
+        }
+        Some(v) => {
+            eprintln!("smoke: FAIL cap-transfer: consumer read {v}, expected {pattern}");
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("smoke: FAIL cap-transfer: no consumer read-back line found");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn smoke(uefi_path: &Path) {
     let actual = run_capture(uefi_path);
     let expected_path = workspace_root().join("expected_boot_log.txt");
@@ -496,6 +526,8 @@ fn smoke(uefi_path: &Path) {
     check_frames_baseline(&actual, "scheduler");
     check_ipc_order(&actual, IPC_ROUNDS);
     check_frames_baseline(&actual, "ipc");
+    check_share(&actual, SHARE_PATTERN);
+    check_frames_baseline(&actual, "share");
 }
 
 /// Build the kernel with the test suite compiled in. Uses a separate

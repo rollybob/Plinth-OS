@@ -312,6 +312,29 @@ pub fn run(binary: &[u8], phys_offset: u64) -> Result<Outcome, &'static str> {
     Ok(outcome)
 }
 
+/// Revoke the capability at `slot` from `proc`, and -- if it is a Frame the
+/// process has mapped -- unmap it too, because the holder is giving the frame
+/// away (the cap and the access must leave together, or the giver could still
+/// reach a frame it no longer owns). Returns the revoked capability for the
+/// receiver to mint. The frame itself is not freed; ownership moves. This is
+/// half of an IPC capability transfer (the mint into the receiver is the
+/// other half); it is also the building block a transfer-over-spawn would use.
+pub fn revoke_and_unmap(proc: &mut Process, slot: usize) -> Option<Capability> {
+    let cap = proc.caps.revoke(slot).ok()?;
+    if matches!(cap.object, CapObject::Frame { .. }) {
+        let l4 = proc.l4;
+        for entry in proc.maps.iter_mut() {
+            if let Some((va, s)) = *entry {
+                if s == slot {
+                    memory::unmap_user_page(l4, va);
+                    *entry = None;
+                }
+            }
+        }
+    }
+    Some(cap)
+}
+
 /// Return everything the process held: frame_map mappings, capability-owned
 /// frames, then the kernel-made code and stack pages. The address space's
 /// own page-table frames are reclaimed by destroy_address_space afterward.

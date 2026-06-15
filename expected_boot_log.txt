@@ -96,4 +96,12 @@ plinth: scheduler demo: all done
 plinth: ipc demo: 2 processes
 plinth: ipc demo: all done
 
+# Phase 2 IPC, capability transfer: a producer fills a frame and hands its
+# capability to a consumer over IPC; the consumer maps the same physical frame
+# and reads the data back. The producer/consumer lines (and the read-back
+# value) are checked per-process by xtask, not here. The frame counts around
+# the demo must match -- ownership moved, so the frame is reclaimed once.
+plinth: share demo: 2 processes
+plinth: share demo: all done
+
 plinth: boot ok

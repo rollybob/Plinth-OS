@@ -100,6 +100,9 @@ struct Slot {
     wait_next: Option<usize>,
     /// Message a blocked *sender* is waiting to hand over (ipc.rs).
     pending_msg: u64,
+    /// Capability slot a blocked *sender* wants transferred with the message,
+    /// or `NO_CAP` for a word-only send (ipc.rs owns the sentinel).
+    pending_cap: u64,
 }
 
 impl Slot {
@@ -111,6 +114,7 @@ impl Slot {
             boot_frames: [None; MAX_BOOT_FRAMES],
             wait_next: None,
             pending_msg: 0,
+            pending_cap: u64::MAX,
         }
     }
 }
@@ -163,6 +167,7 @@ pub struct TrapFrame {
 /// let the IPC layer read syscall-style args from a trap frame and write the
 /// result back (ipc.rs).
 pub const GP_RAX: usize = 0;
+pub const GP_RDX: usize = 3;
 pub const GP_RSI: usize = 4;
 pub const GP_RDI: usize = 5;
 
@@ -609,10 +614,14 @@ pub fn wait_next(slot: usize) -> Option<usize> {
     unsafe { (*addr_of!(TABLE))[slot].wait_next }
 }
 
-/// Stash / take the message a blocked sender is handing over.
-pub fn set_pending(slot: usize, msg: u64) {
+/// Stash / take the message and cap-slot a blocked sender is handing over.
+pub fn set_pending(slot: usize, msg: u64, cap: u64) {
     // SAFETY: as above.
-    unsafe { (*addr_of_mut!(TABLE))[slot].pending_msg = msg }
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        table[slot].pending_msg = msg;
+        table[slot].pending_cap = cap;
+    }
 }
 
 pub fn take_pending(slot: usize) -> u64 {
@@ -620,17 +629,52 @@ pub fn take_pending(slot: usize) -> u64 {
     unsafe { (*addr_of!(TABLE))[slot].pending_msg }
 }
 
-/// Wake a Blocked process: make it Ready and write `val` into the `rax` slot
-/// of its saved trap frame, so when the scheduler resumes it the blocking IPC
-/// call returns `val`.
-pub fn wake_with(slot: usize, val: u64) {
+pub fn take_pending_cap(slot: usize) -> u64 {
+    // SAFETY: as above.
+    unsafe { (*addr_of!(TABLE))[slot].pending_cap }
+}
+
+/// Wake a Blocked process: make it Ready and write `rax`/`rdx` into its saved
+/// trap frame, so when the scheduler resumes it the blocking IPC call returns
+/// those values (rax = the word, rdx = the transferred cap's landing slot or
+/// NO_CAP). The receiver reads both; a woken sender ignores rdx (its send
+/// wrapper treats rdx as clobbered).
+pub fn wake_with(slot: usize, rax: u64, rdx: u64) {
     // SAFETY: the slot is Blocked, so its kernel_rsp points at a valid saved
     // trap frame on its own (live) kernel stack; single CPU, IF=0.
     unsafe {
         let table = &mut *addr_of_mut!(TABLE);
         let frame = table[slot].kernel_rsp as *mut TrapFrame;
-        (*frame).gp[GP_RAX] = val;
+        (*frame).gp[GP_RAX] = rax;
+        (*frame).gp[GP_RDX] = rdx;
         table[slot].state = State::Ready;
+    }
+}
+
+/// Mint `cap` into the table of the Blocked process at `slot`; returns its
+/// landing slot, or None if that process's capability table is full. Used by
+/// the IPC layer to deliver a transferred capability into a blocked receiver.
+pub fn mint_into_blocked(slot: usize, cap: Capability) -> Option<usize> {
+    // SAFETY: single CPU, IF=0; the slot holds a Blocked process.
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        table[slot]
+            .process
+            .as_mut()?
+            .caps
+            .mint(cap.object, cap.rights)
+            .ok()
+    }
+}
+
+/// Revoke (and, if a mapped frame, unmap) the capability at `cap_slot` from
+/// the Blocked process at `slot`. Used when a receiver completes a rendezvous
+/// with a blocked sender that is transferring a capability.
+pub fn revoke_from_blocked(slot: usize, cap_slot: usize) -> Option<Capability> {
+    // SAFETY: single CPU, IF=0; the slot holds a Blocked process.
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        process::revoke_and_unmap(table[slot].process.as_mut()?, cap_slot)
     }
 }
 

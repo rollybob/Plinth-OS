@@ -34,7 +34,7 @@ use x86_64::{PrivilegeLevel, VirtAddr};
 
 use crate::capability::{CapObject, RIGHT_RECV, RIGHT_SEND};
 use crate::process;
-use crate::scheduler::{self, TrapFrame, GP_RAX, GP_RDI, GP_RSI};
+use crate::scheduler::{self, TrapFrame, GP_RAX, GP_RDI, GP_RDX, GP_RSI};
 
 /// Software-interrupt vector for blocking IPC. DPL 3 so ring 3 may `int`.
 const IPC_VECTOR: usize = 0x80;
@@ -45,6 +45,11 @@ const IPC_RECV: u64 = 1;
 
 /// Error sentinel, same convention as the syscall layer (`u64::MAX`).
 const IPC_ERR: u64 = u64::MAX;
+
+/// "No capability" sentinel for the optional cap-transfer slot in `send`, and
+/// for the landing-slot `recv` reports when no cap arrived. A real slot is a
+/// small index, so `u64::MAX` is unambiguous. (libplinth mirrors it.)
+const NO_CAP: u64 = u64::MAX;
 
 /// Bounded endpoint table -- no heap, like the rest of Plinth.
 const MAX_ENDPOINTS: usize = 8;
@@ -160,51 +165,131 @@ pub fn create_endpoint() -> Option<usize> {
 #[no_mangle]
 extern "C" fn ipc_dispatch(frame: *mut TrapFrame) -> u64 {
     // SAFETY: the stub passes a pointer to the trap frame it built on the
-    // current process's kernel stack; valid for this call.
-    let (op, a1, a2) = unsafe {
+    // current process's kernel stack; valid for this call. rax = op, rdi/rsi =
+    // args, rdx = the optional cap slot to transfer (send only).
+    let (op, a1, a2, a3) = unsafe {
         let f = &*frame;
-        (f.gp[GP_RAX], f.gp[GP_RDI], f.gp[GP_RSI])
+        (f.gp[GP_RAX], f.gp[GP_RDI], f.gp[GP_RSI], f.gp[GP_RDX])
     };
     match op {
-        IPC_SEND => ipc_send(a1, a2, frame as u64),
+        IPC_SEND => ipc_send(a1, a2, a3, frame as u64),
         IPC_RECV => ipc_recv(a1, frame as u64),
         _ => IPC_ERR,
     }
 }
 
-/// send(ep_slot, msg): deliver `msg` to a waiting receiver and return 0, or
-/// block until one appears. `frame_ptr` is this call's saved trap frame, used
-/// to resume the sender once a receiver takes the message.
-fn ipc_send(ep_slot: u64, msg: u64, frame_ptr: u64) -> u64 {
+/// send(ep_slot, msg, cap_slot): deliver `msg` (and, if `cap_slot != NO_CAP`,
+/// transfer that capability) to a waiting receiver and return 0, or block
+/// until one appears. `frame_ptr` is this call's saved trap frame, used to
+/// resume the sender once a receiver completes the rendezvous.
+fn ipc_send(ep_slot: u64, msg: u64, cap_slot: u64, frame_ptr: u64) -> u64 {
     let Some(id) = endpoint_id_for(ep_slot, RIGHT_SEND) else {
         return IPC_ERR;
     };
     if let Some(receiver) = take_waiting_receiver(id) {
-        scheduler::wake_with(receiver, msg);
+        // Rendezvous now: this sender does the transfer into the blocked
+        // receiver, then wakes it with the word and the landing slot.
+        let landing = if cap_slot != NO_CAP {
+            transfer_current_to_blocked(receiver, cap_slot)
+        } else {
+            NO_CAP
+        };
+        scheduler::wake_with(receiver, msg, landing);
         return 0;
     }
-    // No receiver waiting: stash the message and block as a sender.
+    // No receiver waiting: stash the word + cap slot and block as a sender.
     let cur = scheduler::current_slot();
-    scheduler::set_pending(cur, msg);
+    scheduler::set_pending(cur, msg, cap_slot);
     enqueue_waiter(id, cur, true);
     scheduler::block_current(frame_ptr)
 }
 
-/// recv(ep_slot): take a waiting sender's message and return it, or block
-/// until a sender appears (then `wake_with` delivers the message in rax).
+/// recv(ep_slot): return a waiting sender's message (rax) and, if it sent a
+/// capability, that cap's landing slot in this process's table (rdx; NO_CAP
+/// otherwise). Blocks until a sender appears.
 fn ipc_recv(ep_slot: u64, frame_ptr: u64) -> u64 {
     let Some(id) = endpoint_id_for(ep_slot, RIGHT_RECV) else {
         return IPC_ERR;
     };
     if let Some(sender) = take_waiting_sender(id) {
         let msg = scheduler::take_pending(sender);
-        scheduler::wake_with(sender, 0); // the sender's send() returns success
+        let sender_cap = scheduler::take_pending_cap(sender);
+        // Rendezvous now: this receiver pulls the transfer out of the blocked
+        // sender into its own table.
+        let landing = if sender_cap != NO_CAP {
+            transfer_blocked_to_current(sender, sender_cap)
+        } else {
+            NO_CAP
+        };
+        scheduler::wake_with(sender, 0, NO_CAP); // the sender's send() returns 0
+        write_rdx(frame_ptr, landing); // report the landing slot in our rdx
         return msg;
     }
-    // No sender waiting: block as a receiver.
+    // No sender waiting: block as a receiver. A later sender does the transfer
+    // and wakes us with (msg, landing) via wake_with.
     let cur = scheduler::current_slot();
     enqueue_waiter(id, cur, false);
     scheduler::block_current(frame_ptr)
+}
+
+/// Move the capability at `cap_slot` from the current (sending) process into
+/// the blocked receiver at `receiver`. Returns the landing slot, or NO_CAP on
+/// failure (best-effort restore to the sender). Takes/releases the CURRENT
+/// lock around the sender side so none is held across the mint.
+fn transfer_current_to_blocked(receiver: usize, cap_slot: u64) -> u64 {
+    let cap = {
+        let mut guard = process::CURRENT.lock();
+        match guard.as_mut() {
+            Some(p) => process::revoke_and_unmap(p, cap_slot as usize),
+            None => None,
+        }
+    };
+    let Some(cap) = cap else {
+        return NO_CAP;
+    };
+    match scheduler::mint_into_blocked(receiver, cap) {
+        Some(landing) => landing as u64,
+        None => {
+            // Receiver's table is full: hand the capability back to the sender.
+            let mut guard = process::CURRENT.lock();
+            if let Some(p) = guard.as_mut() {
+                let _ = p.caps.mint(cap.object, cap.rights);
+            }
+            NO_CAP
+        }
+    }
+}
+
+/// Move the capability at `cap_slot` from the blocked sender at `sender` into
+/// the current (receiving) process. Returns the landing slot, or NO_CAP on
+/// failure (best-effort restore to the still-blocked sender).
+fn transfer_blocked_to_current(sender: usize, cap_slot: u64) -> u64 {
+    let Some(cap) = scheduler::revoke_from_blocked(sender, cap_slot as usize) else {
+        return NO_CAP;
+    };
+    let landing = {
+        let mut guard = process::CURRENT.lock();
+        guard
+            .as_mut()
+            .and_then(|p| p.caps.mint(cap.object, cap.rights).ok())
+    };
+    match landing {
+        Some(l) => l as u64,
+        None => {
+            let _ = scheduler::mint_into_blocked(sender, cap);
+            NO_CAP
+        }
+    }
+}
+
+/// Write `val` into the rdx slot of the trap frame at `frame_ptr`, so the
+/// non-blocking `recv` returns it in rdx (the stub restores rdx on iretq).
+fn write_rdx(frame_ptr: u64, val: u64) {
+    // SAFETY: frame_ptr is this call's trap frame on the current process's
+    // kernel stack; valid for this call.
+    unsafe {
+        (*(frame_ptr as *mut TrapFrame)).gp[GP_RDX] = val;
+    }
 }
 
 /// Resolve `slot` in the current process's table to a live endpoint id,

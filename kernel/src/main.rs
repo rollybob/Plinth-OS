@@ -217,6 +217,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let after_ipc = free_frames();
         let _ = writeln!(serial, "plinth: {after_ipc} frames free after ipc");
 
+        // Capability-transfer / zero-copy demo: a producer fills a frame and
+        // hands its capability to a consumer over IPC; the consumer maps the
+        // same physical frame and reads the data. Ownership moves -- the
+        // producer is unmapped -- so the frame is reclaimed exactly once.
+        const SHARE_BIN: &[u8] = include_bytes!(env!("SHARE_BIN"));
+        let before_share = free_frames();
+        let _ = writeln!(serial, "plinth: {before_share} frames free before share");
+        match ipc::create_endpoint() {
+            Some(ep) => {
+                let cap = Capability {
+                    object: CapObject::Endpoint { id: ep },
+                    rights: RIGHT_SEND | RIGHT_RECV,
+                };
+                scheduler::run(
+                    "share demo",
+                    &[SHARE_BIN, SHARE_BIN],
+                    phys_offset,
+                    &[Some(cap), Some(cap)],
+                );
+            }
+            None => {
+                let _ = writeln!(serial, "plinth: share demo: no endpoint available");
+            }
+        }
+        let after_share = free_frames();
+        let _ = writeln!(serial, "plinth: {after_share} frames free after share");
+
         // The tick count is proof the timer fired during ring-3 execution.
         // It is nondeterministic under wall-clock timing (it varies with how
         // long the demos took) and deterministic only under -icount; nothing

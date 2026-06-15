@@ -2,8 +2,10 @@
 // with include_bytes!. The kernel's ELF loader parses each at load time.
 // Run `cargo xtask build` at least once before building the kernel directly.
 
-const USER_BINARIES: &[&str] =
-    &["hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong"];
+const USER_BINARIES: &[&str] = &[
+    "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
+    "share",
+];
 
 fn main() {
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
