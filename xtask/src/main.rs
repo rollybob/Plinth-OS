@@ -34,7 +34,7 @@ fn main() {
 /// skeleton from GUIDE.md: compiled every build so it cannot rot, but not
 /// embedded or booted.
 const USER_CRATES: &[&str] =
-    &["hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "template"];
+    &["hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "template"];
 
 /// Build all user crates, then the kernel + disk image.
 fn build_all() -> PathBuf {
@@ -364,10 +364,80 @@ fn check_smoke_output(actual: &str, expected_path: &Path) {
     println!("smoke: ok ({} lines verified)", expected.len());
 }
 
+/// Number of scheduler-demo processes and lines each prints. Must match
+/// main.rs (3 instances of spin-user) and spin-user's ITER.
+const SCHED_PROCESSES: u64 = 3;
+const SCHED_ITERS: u64 = 6;
+
+/// Assert each scheduled process printed its own lines in program order.
+/// Under preemption the processes' lines interleave arbitrarily, but a single
+/// process's output is always in program order -- so for each id the counters
+/// it printed must be exactly 0, 1, ..., iters-1. This is the interleaving-
+/// robust replacement for an exact-trace assertion (Design section 2): it does
+/// not care HOW the lines interleave, only that each process's are in order.
+fn check_per_process_order(actual: &str, num_processes: u64, iters: u64) {
+    let lines: Vec<&str> = actual.lines().map(str::trim).collect();
+    let mut failed = false;
+    for id in 0..num_processes {
+        let prefix = format!("spin[{id}] ");
+        let seq: Vec<u64> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix(&prefix))
+            .filter_map(|rest| rest.trim().parse::<u64>().ok())
+            .collect();
+        let want: Vec<u64> = (0..iters).collect();
+        if seq != want {
+            eprintln!("smoke: process {id} out of order: got {seq:?}, want {want:?}");
+            failed = true;
+        }
+    }
+    if failed {
+        eprintln!("smoke: FAIL (per-process ordering)");
+        eprintln!("--- captured output ---");
+        for line in &lines {
+            eprintln!("{line}");
+        }
+        eprintln!("--- end output ---");
+        std::process::exit(1);
+    }
+    println!("smoke: per-process ordering ok ({num_processes} processes x {iters} lines)");
+}
+
+/// The free-frame count printed before and after the scheduler demo must be
+/// identical: every scheduled process is fully reclaimed, so the system
+/// returns to baseline at quiescence (the no-leak invariant, Design section 2).
+fn check_frames_baseline(actual: &str) {
+    let before = find_frame_count(actual, "frames free before scheduler");
+    let after = find_frame_count(actual, "frames free after scheduler");
+    match (before, after) {
+        (Some(b), Some(a)) if a == b => {
+            println!("smoke: frame baseline ok ({b} free, no leak across scheduler)");
+        }
+        (Some(b), Some(a)) => {
+            eprintln!("smoke: FAIL frames leaked across scheduler: before={b}, after={a}");
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("smoke: FAIL could not find scheduler frame-baseline lines");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Pull the integer out of the first line containing `marker`.
+fn find_frame_count(actual: &str, marker: &str) -> Option<u64> {
+    actual
+        .lines()
+        .find(|l| l.contains(marker))
+        .and_then(|l| l.split_whitespace().find_map(|t| t.parse::<u64>().ok()))
+}
+
 fn smoke(uefi_path: &Path) {
     let actual = run_capture(uefi_path);
     let expected_path = workspace_root().join("expected_boot_log.txt");
     check_smoke_output(&actual, &expected_path);
+    check_per_process_order(&actual, SCHED_PROCESSES, SCHED_ITERS);
+    check_frames_baseline(&actual);
 }
 
 /// Build the kernel with the test suite compiled in. Uses a separate

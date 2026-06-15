@@ -252,6 +252,27 @@ pub fn spawn_process(transferred: Option<Capability>) -> Process {
     proc
 }
 
+/// Terminate the process currently on the CPU. Every death site funnels
+/// through here -- the exit syscall, a CPU-budget overdraw, and the fault
+/// handlers -- so the correct unwind happens for the execution model in force:
+///
+/// - Under the preemptive scheduler, reclaim this process and switch to the
+///   next runnable one (or return to the launcher when none remain).
+/// - Otherwise (synchronous, one process at a time), longjmp back into `run`
+///   via `kernel_resume`.
+///
+/// Never returns.
+pub fn exit_current(value: u64) -> ! {
+    if crate::scheduler::active() {
+        crate::scheduler::on_exit(value)
+    } else {
+        // SAFETY: every caller reaches this with user code (or its fault
+        // handler) on the CPU and the synchronous kernel context live; no
+        // locks are held.
+        unsafe { usermode::kernel_resume(value) }
+    }
+}
+
 /// Load `binary` (a static ET_EXEC ELF), run it in ring 3 to completion,
 /// and tear it down. Returns how it ended.
 pub fn run(binary: &[u8], phys_offset: u64) -> Result<Outcome, &'static str> {

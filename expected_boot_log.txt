@@ -80,4 +80,13 @@ grantee: used granted frame at 0x10004000
 spawner: child returned 42
 plinth: spawner-demo exited (code 0)
 
+# Phase 2: the preemptive scheduler launches independent CPU-bound processes
+# and round-robins them under the timer. Their spin[...] lines interleave --
+# that ordering is checked per-process by xtask (check_per_process_order), not
+# here, since the cross-process interleaving is deliberately nondeterministic.
+# These two lines bracket the demo; the frame counts around them must match
+# (check_frames_baseline), proving no process leaked.
+plinth: scheduler demo: 3 processes
+plinth: scheduler: all done
+
 plinth: boot ok

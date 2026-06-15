@@ -27,6 +27,11 @@ mod memory;
 // build stops before userspace, so silence their dead-code noise there.
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod process;
+// The scheduler's pure pick_next is exercised by the test suite; the rest of
+// it (launch/switch/teardown) is only reached from the userspace boot path,
+// so silence that dead-code noise in the test build.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod scheduler;
 mod serial;
 mod syscall;
 // The timer's IRQ vector is installed in every build (interrupts::init),
@@ -157,6 +162,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let _ = writeln!(serial, "plinth: {} frames free", fa.free_frames());
             }
         }
+
+        // Preemptive scheduler demo (Phase 2): launch independent CPU-bound
+        // processes and round-robin them under the timer. Their lines
+        // interleave in the log -- preemption made visible -- while each
+        // process's own lines stay in program order. Frame counts bracket the
+        // demo to show it leaks nothing once every process has exited.
+        const SPIN_BIN: &[u8] = include_bytes!(env!("SPIN_BIN"));
+        let before = frame_alloc::FRAME_ALLOC
+            .lock()
+            .as_ref()
+            .map(|fa| fa.free_frames())
+            .unwrap_or(0);
+        let _ = writeln!(serial, "plinth: {before} frames free before scheduler");
+        scheduler::run(&[SPIN_BIN, SPIN_BIN, SPIN_BIN], phys_offset);
+        let after = frame_alloc::FRAME_ALLOC
+            .lock()
+            .as_ref()
+            .map(|fa| fa.free_frames())
+            .unwrap_or(0);
+        let _ = writeln!(serial, "plinth: {after} frames free after scheduler");
 
         // The tick count is proof the timer fired during ring-3 execution.
         // It is nondeterministic under wall-clock timing (it varies with how

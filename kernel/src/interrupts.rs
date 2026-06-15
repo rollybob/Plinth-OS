@@ -23,6 +23,7 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
 use crate::fault;
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
+use crate::process;
 use crate::serial;
 use crate::usermode;
 
@@ -42,10 +43,10 @@ pub fn init() {
         idt.double_fault
             .set_handler_fn(double_fault_handler)
             .set_stack_index(DOUBLE_FAULT_IST_INDEX);
-        // IRQ0 (the PIT timer) once the PIC is remapped above the exception
-        // range. The vector is installed now; the timer is armed and fires
-        // only later, and only in ring 3 (see `timer`).
-        crate::timer::register(idt);
+        // IRQ0 (the PIT timer): the scheduler installs its naked context-switch
+        // stub at the remapped vector. Installed now; the timer is armed and
+        // fires only later, and only in ring 3 (see `timer` / `scheduler`).
+        crate::scheduler::register(idt);
         (*addr_of!(IDT_STORAGE)).as_ref().unwrap().load();
     }
 }
@@ -75,9 +76,9 @@ fn handle_fault(name: &str, frame: &InterruptStackFrame, err: Option<u64>, addr:
 
     if from_user {
         let _ = writeln!(serial, "plinth: terminating user process");
-        // SAFETY: from_user is only true when the CPU was at CPL 3, so no
-        // kernel lock is held and the saved kernel context is live.
-        unsafe { usermode::kernel_resume(usermode::EXIT_FAULTED) }
+        // from_user means the CPU was at CPL 3, so no kernel lock is held and
+        // the saved context is live. exit_current never returns.
+        process::exit_current(usermode::EXIT_FAULTED)
     }
     panic!("unrecoverable kernel fault: {name}");
 }

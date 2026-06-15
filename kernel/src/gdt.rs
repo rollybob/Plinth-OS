@@ -78,3 +78,17 @@ pub fn init() -> Selectors {
         Selectors { kcode, kdata, ucode, udata }
     }
 }
+
+/// Repoint the kernel stack the CPU switches to on a ring-3 -> ring-0
+/// interrupt (TSS RSP0). The scheduler calls this on every context switch so
+/// the next process's interrupt frame lands on that process's own kernel
+/// stack -- a shared RSP0 stack would clobber a suspended process's saved
+/// frame. `top` must be the highest address of a live, 16-byte-aligned stack.
+pub fn set_kernel_stack(top: u64) {
+    // SAFETY: single CPU; the TSS is mutated only here (between ring-3 runs,
+    // interrupts disabled) and by init() at boot. RSP0 takes effect on the
+    // next privilege-raising interrupt, after this returns.
+    unsafe {
+        (*addr_of_mut!(TSS_STORAGE)).privilege_stack_table[0] = VirtAddr::new(top);
+    }
+}

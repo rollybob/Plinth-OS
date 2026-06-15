@@ -1,15 +1,16 @@
-//! Legacy PIC (8259) + PIT (8254) timer -- the periodic interrupt that will
-//! drive preemptive scheduling.
+//! Legacy PIC (8259) + PIT (8254) timer device -- the periodic interrupt that
+//! drives preemptive scheduling.
 //!
-//! Stage 1 wires the interrupt up but does not yet switch processes: the
-//! handler counts ticks and acknowledges the PIC, then returns to whatever
-//! was running. Its job here is to prove the interrupt plumbing in
-//! isolation before the context-switch work.
+//! This module owns the hardware: remap the PIC off the exception vectors,
+//! program the PIT for a periodic IRQ0, count ticks, and acknowledge the PIC.
+//! The interrupt *handler* and the context switch it drives live in
+//! `scheduler.rs` (which installs the vector and calls `note_tick` + `eoi`
+//! from its `timer_tick`).
 //!
 //! Interrupt discipline (the basis for a non-preemptible kernel): ring 3
 //! runs with interrupts enabled (usermode.rs sets IF in the user RFLAGS),
 //! so the timer fires while a user process is on the CPU. Kernel code always
-//! runs with interrupts disabled -- syscalls mask IF via SFMask, and this
+//! runs with interrupts disabled -- syscalls mask IF via SFMask, and the
 //! handler is reached through an interrupt gate (which clears IF on entry) --
 //! so the kernel is never reentered by the timer and holds no lock across a
 //! tick.
@@ -17,11 +18,11 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::instructions::port::Port;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
 /// IRQ0 is delivered at this vector once the PIC is remapped above the CPU
-/// exception range (which occupies 0..32). Must be >= 32.
-const TIMER_VECTOR: usize = 0x20;
+/// exception range (which occupies 0..32). Must be >= 32. `scheduler::register`
+/// installs the handler here.
+pub const TIMER_VECTOR: usize = 0x20;
 
 // 8259 PIC command/data ports, and the end-of-interrupt command.
 const PIC1_CMD: u16 = 0x20;
@@ -35,16 +36,9 @@ const PIT_CH0: u16 = 0x40;
 const PIT_CMD: u16 = 0x43;
 const PIT_HZ: u32 = 1_193_182;
 
-/// Ticks since the timer was armed. Stage 1's only observable effect; the
-/// scheduler will read it in Stage 2.
+/// Ticks since the timer was armed. The scheduler bumps it once per IRQ0 and
+/// the boot path prints it as proof the timer fired.
 static TICKS: AtomicU64 = AtomicU64::new(0);
-
-/// Install the IRQ0 handler into the IDT. Called while the IDT is being
-/// built, before it is loaded. The timer does not fire until it is armed
-/// (`arm`) AND interrupts are enabled -- which only happens in ring 3.
-pub fn register(idt: &mut InterruptDescriptorTable) {
-    idt[TIMER_VECTOR].set_handler_fn(timer_handler);
-}
 
 /// Remap the PIC off the exception vectors, program the PIT for a periodic
 /// `hz`-Hz IRQ0, and unmask IRQ0 (only). Call once at boot, interrupts off.
@@ -64,6 +58,21 @@ pub fn arm(hz: u32) {
 /// Ticks elapsed since `arm`.
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+/// Record one timer tick. Called once per IRQ0 from `scheduler::timer_tick`.
+pub fn note_tick() {
+    TICKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Acknowledge the interrupt at the master PIC so the next one is delivered.
+/// Called from `scheduler::timer_tick` after the tick is accounted for.
+pub fn eoi() {
+    // SAFETY: PIC1_CMD is the fixed master-PIC command port; writing the EOI
+    // command has no effect other than ending the in-service interrupt.
+    unsafe {
+        Port::<u8>::new(PIC1_CMD).write(PIC_EOI);
+    }
 }
 
 /// ICW1-4: remap master to 0x20..0x27, slave to 0x28..0x2F, 8086 mode.
@@ -98,13 +107,4 @@ unsafe fn program_pit(hz: u32) {
 /// unused port. Real 8259s need it between ICW writes; harmless on QEMU.
 unsafe fn io_wait() {
     Port::<u8>::new(0x80).write(0u8);
-}
-
-extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
-    TICKS.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: acknowledge the interrupt at the master PIC so the next one
-    // will be delivered. No other state is touched (Stage 1 does not switch).
-    unsafe {
-        Port::<u8>::new(PIC1_CMD).write(PIC_EOI);
-    }
 }

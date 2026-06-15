@@ -128,3 +128,12 @@ The reference `*-user` crates do this with a `build.rs` that passes
 - The process starts holding its CPU-time capability at `CPU_CAP_SLOT`,
   plus one transferred capability at `GRANT_SLOT` if it was spawned with a
   grant. All other slots are empty.
+
+The argument rule above governs every program launched through the public
+interface (the boot loader's program set and `spawn`); it is unchanged in v1.
+One internal mechanism is the exception, noted here for completeness: the
+kernel's preemptive **scheduler** passes a small integer process id in `RDI`
+to each process it launches, so several instances of one program can tell
+themselves apart (`_start` reads it as its first C-ABI argument). There is no
+public syscall that launches a scheduled process, so a normally-launched
+program never sees this and may continue to assume `RDI` is unspecified.

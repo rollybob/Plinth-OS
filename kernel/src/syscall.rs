@@ -252,9 +252,10 @@ fn sys_write(ptr: u64, len: u64) -> u64 {
 /// exit(code): never returns to the caller -- control resumes in
 /// process::run on the kernel side.
 fn sys_exit(code: u64) -> u64 {
-    // SAFETY: reached only from the syscall path, so user code was on the
-    // CPU and the saved kernel context is live. No locks are held here.
-    unsafe { usermode::kernel_resume(code & 0xFFFF_FFFF) }
+    // Reached only from the syscall path, so user code was on the CPU and no
+    // locks are held. exit_current picks the right unwind (scheduler switch or
+    // the synchronous kernel_resume) and never returns.
+    process::exit_current(code & 0xFFFF_FFFF)
 }
 
 /// frame_alloc(): allocate one physical frame and mint a capability for
@@ -398,9 +399,9 @@ fn sys_cpu_charge(slot: u64, amount: u64) -> u64 {
             // panic handler), so this holds nothing across kernel_resume.
             let mut serial = serial::init();
             let _ = writeln!(serial, "plinth: [out of budget] terminating user process");
-            // SAFETY: reached from the syscall path, so user code was on
-            // the CPU and the saved kernel context is live; no locks held.
-            unsafe { usermode::kernel_resume(usermode::EXIT_OUT_OF_BUDGET) }
+            // Reached from the syscall path: user code was on the CPU, no
+            // locks held. exit_current never returns.
+            process::exit_current(usermode::EXIT_OUT_OF_BUDGET)
         }
         Err(_) => ERR,
     }

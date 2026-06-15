@@ -16,8 +16,9 @@ A uniprocessor exokernel that boots under QEMU and runs unprivileged
 programs over nine syscalls: physical frames and CPU time as capabilities,
 per-process address spaces, application-level page-fault handling
 (self-paging), and `spawn` with capability transfer into an isolated
-child. One process runs at a time, to completion; there is no timer, disk,
-or network. See the [README](README.md) for the full demo.
+child. A 100 Hz timer preemptively multiplexes the CPU across several
+processes (round-robin); there is no disk or network yet. See the
+[README](README.md) for the full demo.
 
 ## Phase 1 -- an adoptable reference
 
@@ -31,18 +32,20 @@ and small.
   with per-segment W^X, instead of a flat blob. Bring your own program.
 - [x] **Templates and a guide** -- a skeleton program crate and a
   walkthrough of writing programs and library OSes ([GUIDE.md](GUIDE.md)).
-- [ ] **Adoption scaffolding** -- this roadmap, contribution norms, and a
-  changelog (in progress).
+- [x] **Adoption scaffolding** -- this roadmap, contribution norms
+  ([CONTRIBUTING.md](CONTRIBUTING.md)), and a [changelog](CHANGELOG.md).
 
 ## Phase 2 -- a usable general-purpose exokernel
 
 Everything here follows from adding a timer, and each step is weighed
 against the cost to determinism rather than taken for granted.
 
-- [ ] **Timer + preemptive scheduling.** The foundational step, and the one
-  that changes how the kernel is tested: the current line-by-line
-  deterministic boot log gives way to assertion-based tests. Run more than
-  one process, with the kernel deciding when each runs.
+- [x] **Timer + preemptive scheduling.** A 100 Hz PIT preempts ring-3 code;
+  the kernel saves the full context, switches address space and kernel stack,
+  and round-robins independent processes (`kernel/src/scheduler.rs`). The
+  kernel is non-preemptible (it reschedules only out of ring 3). Testing moved
+  off the exact boot trace: per-process ordering plus no-leak invariants for
+  the interleaving demo, and `pick_next` as unit tests.
 - [ ] **Inter-process communication.** Once processes are concurrent, they
   need a way to talk.
 - [ ] **Storage and a filesystem.** A block device driver and a minimal

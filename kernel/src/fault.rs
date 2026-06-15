@@ -242,8 +242,9 @@ extern "C" fn page_fault_dispatch(raw: *const RawTrap) -> ! {
             raw.rip, raw.error_code, cr2
         );
         let _ = writeln!(serial, "plinth: terminating user process");
-        // SAFETY: CPL 3 fault, no locks held, saved kernel context is live.
-        unsafe { usermode::kernel_resume(usermode::EXIT_FAULTED) }
+        // CPL 3 fault, no locks held. exit_current picks the scheduler switch
+        // or the synchronous longjmp and never returns.
+        process::exit_current(usermode::EXIT_FAULTED)
     }
 
     // Kernel-mode #PF is a bug -- including the documented CPL-0 user-pointer

@@ -13,6 +13,7 @@
 mod capability;
 mod elf;
 mod frame_alloc;
+mod scheduler;
 
 use crate::frame_alloc::FrameAlloc;
 use crate::serial;
@@ -78,6 +79,12 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "elf::too_large", run: elf::too_large },
     TestCase { name: "elf::bad_entry", run: elf::bad_entry },
     TestCase { name: "elf::segment_overlap", run: elf::segment_overlap },
+    TestCase { name: "scheduler::picks_next_ready", run: scheduler::picks_next_ready },
+    TestCase { name: "scheduler::skips_empty", run: scheduler::skips_empty },
+    TestCase { name: "scheduler::wraps_around", run: scheduler::wraps_around },
+    TestCase { name: "scheduler::none_when_alone", run: scheduler::none_when_alone },
+    TestCase { name: "scheduler::never_picks_self", run: scheduler::never_picks_self },
+    TestCase { name: "scheduler::round_robin_cycle", run: scheduler::round_robin_cycle },
 ];
 
 /// Run every registered test. Returns true if all passed.

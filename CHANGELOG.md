@@ -7,6 +7,24 @@ released versions do not break it.
 
 ## [Unreleased]
 
+### Added
+- Preemptive round-robin scheduler (`kernel/src/scheduler.rs`): a 100 Hz PIT
+  timer preempts ring-3 code, the kernel saves the full interrupted context,
+  switches address space and per-process kernel stack, and resumes another
+  process. The kernel is non-preemptible (the timer reschedules only out of
+  ring 3), so kernel data structures are never reentered. Crosses the project
+  from one-process-at-a-time to real CPU multiplexing.
+- A `spin-user` demo: the boot path launches three independent CPU-bound
+  processes under the scheduler; their output interleaves in the log
+  (preemption made visible) while each process's own lines stay in program
+  order.
+- `xtask smoke` now also checks per-process ordering (interleaving-robust,
+  replacing an exact-trace assertion) and that free frames return to baseline
+  after the scheduler demo (no leak at quiescence). Scheduler `pick_next`
+  policy is covered by 6 new unit tests.
+- Opt-in `PLINTH_ICOUNT` makes preemptive interleaving reproducible across
+  runs for debugging; the kernel never depends on it.
+
 ## [2.1.0] - 2026-06-14
 
 ### Added
