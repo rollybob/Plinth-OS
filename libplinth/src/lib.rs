@@ -41,6 +41,12 @@ pub const CPU_CAP_SLOT: u64 = 0;
 /// child reads its inherited capability from this slot.
 pub const GRANT_SLOT: u64 = 1;
 
+/// An endpoint capability the kernel grants a scheduler-launched IPC process
+/// lands here too -- the next mint after the CPU budget. Pass it to
+/// sys_send / sys_recv. (Same slot as GRANT_SLOT: a process gets one or the
+/// other depending on how it was launched.)
+pub const ENDPOINT_SLOT: u64 = 1;
+
 /// Demand-paged window. A not-present access here, once the process has
 /// registered a fault handler (sys_fault_reg), is delivered to that handler
 /// instead of killing the process. Inside [MAP_BASE, MAP_END), so the
@@ -149,6 +155,60 @@ pub fn sys_fault_return() -> ! {
     syscall3(8, 0, 0, 0);
     // Reached only if the kernel refused the resume -- treat as fatal.
     sys_exit(120)
+}
+
+// ---------------------------------------------------------------------------
+// IPC (synchronous endpoints)
+// ---------------------------------------------------------------------------
+// The blocking IPC operations enter through a software-interrupt gate
+// (`int 0x80`), NOT `syscall`. A blocking call must be suspendable and
+// resumable with a return value, and the kernel resumes a process by
+// restoring a full register trap frame -- which an interrupt entry saves but
+// the syscall fast path does not. The op selector goes in rax, args in
+// rdi/rsi, result in rax, mirroring the syscall ABI.
+
+const IPC_SEND: u64 = 0;
+const IPC_RECV: u64 = 1;
+
+/// Send the one-word message `msg` on the endpoint capability at `ep_slot`,
+/// blocking until a receiver takes it. Returns 0 on success, or SYS_ERR for a
+/// bad slot or missing send right.
+#[inline]
+pub fn sys_send(ep_slot: u64, msg: u64) -> u64 {
+    let ret: u64;
+    // SAFETY: int 0x80 is the kernel's IPC gate; its handler saves and
+    // restores every register except rax (the result), so the only state
+    // this clobbers is rax. The extra clobbers below are conservative.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") IPC_SEND => ret,
+            in("rdi") ep_slot,
+            in("rsi") msg,
+            out("rdx") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Receive a one-word message from the endpoint capability at `ep_slot`,
+/// blocking until a sender arrives. Returns the message, or SYS_ERR for a bad
+/// slot or missing receive right.
+#[inline]
+pub fn sys_recv(ep_slot: u64) -> u64 {
+    let ret: u64;
+    // SAFETY: as sys_send.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") IPC_RECV => ret,
+            in("rdi") ep_slot,
+            out("rsi") _, out("rdx") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
 }
 
 // ---------------------------------------------------------------------------

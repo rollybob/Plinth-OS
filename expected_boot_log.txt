@@ -87,6 +87,13 @@ plinth: spawner-demo exited (code 0)
 # These two lines bracket the demo; the frame counts around them must match
 # (check_frames_baseline), proving no process leaked.
 plinth: scheduler demo: 3 processes
-plinth: scheduler: all done
+plinth: scheduler demo: all done
+
+# Phase 2 IPC: a pinger and a ponger rendezvous over one synchronous endpoint
+# the kernel grants to both. Their "ping N got .." / "pong N got .." lines
+# interleave -- checked per-process (and for correct exchanged values) by
+# xtask, not here. The frame counts around the demo must match (no leak).
+plinth: ipc demo: 2 processes
+plinth: ipc demo: all done
 
 plinth: boot ok

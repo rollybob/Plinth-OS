@@ -22,6 +22,11 @@ mod fault;
 mod frame_alloc;
 mod gdt;
 mod interrupts;
+// IPC endpoints are driven from the userspace boot path (and the no_mangle
+// dispatcher); create_endpoint is unused in the test build, which stops
+// before userspace.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod ipc;
 mod memory;
 // process/usermode are driven from the normal boot path only; the test
 // build stops before userspace, so silence their dead-code noise there.
@@ -163,25 +168,54 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
         }
 
+        use capability::{Capability, CapObject, RIGHT_RECV, RIGHT_SEND};
+
+        // Free-frame count, for the no-leak-at-quiescence checks below.
+        let free_frames = || {
+            frame_alloc::FRAME_ALLOC
+                .lock()
+                .as_ref()
+                .map(|fa| fa.free_frames())
+                .unwrap_or(0)
+        };
+
         // Preemptive scheduler demo (Phase 2): launch independent CPU-bound
         // processes and round-robin them under the timer. Their lines
         // interleave in the log -- preemption made visible -- while each
         // process's own lines stay in program order. Frame counts bracket the
         // demo to show it leaks nothing once every process has exited.
         const SPIN_BIN: &[u8] = include_bytes!(env!("SPIN_BIN"));
-        let before = frame_alloc::FRAME_ALLOC
-            .lock()
-            .as_ref()
-            .map(|fa| fa.free_frames())
-            .unwrap_or(0);
+        let before = free_frames();
         let _ = writeln!(serial, "plinth: {before} frames free before scheduler");
-        scheduler::run(&[SPIN_BIN, SPIN_BIN, SPIN_BIN], phys_offset);
-        let after = frame_alloc::FRAME_ALLOC
-            .lock()
-            .as_ref()
-            .map(|fa| fa.free_frames())
-            .unwrap_or(0);
+        scheduler::run("scheduler demo", &[SPIN_BIN, SPIN_BIN, SPIN_BIN], phys_offset, &[None, None, None]);
+        let after = free_frames();
         let _ = writeln!(serial, "plinth: {after} frames free after scheduler");
+
+        // IPC demo (Phase 2): a pinger and a ponger rendezvous over one
+        // synchronous endpoint the kernel creates and grants to both. Their
+        // ping/pong lines interleave; each process's own stay in program order.
+        const PINGPONG_BIN: &[u8] = include_bytes!(env!("PINGPONG_BIN"));
+        let before_ipc = free_frames();
+        let _ = writeln!(serial, "plinth: {before_ipc} frames free before ipc");
+        match ipc::create_endpoint() {
+            Some(ep) => {
+                let cap = Capability {
+                    object: CapObject::Endpoint { id: ep },
+                    rights: RIGHT_SEND | RIGHT_RECV,
+                };
+                scheduler::run(
+                    "ipc demo",
+                    &[PINGPONG_BIN, PINGPONG_BIN],
+                    phys_offset,
+                    &[Some(cap), Some(cap)],
+                );
+            }
+            None => {
+                let _ = writeln!(serial, "plinth: ipc demo: no endpoint available");
+            }
+        }
+        let after_ipc = free_frames();
+        let _ = writeln!(serial, "plinth: {after_ipc} frames free after ipc");
 
         // The tick count is proof the timer fired during ring-3 execution.
         // It is nondeterministic under wall-clock timing (it varies with how

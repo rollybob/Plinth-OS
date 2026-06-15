@@ -47,6 +47,9 @@ pub fn init() {
         // stub at the remapped vector. Installed now; the timer is armed and
         // fires only later, and only in ring 3 (see `timer` / `scheduler`).
         crate::scheduler::register(idt);
+        // The blocking IPC operations enter through a software-interrupt gate
+        // (vector 0x80, DPL 3) so they save a full trap frame -- see `ipc`.
+        crate::ipc::register(idt);
         (*addr_of!(IDT_STORAGE)).as_ref().unwrap().load();
     }
 }

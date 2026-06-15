@@ -264,7 +264,9 @@ pub fn spawn_process(transferred: Option<Capability>) -> Process {
 /// Never returns.
 pub fn exit_current(value: u64) -> ! {
     if crate::scheduler::active() {
-        crate::scheduler::on_exit(value)
+        // The scheduler surfaces a process's result via IPC, not this exit
+        // code (Stage 1); reclaim it and run the next process.
+        crate::scheduler::on_exit()
     } else {
         // SAFETY: every caller reaches this with user code (or its fault
         // handler) on the CPU and the synchronous kernel context live; no

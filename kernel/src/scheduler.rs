@@ -45,6 +45,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::VirtAddr;
 
+use crate::capability::Capability;
 use crate::gdt;
 use crate::memory;
 use crate::process::{self, Process, MAX_BOOT_FRAMES, USER_STACK_TOP};
@@ -75,6 +76,12 @@ pub enum State {
     /// On the CPU right now; its `Process` is in `process::CURRENT` and its
     /// saved context does not exist yet (it is live in registers).
     Running,
+    /// Waiting on an IPC endpoint; out of the round-robin rotation until a
+    /// peer wakes it. Like Ready, its `Process` and saved trap frame live in
+    /// the slot; unlike Ready, `pick_next` skips it. Woken by `wake_with`,
+    /// which writes the result into the saved frame and flips it back to
+    /// Ready (see ipc.rs).
+    Blocked,
 }
 
 /// One process's scheduler-side bookkeeping. The `Process` itself is here only
@@ -82,11 +89,17 @@ pub enum State {
 struct Slot {
     state: State,
     process: Option<Process>,
-    /// Kernel rsp where this process's saved trap frame sits (only meaningful
-    /// while Ready).
+    /// Kernel rsp where this process's saved trap frame sits (meaningful
+    /// while Ready or Blocked).
     kernel_rsp: u64,
     /// (va, phys) pairs the kernel mapped for this process, for teardown.
     boot_frames: [Option<(u64, u64)>; MAX_BOOT_FRAMES],
+    /// Intrusive link to the next waiter in an endpoint's queue (ipc.rs).
+    /// Meaningful only while Blocked and enqueued; the queue nodes are the
+    /// process slots themselves, so the wait queue needs no heap.
+    wait_next: Option<usize>,
+    /// Message a blocked *sender* is waiting to hand over (ipc.rs).
+    pending_msg: u64,
 }
 
 impl Slot {
@@ -96,6 +109,8 @@ impl Slot {
             process: None,
             kernel_rsp: 0,
             boot_frames: [None; MAX_BOOT_FRAMES],
+            wait_next: None,
+            pending_msg: 0,
         }
     }
 }
@@ -133,18 +148,23 @@ fn kstack_top(slot: usize) -> u64 {
 /// an iretq frame. Field order matches the stub's push order and the pop
 /// order in `sched_resume` / the `timer_entry` tail.
 #[repr(C)]
-struct TrapFrame {
-    gp: [u64; 15],
-    rip: u64,
-    cs: u64,
-    rflags: u64,
-    rsp: u64,
-    ss: u64,
+pub struct TrapFrame {
+    pub gp: [u64; 15],
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
 }
 
-/// Index of rdi within `gp` (push order rax,rbx,rcx,rdx,rsi,rdi -> 5). The
-/// scheduler plants the process id here so `_start` receives it as arg0.
-const GP_RDI: usize = 5;
+/// Indices within `gp`, in the stub's push order
+/// (rax,rbx,rcx,rdx,rsi,rdi,rbp,r8..r15). `GP_RDI` is where the scheduler
+/// plants the process id so `_start` receives it as arg0; `GP_RAX`/`GP_RSI`
+/// let the IPC layer read syscall-style args from a trap frame and write the
+/// result back (ipc.rs).
+pub const GP_RAX: usize = 0;
+pub const GP_RSI: usize = 4;
+pub const GP_RDI: usize = 5;
 
 /// Kernel rsp captured by `sched_start`, restored by `sched_return_to_kernel`
 /// when the last process exits. Single CPU, no nesting.
@@ -386,7 +406,12 @@ extern "C" fn timer_tick(frame: *const TrapFrame) -> u64 {
 /// loaded image, a fresh `Process`, and a fabricated initial trap frame on the
 /// slot's kernel stack (with rdi = id, so `_start` receives its id). Leaves
 /// the slot Ready. Reuses the same loader the synchronous path uses.
-fn setup_process(id: usize, binary: &[u8], phys_offset: u64) -> Result<(), &'static str> {
+fn setup_process(
+    id: usize,
+    binary: &[u8],
+    phys_offset: u64,
+    extra: Option<Capability>,
+) -> Result<(), &'static str> {
     let l4 = memory::create_address_space()?;
     let mut boot_frames: [Option<(u64, u64)>; MAX_BOOT_FRAMES] = [None; MAX_BOOT_FRAMES];
     let entry = match process::load_and_map(binary, phys_offset, l4, &mut boot_frames) {
@@ -398,6 +423,14 @@ fn setup_process(id: usize, binary: &[u8], phys_offset: u64) -> Result<(), &'sta
     };
 
     let mut proc = process::spawn_process(None);
+    // An optional grant (e.g. an endpoint capability) lands right after the
+    // CPU-time budget -- the next mint -- so it is at a well-known slot.
+    if let Some(cap) = extra {
+        if proc.caps.mint(cap.object, cap.rights).is_err() {
+            memory::destroy_address_space(l4);
+            return Err("capability table full");
+        }
+    }
     proc.l4 = l4;
 
     // SAFETY: id < MAX_PROCESSES (checked by the caller); the kernel stack and
@@ -437,14 +470,15 @@ unsafe fn fabricate_initial_frame(id: usize, entry: u64) -> u64 {
 /// timer until all have exited. Returns to the boot path when the last one
 /// exits. Per design D4 these are kernel-launched, independent processes; this
 /// does not use (or compose with) `spawn`.
-pub fn run(binaries: &[&[u8]], phys_offset: u64) {
+pub fn run(label: &str, binaries: &[&[u8]], phys_offset: u64, extra: &[Option<Capability>]) {
     let mut serial = serial::init();
     let count = binaries.len().min(MAX_PROCESSES);
-    let _ = writeln!(serial, "plinth: scheduler demo: {count} processes");
+    let _ = writeln!(serial, "plinth: {label}: {count} processes");
 
     for (id, binary) in binaries.iter().take(count).enumerate() {
-        if let Err(e) = setup_process(id, binary, phys_offset) {
-            let _ = writeln!(serial, "plinth: scheduler: setup of process {id} failed: {e}");
+        let grant = extra.get(id).copied().flatten();
+        if let Err(e) = setup_process(id, binary, phys_offset, grant) {
+            let _ = writeln!(serial, "plinth: {label}: setup of process {id} failed: {e}");
             // Reclaim whatever was set up before aborting the demo.
             teardown_all();
             return;
@@ -473,14 +507,14 @@ pub fn run(binaries: &[&[u8]], phys_offset: u64) {
     // the kernel address space in on_exit, but be explicit.
     memory::switch_to_kernel();
     SCHEDULER_ACTIVE.store(false, Ordering::Relaxed);
-    let _ = writeln!(serial, "plinth: scheduler: all done");
+    let _ = writeln!(serial, "plinth: {label}: all done");
 }
 
 /// Reclaim the process currently on the CPU and continue: switch to the next
 /// runnable process, or, if none remain, return to `run`. Reached from
 /// `process::exit_current` for every scheduled-process death (exit, fault,
 /// budget overdraw). Never returns to its caller.
-pub fn on_exit(value: u64) -> ! {
+pub fn on_exit() -> ! {
     let cur = unsafe { CURRENT_SLOT };
 
     // Take the dying process out of CURRENT and reclaim it. Move to the kernel
@@ -501,33 +535,124 @@ pub fn on_exit(value: u64) -> ! {
         table[cur] = Slot::empty();
     }
 
-    // Switch to the next runnable process, or return to the launcher.
+    // The current process is gone, so when nothing else is runnable it means
+    // every process has exited -> return to the launcher.
+    unsafe { switch_to_next(LauncherOnIdle::Return) }
+}
+
+/// What to do when no process is runnable after the current one leaves the CPU.
+enum LauncherOnIdle {
+    /// Every process has exited -> return from `run` (used by `on_exit`).
+    Return,
+    /// The current process blocked but is still live -> nobody can run, which
+    /// for a CPU-bound IPC system means a genuine deadlock (used by
+    /// `block_current`).
+    Deadlock,
+}
+
+/// Pick the next Ready process and resume it, or handle the no-runnable case
+/// per `on_idle`. Shared by `on_exit` and `block_current`; never returns.
+///
+/// # Safety
+/// Caller must have already removed the leaving process from `CURRENT` (taken
+/// it for teardown, or parked it in its slot as Blocked) and must hold no
+/// locks.
+unsafe fn switch_to_next(on_idle: LauncherOnIdle) -> ! {
+    let cur = CURRENT_SLOT;
     match pick_next(&states(), cur) {
         Some(next) => {
-            // SAFETY: next is Ready, so its slot holds a Process and a valid
-            // saved frame. No lock held across sched_resume.
-            unsafe {
-                let table = &mut *addr_of_mut!(TABLE);
-                let nproc = table[next]
-                    .process
-                    .take()
-                    .expect("Ready slot has no process");
-                table[next].state = State::Running;
-                let rsp = table[next].kernel_rsp;
-                let l4 = nproc.l4;
-                *process::CURRENT.lock() = Some(nproc);
-                CURRENT_SLOT = next;
-                memory::switch_to(l4);
-                gdt::set_kernel_stack(kstack_top(next));
-                sched_resume(rsp)
-            }
+            let table = &mut *addr_of_mut!(TABLE);
+            let nproc = table[next]
+                .process
+                .take()
+                .expect("Ready slot has no process");
+            table[next].state = State::Running;
+            let rsp = table[next].kernel_rsp;
+            let l4 = nproc.l4;
+            *process::CURRENT.lock() = Some(nproc);
+            CURRENT_SLOT = next;
+            memory::switch_to(l4);
+            gdt::set_kernel_stack(kstack_top(next));
+            sched_resume(rsp)
         }
-        None => {
-            // Last process: longjmp back into run (no locks held here).
+        None => match on_idle {
             // SAFETY: sched_start saved the anchor before entering the first
             // process, and its stack frame is still live.
-            unsafe { sched_return_to_kernel(value) }
-        }
+            LauncherOnIdle::Return => sched_return_to_kernel(0),
+            LauncherOnIdle::Deadlock => {
+                panic!("scheduler: every process is blocked (IPC deadlock)")
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blocking support for IPC (ipc.rs). The endpoint objects and the matching
+// policy live in ipc.rs; the scheduler owns the process state transitions and
+// the intrusive wait-queue links (which live in the slots).
+// ---------------------------------------------------------------------------
+
+/// Index of the process currently on the CPU.
+pub fn current_slot() -> usize {
+    // SAFETY: scalar read of a single-CPU static.
+    unsafe { CURRENT_SLOT }
+}
+
+/// Set / read a slot's intrusive wait-queue link.
+pub fn set_wait_next(slot: usize, next: Option<usize>) {
+    // SAFETY: single CPU, IF=0; reached only from IPC dispatch.
+    unsafe { (*addr_of_mut!(TABLE))[slot].wait_next = next }
+}
+
+pub fn wait_next(slot: usize) -> Option<usize> {
+    // SAFETY: as above.
+    unsafe { (*addr_of!(TABLE))[slot].wait_next }
+}
+
+/// Stash / take the message a blocked sender is handing over.
+pub fn set_pending(slot: usize, msg: u64) {
+    // SAFETY: as above.
+    unsafe { (*addr_of_mut!(TABLE))[slot].pending_msg = msg }
+}
+
+pub fn take_pending(slot: usize) -> u64 {
+    // SAFETY: as above.
+    unsafe { (*addr_of!(TABLE))[slot].pending_msg }
+}
+
+/// Wake a Blocked process: make it Ready and write `val` into the `rax` slot
+/// of its saved trap frame, so when the scheduler resumes it the blocking IPC
+/// call returns `val`.
+pub fn wake_with(slot: usize, val: u64) {
+    // SAFETY: the slot is Blocked, so its kernel_rsp points at a valid saved
+    // trap frame on its own (live) kernel stack; single CPU, IF=0.
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        let frame = table[slot].kernel_rsp as *mut TrapFrame;
+        (*frame).gp[GP_RAX] = val;
+        table[slot].state = State::Ready;
+    }
+}
+
+/// Park the current process as Blocked (saving the trap frame the IPC stub
+/// built) and switch to the next runnable process. The caller (ipc.rs) must
+/// have already enqueued the current slot on the endpoint it is waiting for.
+/// Never returns to its caller; the process resumes later via `wake_with` +
+/// the scheduler picking it up.
+pub fn block_current(frame_ptr: u64) -> ! {
+    // SAFETY: reached from the IPC interrupt handler with IF=0 and no locks
+    // held; CURRENT holds the running process.
+    unsafe {
+        let cur = CURRENT_SLOT;
+        let running = process::CURRENT
+            .lock()
+            .take()
+            .expect("no CURRENT process to block");
+        let table = &mut *addr_of_mut!(TABLE);
+        table[cur].kernel_rsp = frame_ptr;
+        table[cur].process = Some(running);
+        table[cur].state = State::Blocked;
+        switch_to_next(LauncherOnIdle::Deadlock)
     }
 }
 

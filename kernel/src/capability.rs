@@ -19,6 +19,11 @@ pub const RIGHT_MAP: u8 = 1 << 2;
 /// and a CpuTime capability never carries RIGHT_MAP, so the rights check
 /// alone keeps the two syscall families from touching the wrong object.
 pub const RIGHT_CONSUME: u8 = 1 << 3;
+/// The right to send on / receive from an Endpoint. Directional, so a
+/// capability can grant one half of a channel without the other -- a client
+/// gets RIGHT_SEND, a server RIGHT_RECV, on the same endpoint.
+pub const RIGHT_SEND: u8 = 1 << 4;
+pub const RIGHT_RECV: u8 = 1 << 5;
 
 pub const MAX_CAPS: usize = 16;
 
@@ -33,6 +38,11 @@ pub enum CapObject {
     /// The kernel mints it at spawn; teardown reclaims the slot but the
     /// "resource" (CPU time) is not poolable, so nothing returns anywhere.
     CpuTime { budget: u64 },
+    /// A synchronous IPC endpoint, named by index into the kernel endpoint
+    /// table. The holder may send and/or receive (per its rights). The
+    /// endpoint itself owns no poolable resource, so teardown just drops the
+    /// slot -- like a CpuTime budget.
+    Endpoint { id: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

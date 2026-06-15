@@ -33,8 +33,10 @@ fn main() {
 /// ELF loader maps their PT_LOAD segments. `template` is the build-only
 /// skeleton from GUIDE.md: compiled every build so it cannot rot, but not
 /// embedded or booted.
-const USER_CRATES: &[&str] =
-    &["hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "template"];
+const USER_CRATES: &[&str] = &[
+    "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
+    "template",
+];
 
 /// Build all user crates, then the kernel + disk image.
 fn build_all() -> PathBuf {
@@ -369,6 +371,9 @@ fn check_smoke_output(actual: &str, expected_path: &Path) {
 const SCHED_PROCESSES: u64 = 3;
 const SCHED_ITERS: u64 = 6;
 
+/// Rounds the IPC ping-pong demo runs. Must match pingpong-user's ROUNDS.
+const IPC_ROUNDS: u64 = 4;
+
 /// Assert each scheduled process printed its own lines in program order.
 /// Under preemption the processes' lines interleave arbitrarily, but a single
 /// process's output is always in program order -- so for each id the counters
@@ -403,25 +408,76 @@ fn check_per_process_order(actual: &str, num_processes: u64, iters: u64) {
     println!("smoke: per-process ordering ok ({num_processes} processes x {iters} lines)");
 }
 
-/// The free-frame count printed before and after the scheduler demo must be
-/// identical: every scheduled process is fully reclaimed, so the system
-/// returns to baseline at quiescence (the no-leak invariant, Design section 2).
-fn check_frames_baseline(actual: &str) {
-    let before = find_frame_count(actual, "frames free before scheduler");
-    let after = find_frame_count(actual, "frames free after scheduler");
+/// The free-frame count printed before and after a demo named `name` must be
+/// identical: every process is fully reclaimed, so the system returns to
+/// baseline at quiescence (the no-leak invariant, Design section 2).
+fn check_frames_baseline(actual: &str, name: &str) {
+    let before = find_frame_count(actual, &format!("frames free before {name}"));
+    let after = find_frame_count(actual, &format!("frames free after {name}"));
     match (before, after) {
         (Some(b), Some(a)) if a == b => {
-            println!("smoke: frame baseline ok ({b} free, no leak across scheduler)");
+            println!("smoke: {name} frame baseline ok ({b} free, no leak)");
         }
         (Some(b), Some(a)) => {
-            eprintln!("smoke: FAIL frames leaked across scheduler: before={b}, after={a}");
+            eprintln!("smoke: FAIL frames leaked across {name}: before={b}, after={a}");
             std::process::exit(1);
         }
         _ => {
-            eprintln!("smoke: FAIL could not find scheduler frame-baseline lines");
+            eprintln!("smoke: FAIL could not find {name} frame-baseline lines");
             std::process::exit(1);
         }
     }
+}
+
+/// Verify the IPC ping-pong rendezvous: for each role the round counter must
+/// run 0..rounds in program order (interleaving-robust), and the exchanged
+/// value must be right -- the ponger replies `i + 100`, so the pinger sees
+/// `i + 100` and the ponger sees `i`. Checking the values proves the
+/// rendezvous actually moved the right data, not just that lines appeared.
+fn check_ipc_order(actual: &str, rounds: u64) {
+    let lines: Vec<&str> = actual.lines().map(str::trim).collect();
+    let mut failed = false;
+
+    for &(tag, offset) in &[("ping", 100u64), ("pong", 0u64)] {
+        let prefix = format!("{tag} ");
+        let mut round = 0u64;
+        for line in &lines {
+            let Some(rest) = line.strip_prefix(&prefix) else {
+                continue;
+            };
+            // rest is "<i> got <v>"
+            let Some((i_str, v_str)) = rest.split_once(" got ") else {
+                continue;
+            };
+            let (Ok(i), Ok(v)) = (i_str.trim().parse::<u64>(), v_str.trim().parse::<u64>()) else {
+                continue;
+            };
+            if i != round {
+                eprintln!("smoke: {tag} out of order: saw round {i}, expected {round}");
+                failed = true;
+            }
+            if v != round + offset {
+                eprintln!("smoke: {tag} round {round}: got {v}, expected {}", round + offset);
+                failed = true;
+            }
+            round += 1;
+        }
+        if round != rounds {
+            eprintln!("smoke: {tag}: saw {round} rounds, expected {rounds}");
+            failed = true;
+        }
+    }
+
+    if failed {
+        eprintln!("smoke: FAIL (ipc rendezvous)");
+        eprintln!("--- captured output ---");
+        for line in &lines {
+            eprintln!("{line}");
+        }
+        eprintln!("--- end output ---");
+        std::process::exit(1);
+    }
+    println!("smoke: ipc rendezvous ok (ping/pong x {rounds} rounds, values verified)");
 }
 
 /// Pull the integer out of the first line containing `marker`.
@@ -437,7 +493,9 @@ fn smoke(uefi_path: &Path) {
     let expected_path = workspace_root().join("expected_boot_log.txt");
     check_smoke_output(&actual, &expected_path);
     check_per_process_order(&actual, SCHED_PROCESSES, SCHED_ITERS);
-    check_frames_baseline(&actual);
+    check_frames_baseline(&actual, "scheduler");
+    check_ipc_order(&actual, IPC_ROUNDS);
+    check_frames_baseline(&actual, "ipc");
 }
 
 /// Build the kernel with the test suite compiled in. Uses a separate
