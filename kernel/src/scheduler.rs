@@ -47,6 +47,7 @@ use x86_64::VirtAddr;
 
 use crate::capability::Capability;
 use crate::gdt;
+use crate::ipc;
 use crate::memory;
 use crate::process::{self, Process, MAX_BOOT_FRAMES, USER_STACK_TOP};
 use crate::serial;
@@ -445,6 +446,10 @@ fn setup_process(
             memory::destroy_address_space(l4);
             return Err("capability table full");
         }
+        // Account an endpoint grant entering the new table (no-op otherwise).
+        // This is the single mint site for boot demo grants, the spawn child's
+        // send cap, and the receiving half of a spawn capability transfer.
+        ipc::note_cap_added(cap);
     }
     proc.l4 = l4;
 

@@ -442,6 +442,29 @@ fn check_frames_baseline(actual: &str, name: &str) {
     }
 }
 
+/// The free-endpoint count printed before and after an IPC demo must match:
+/// every endpoint the demo created (granted to its processes, or made by
+/// sys_spawn) is reclaimed once the last capability referencing it is dropped
+/// at teardown (Stage B endpoint freeing). Mirrors the frame baseline; this is
+/// what proves the endpoint-table leak is actually fixed.
+fn check_endpoints_baseline(actual: &str, name: &str) {
+    let before = find_frame_count(actual, &format!("endpoints free before {name}"));
+    let after = find_frame_count(actual, &format!("endpoints free after {name}"));
+    match (before, after) {
+        (Some(b), Some(a)) if a == b => {
+            println!("smoke: {name} endpoint baseline ok ({b} free, no leak)");
+        }
+        (Some(b), Some(a)) => {
+            eprintln!("smoke: FAIL endpoints leaked across {name}: before={b}, after={a}");
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("smoke: FAIL could not find {name} endpoint-baseline lines");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Verify the IPC ping-pong rendezvous: for each role the round counter must
 /// run 0..rounds in program order (interleaving-robust), and the exchanged
 /// value must be right -- the ponger replies `i + 100`, so the pinger sees
@@ -597,12 +620,16 @@ fn smoke(uefi_path: &Path) {
     check_frames_baseline(&actual, "scheduler");
     check_ipc_order(&actual, IPC_ROUNDS);
     check_frames_baseline(&actual, "ipc");
+    check_endpoints_baseline(&actual, "ipc");
     check_share(&actual, SHARE_PATTERN);
     check_frames_baseline(&actual, "share");
+    check_endpoints_baseline(&actual, "share");
     check_rpc(&actual, RPC_CALLS, RPC_OFFSET);
     check_frames_baseline(&actual, "rpc");
+    check_endpoints_baseline(&actual, "rpc");
     check_spawn(&actual, SPAWN_RESULT);
     check_frames_baseline(&actual, "spawn");
+    check_endpoints_baseline(&actual, "spawn");
 }
 
 /// Build the kernel with the test suite compiled in. Uses a separate

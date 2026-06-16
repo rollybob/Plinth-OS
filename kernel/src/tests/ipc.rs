@@ -10,7 +10,8 @@
 //! match decision, tail bookkeeping).
 
 use super::TestCtx;
-use crate::ipc::WaitQueue;
+use crate::capability::{RIGHT_RECV, RIGHT_SEND};
+use crate::ipc::{Endpoint, WaitQueue};
 use crate::test_assert;
 
 /// FIFO: waiters come back out in the order they went in, then the queue is
@@ -80,5 +81,78 @@ pub fn wq_refill_other_side(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     q.enqueue(1, false, &mut links);
     test_assert!(q.take_if(true, &links).is_none(), "stale sender side must not linger");
     test_assert!(q.take_if(false, &links) == Some(1), "receiver now takeable");
+    Ok(())
+}
+
+/// `is_empty` tracks the queue across an enqueue and the drain back to empty.
+pub fn wq_is_empty(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut links = [None; 4];
+    let mut q = WaitQueue::empty();
+    test_assert!(q.is_empty(), "a fresh queue is empty");
+    q.enqueue(0, true, &mut links);
+    test_assert!(!q.is_empty(), "not empty with one waiter");
+    q.dequeue(&links);
+    test_assert!(q.is_empty(), "empty again after draining");
+    Ok(())
+}
+
+// --- endpoint capability refcounts (Stage B) ---
+
+/// One sender capability references the endpoint; removing it frees it.
+pub fn ep_refcount_sender(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut ep = Endpoint::empty();
+    test_assert!(ep.is_unreferenced(), "a fresh endpoint is unreferenced");
+    ep.add_cap(RIGHT_SEND);
+    test_assert!(!ep.is_unreferenced(), "a live sender cap references it");
+    ep.remove_cap(RIGHT_SEND);
+    test_assert!(ep.is_unreferenced(), "removing the last sender frees it");
+    Ok(())
+}
+
+/// Symmetric for the receive side.
+pub fn ep_refcount_receiver(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut ep = Endpoint::empty();
+    ep.add_cap(RIGHT_RECV);
+    test_assert!(!ep.is_unreferenced(), "a live receiver cap references it");
+    ep.remove_cap(RIGHT_RECV);
+    test_assert!(ep.is_unreferenced(), "removing the last receiver frees it");
+    Ok(())
+}
+
+/// Send and receive sides count independently: a directional channel (one
+/// send cap, one recv cap -- the RPC demo shape) is freed only when BOTH go.
+pub fn ep_refcount_directional_split(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut ep = Endpoint::empty();
+    ep.add_cap(RIGHT_SEND);
+    ep.add_cap(RIGHT_RECV);
+    test_assert!(!ep.is_unreferenced(), "two references");
+    ep.remove_cap(RIGHT_SEND);
+    test_assert!(!ep.is_unreferenced(), "the receiver still references it");
+    ep.remove_cap(RIGHT_RECV);
+    test_assert!(ep.is_unreferenced(), "now nothing references it");
+    Ok(())
+}
+
+/// Multiple caps on the same side are counted, not collapsed: two senders
+/// (the pingpong shape, where both peers hold send rights) need two removals.
+pub fn ep_refcount_multiple_same_side(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut ep = Endpoint::empty();
+    ep.add_cap(RIGHT_SEND);
+    ep.add_cap(RIGHT_SEND);
+    ep.remove_cap(RIGHT_SEND);
+    test_assert!(!ep.is_unreferenced(), "one sender still holds it");
+    ep.remove_cap(RIGHT_SEND);
+    test_assert!(ep.is_unreferenced(), "the last sender frees it");
+    Ok(())
+}
+
+/// A single capability carrying both rights (the pingpong/share grant) counts
+/// on both sides and clears both when removed.
+pub fn ep_refcount_dual_right_cap(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut ep = Endpoint::empty();
+    ep.add_cap(RIGHT_SEND | RIGHT_RECV);
+    test_assert!(!ep.is_unreferenced(), "the dual-right cap references both sides");
+    ep.remove_cap(RIGHT_SEND | RIGHT_RECV);
+    test_assert!(ep.is_unreferenced(), "removing it clears both sides");
     Ok(())
 }

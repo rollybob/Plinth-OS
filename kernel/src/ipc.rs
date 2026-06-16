@@ -115,18 +115,66 @@ impl WaitQueue {
             None
         }
     }
+
+    /// True when no waiters are queued.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
 }
 
-/// A rendezvous point: a capability-named endpoint with its wait queue.
+/// A rendezvous point: a capability-named endpoint, its wait queue, and a
+/// reference count of the live capabilities that can reach it.
+///
+/// `senders`/`receivers` track how many live capabilities grant `RIGHT_SEND` /
+/// `RIGHT_RECV` to this endpoint, summed across every process's table. They are
+/// maintained symmetrically -- +1 on every mint of an `Endpoint` cap into a
+/// table, -1 on every revoke/drain out of one (see `note_cap_added` /
+/// `note_cap_removed`) -- so an IPC or spawn capability *transfer*, being a
+/// revoke followed by a mint, nets to zero as the cap moves. The counts let the
+/// kernel (a) free an endpoint slot once nothing can reach it (this stage) and
+/// (b) wake peers stranded by a dead counterpart (Stage C2).
 #[derive(Clone, Copy)]
-struct Endpoint {
+pub(crate) struct Endpoint {
     in_use: bool,
     queue: WaitQueue,
+    senders: u32,
+    receivers: u32,
 }
 
 impl Endpoint {
-    const fn empty() -> Endpoint {
-        Endpoint { in_use: false, queue: WaitQueue::empty() }
+    pub(crate) const fn empty() -> Endpoint {
+        Endpoint { in_use: false, queue: WaitQueue::empty(), senders: 0, receivers: 0 }
+    }
+
+    /// Account a capability with `rights` becoming able to reach this endpoint.
+    pub(crate) fn add_cap(&mut self, rights: u8) {
+        if rights & RIGHT_SEND != 0 {
+            self.senders += 1;
+        }
+        if rights & RIGHT_RECV != 0 {
+            self.receivers += 1;
+        }
+    }
+
+    /// Account a capability with `rights` no longer reaching this endpoint.
+    /// A decrement below zero would mean an unmatched removal -- an accounting
+    /// bug -- so it is caught loudly in debug and clamped in release.
+    pub(crate) fn remove_cap(&mut self, rights: u8) {
+        if rights & RIGHT_SEND != 0 {
+            debug_assert!(self.senders > 0, "endpoint sender refcount underflow");
+            self.senders = self.senders.saturating_sub(1);
+        }
+        if rights & RIGHT_RECV != 0 {
+            debug_assert!(self.receivers > 0, "endpoint receiver refcount underflow");
+            self.receivers = self.receivers.saturating_sub(1);
+        }
+    }
+
+    /// True when nothing can reach this endpoint any more: no live caps and no
+    /// queued waiters. (A queued waiter always still holds a cap, so the queue
+    /// check is implied by the counts; it is kept explicit as defence in depth.)
+    pub(crate) fn is_unreferenced(&self) -> bool {
+        self.senders == 0 && self.receivers == 0 && self.queue.is_empty()
     }
 }
 
@@ -207,12 +255,65 @@ pub fn create_endpoint() -> Option<usize> {
         let eps = &mut *addr_of_mut!(ENDPOINTS);
         for (i, ep) in eps.iter_mut().enumerate() {
             if !ep.in_use {
-                *ep = Endpoint { in_use: true, queue: WaitQueue::empty() };
+                *ep = Endpoint { in_use: true, ..Endpoint::empty() };
                 return Some(i);
             }
         }
         None
     }
+}
+
+/// Account an `Endpoint` capability entering some process's table (a mint).
+/// A no-op for every other capability kind, so call sites can pass any cap
+/// without checking. Reached from every mint of an endpoint cap -- process
+/// setup grants, the spawn handle, and the receiving half of a transfer.
+pub(crate) fn note_cap_added(cap: &Capability) {
+    if let CapObject::Endpoint { id } = cap.object {
+        // SAFETY: single CPU, IF=0 at every accounting site.
+        unsafe {
+            (*addr_of_mut!(ENDPOINTS))[id].add_cap(cap.rights);
+        }
+    }
+}
+
+/// Account an `Endpoint` capability leaving a table (a revoke or drain). A
+/// no-op for every other kind. `free_if_unreferenced` must be true ONLY when
+/// the cap leaves *permanently* -- process teardown's drain -- where the last
+/// reference disappearing means the slot can be reclaimed. A capability
+/// *transfer* passes false: it is a revoke immediately followed by a matching
+/// mint, so the count dips transiently and the endpoint must NOT be freed out
+/// from under the in-flight move.
+pub(crate) fn note_cap_removed(cap: &Capability, free_if_unreferenced: bool) {
+    if let CapObject::Endpoint { id } = cap.object {
+        // SAFETY: single CPU, IF=0 at every accounting site.
+        unsafe {
+            let eps = &mut *addr_of_mut!(ENDPOINTS);
+            eps[id].remove_cap(cap.rights);
+            if free_if_unreferenced && eps[id].is_unreferenced() {
+                eps[id] = Endpoint::empty();
+            }
+        }
+    }
+}
+
+/// Reclaim an endpoint slot if nothing references it. Used by `sys_spawn` to
+/// release a freshly-created result endpoint when the child could not be
+/// launched (no cap was ever minted for it, so it is unreferenced).
+pub fn release_endpoint(id: usize) {
+    // SAFETY: single CPU, IF=0.
+    unsafe {
+        let eps = &mut *addr_of_mut!(ENDPOINTS);
+        if id < MAX_ENDPOINTS && eps[id].is_unreferenced() {
+            eps[id] = Endpoint::empty();
+        }
+    }
+}
+
+/// Number of free (reclaimable) endpoint slots. Used by the boot path's
+/// no-leak baseline checks, mirroring the frame-allocator's free count.
+pub fn free_endpoint_count() -> usize {
+    // SAFETY: scalar reads of the single-CPU table.
+    unsafe { (*addr_of!(ENDPOINTS)).iter().filter(|ep| !ep.in_use).count() }
 }
 
 /// The IPC interrupt dispatcher. Reached only from `ipc_entry`. Reads the
@@ -395,14 +496,21 @@ fn transfer_current_to_blocked(receiver: usize, cap_slot: u64) -> u64 {
     let Some(cap) = cap else {
         return NO_CAP;
     };
+    // The revoke above is the give half of the move; account it (no free --
+    // the matching mint below re-references the endpoint).
+    note_cap_removed(&cap, false);
     match scheduler::mint_into_blocked(receiver, cap) {
-        Some(landing) => landing as u64,
+        Some(landing) => {
+            note_cap_added(&cap);
+            landing as u64
+        }
         None => {
             // Receiver's table is full: hand the capability back to the sender.
             let mut guard = process::CURRENT.lock();
             if let Some(p) = guard.as_mut() {
                 let _ = p.caps.mint(cap.object, cap.rights);
             }
+            note_cap_added(&cap);
             NO_CAP
         }
     }
@@ -415,6 +523,8 @@ fn transfer_blocked_to_current(sender: usize, cap_slot: u64) -> u64 {
     let Some(cap) = scheduler::revoke_from_blocked(sender, cap_slot as usize) else {
         return NO_CAP;
     };
+    // Give half of the move; account it (no free -- the mint below re-refs).
+    note_cap_removed(&cap, false);
     let landing = {
         let mut guard = process::CURRENT.lock();
         guard
@@ -422,9 +532,13 @@ fn transfer_blocked_to_current(sender: usize, cap_slot: u64) -> u64 {
             .and_then(|p| p.caps.mint(cap.object, cap.rights).ok())
     };
     match landing {
-        Some(l) => l as u64,
+        Some(l) => {
+            note_cap_added(&cap);
+            l as u64
+        }
         None => {
             let _ = scheduler::mint_into_blocked(sender, cap);
+            note_cap_added(&cap);
             NO_CAP
         }
     }

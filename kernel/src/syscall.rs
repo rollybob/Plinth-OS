@@ -429,6 +429,11 @@ fn sys_spawn(child_id: u64, transfer_slot: u64) -> u64 {
     } else {
         None
     };
+    // Account the give half of a spawn capability transfer (no-op for a
+    // non-endpoint cap; no free -- the child's mint in setup_process re-refs).
+    if let Some(ref cap) = transferred {
+        ipc::note_cap_removed(cap, false);
+    }
 
     // Child capabilities: a SEND cap to the result endpoint (ENDPOINT_SLOT),
     // then the optional transferred capability (GRANT_SLOT).
@@ -437,21 +442,31 @@ fn sys_spawn(child_id: u64, transfer_slot: u64) -> u64 {
         rights: RIGHT_SEND,
     };
     if scheduler::spawn(binary, phys, &[Some(send_cap), transferred]).is_none() {
-        // Could not create the child: undo the capability move (best effort).
+        // Could not create the child: it never minted send_cap, so the result
+        // endpoint is unreferenced -- reclaim the slot. Then undo the capability
+        // move by re-minting it back to the caller (re-accounting it).
+        ipc::release_endpoint(ep);
         if let Some(cap) = transferred {
             let mut cur = process::CURRENT.lock();
             if let Some(p) = cur.as_mut() {
                 let _ = p.caps.mint(cap.object, cap.rights);
             }
+            ipc::note_cap_added(&cap);
         }
         return ERR;
     }
 
     // The caller's RECV handle on the result channel; recv on it = wait.
+    let recv_cap = Capability { object: CapObject::Endpoint { id: ep }, rights: RIGHT_RECV };
     let handle = {
         let mut cur = process::CURRENT.lock();
-        cur.as_mut()
-            .and_then(|p| p.caps.mint(CapObject::Endpoint { id: ep }, RIGHT_RECV).ok())
+        cur.as_mut().and_then(|p| p.caps.mint(recv_cap.object, recv_cap.rights).ok())
     };
-    handle.map(|h| h as u64).unwrap_or(ERR)
+    match handle {
+        Some(h) => {
+            ipc::note_cap_added(&recv_cap);
+            h as u64
+        }
+        None => ERR,
+    }
 }

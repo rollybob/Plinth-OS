@@ -181,6 +181,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 .unwrap_or(0)
         };
 
+        // Free-endpoint count: the analogue of free_frames for the endpoint
+        // table. Bracketing an IPC demo with this proves the endpoint slot is
+        // reclaimed once every referencing capability is gone (Stage B), the
+        // way the frame baseline proves frames are.
+        let free_endpoints = ipc::free_endpoint_count;
+
         // Preemptive scheduler demo (Phase 2): launch independent CPU-bound
         // processes and round-robin them under the timer. Their lines
         // interleave in the log -- preemption made visible -- while each
@@ -199,6 +205,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         const PINGPONG_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pingpong-user"));
         let before_ipc = free_frames();
         let _ = writeln!(serial, "plinth: {before_ipc} frames free before ipc");
+        let _ = writeln!(serial, "plinth: {} endpoints free before ipc", free_endpoints());
         match ipc::create_endpoint() {
             Some(ep) => {
                 let cap = Capability {
@@ -218,6 +225,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         let after_ipc = free_frames();
         let _ = writeln!(serial, "plinth: {after_ipc} frames free after ipc");
+        let _ = writeln!(serial, "plinth: {} endpoints free after ipc", free_endpoints());
 
         // Capability-transfer / zero-copy demo: a producer fills a frame and
         // hands its capability to a consumer over IPC; the consumer maps the
@@ -226,6 +234,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         const SHARE_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/share-user"));
         let before_share = free_frames();
         let _ = writeln!(serial, "plinth: {before_share} frames free before share");
+        let _ = writeln!(serial, "plinth: {} endpoints free before share", free_endpoints());
         match ipc::create_endpoint() {
             Some(ep) => {
                 let cap = Capability {
@@ -245,6 +254,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         let after_share = free_frames();
         let _ = writeln!(serial, "plinth: {after_share} frames free after share");
+        let _ = writeln!(serial, "plinth: {} endpoints free after share", free_endpoints());
 
         // RPC demo: a server and a client over one endpoint, with directional
         // rights -- the server holds RIGHT_RECV only, the client RIGHT_SEND
@@ -254,6 +264,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         const RPC_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rpc-user"));
         let before_rpc = free_frames();
         let _ = writeln!(serial, "plinth: {before_rpc} frames free before rpc");
+        let _ = writeln!(serial, "plinth: {} endpoints free before rpc", free_endpoints());
         match ipc::create_endpoint() {
             Some(ep) => {
                 let recv_cap = Capability {
@@ -277,6 +288,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         let after_rpc = free_frames();
         let _ = writeln!(serial, "plinth: {after_rpc} frames free after rpc");
+        let _ = writeln!(serial, "plinth: {} endpoints free after rpc", free_endpoints());
 
         // Spawn + wait demo: the kernel launches a single parent process; the
         // parent `spawn`s a worker (an independent scheduled process), the
@@ -286,9 +298,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         const SPAWNER_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spawner-user"));
         let before_spawn = free_frames();
         let _ = writeln!(serial, "plinth: {before_spawn} frames free before spawn");
+        let _ = writeln!(serial, "plinth: {} endpoints free before spawn", free_endpoints());
         scheduler::run("spawn demo", &[SPAWNER_BIN], phys_offset, &[None]);
         let after_spawn = free_frames();
         let _ = writeln!(serial, "plinth: {after_spawn} frames free after spawn");
+        let _ = writeln!(serial, "plinth: {} endpoints free after spawn", free_endpoints());
 
         // The tick count is proof the timer fired during ring-3 execution.
         // It is nondeterministic under wall-clock timing (it varies with how

@@ -353,6 +353,12 @@ pub fn teardown(mut proc: Process, boot_frames: &[Option<(u64, u64)>]) {
         if let CapObject::Frame { addr } = cap.object {
             let _ = fa.dealloc(addr);
         }
+        // An endpoint capability leaving permanently: drop its reference and
+        // free the endpoint slot if this was the last one able to reach it.
+        // This is the single permanent-removal site, so the only place the
+        // free-at-zero check runs (transfers pass false; see ipc::note_cap_*).
+        // A no-op for every non-endpoint capability.
+        crate::ipc::note_cap_removed(&cap, true);
     });
     for (va, phys) in boot_frames.iter().flatten() {
         memory::unmap_user_page(l4, *va);
