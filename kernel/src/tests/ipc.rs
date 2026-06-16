@@ -156,3 +156,38 @@ pub fn ep_refcount_dual_right_cap(_ctx: &mut TestCtx) -> Result<(), &'static str
     test_assert!(ep.is_unreferenced(), "removing it clears both sides");
     Ok(())
 }
+
+// --- death-time reaping decision (Stage C2): the "wake-at-zero" half ---
+
+/// A process dying with the last sender (or receiver) cap strands the opposite
+/// side -- the trigger for waking blocked peers with IPC_PEER_DIED. This is the
+/// crashed-child case: the worker holds the only send cap, the parent is the
+/// blocked receiver.
+pub fn ep_strand_last_side(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut ep = Endpoint::empty();
+    ep.add_cap(RIGHT_SEND); // the worker's send cap
+    ep.add_cap(RIGHT_RECV); // the parent's recv handle
+    test_assert!(ep.death_strands_peers(1, 0), "last sender gone -> strands receivers");
+    test_assert!(ep.death_strands_peers(0, 1), "last receiver gone -> strands senders");
+    Ok(())
+}
+
+/// If another live capability remains on the dying side, no peer is stranded;
+/// only losing the *last* one triggers reaping.
+pub fn ep_strand_not_last(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut ep = Endpoint::empty();
+    ep.add_cap(RIGHT_SEND);
+    ep.add_cap(RIGHT_SEND); // two senders
+    test_assert!(!ep.death_strands_peers(1, 0), "another sender remains -> no stranding");
+    test_assert!(ep.death_strands_peers(2, 0), "all senders gone -> strands");
+    Ok(())
+}
+
+/// A process that held no capability on an endpoint strands nobody there.
+pub fn ep_strand_no_reference(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut ep = Endpoint::empty();
+    ep.add_cap(RIGHT_SEND);
+    ep.add_cap(RIGHT_RECV);
+    test_assert!(!ep.death_strands_peers(0, 0), "no references dropped -> no stranding");
+    Ok(())
+}

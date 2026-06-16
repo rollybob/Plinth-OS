@@ -33,7 +33,7 @@ use core::ptr::{addr_of, addr_of_mut};
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::{PrivilegeLevel, VirtAddr};
 
-use crate::capability::{CapObject, Capability, RIGHT_RECV, RIGHT_SEND};
+use crate::capability::{CapObject, CapTable, Capability, RIGHT_RECV, RIGHT_SEND};
 use crate::process;
 use crate::scheduler::{self, TrapFrame, GP_RAX, GP_RDI, GP_RDX, GP_RSI};
 
@@ -52,11 +52,12 @@ const IPC_REPLY: u64 = 3;
 /// the transferred-cap landing slot (rdx). Splitting status from the payload
 /// (ABI v2) means no message value, not even `u64::MAX`, can be mistaken for an
 /// error: a peer controls the full payload word, so an in-band error sentinel
-/// would be ambiguous. `IPC_OK` is the only status the rendezvous path produces
-/// today; `IPC_PEER_DIED` arrives with the death-time reaping (Stage C2). See
-/// Design/ipc.md.
+/// would be ambiguous. The rendezvous path produces `IPC_OK`; `IPC_PEER_DIED`
+/// is delivered by the death-time reaping (`reap_dying`) when a process blocked
+/// on a peer outlives it. See Design/ipc.md.
 const IPC_OK: u64 = 0;
 const IPC_ERR: u64 = 1;
+const IPC_PEER_DIED: u64 = 2;
 
 /// "No capability" sentinel for the optional cap-transfer slot in `send`, and
 /// for the landing-slot `recv` reports when no cap arrived. A real slot is a
@@ -183,6 +184,20 @@ impl Endpoint {
     /// check is implied by the counts; it is kept explicit as defence in depth.)
     pub(crate) fn is_unreferenced(&self) -> bool {
         self.senders == 0 && self.receivers == 0 && self.queue.is_empty()
+    }
+
+    /// Given how many sender/receiver capabilities a dying process holds on this
+    /// endpoint, would its death remove the *last* sender (or receiver)? If so,
+    /// the opposite side's blocked waiters have lost their only possible
+    /// counterpart and must be reaped. Pure decision used by `reap_dying`; the
+    /// "wake-at-zero" half of the refcount machinery (free-at-zero is
+    /// `is_unreferenced`).
+    pub(crate) fn death_strands_peers(&self, dying_senders: u32, dying_receivers: u32) -> bool {
+        let last_sender_gone =
+            dying_senders > 0 && self.senders.saturating_sub(dying_senders) == 0;
+        let last_receiver_gone =
+            dying_receivers > 0 && self.receivers.saturating_sub(dying_receivers) == 0;
+        last_sender_gone || last_receiver_gone
     }
 }
 
@@ -324,6 +339,75 @@ pub fn free_endpoint_count() -> usize {
     unsafe { (*addr_of!(ENDPOINTS)).iter().filter(|ep| !ep.in_use).count() }
 }
 
+/// Death-time liveness reaping: `caps` belongs to a process that is exiting;
+/// wake any *live* peer that was depending on it, so the peer observes
+/// `IPC_PEER_DIED` instead of blocking forever. Runs in `on_exit` BEFORE
+/// teardown drains the caps (hardening D5): it only wakes peers and never
+/// touches refcounts -- teardown's drain still applies the decrements and frees
+/// the slot. An endpoint with blocked waiters is never freed, because those
+/// waiters still hold capabilities. Two strandings are possible:
+///
+///   (a) the dying process holds an unconsumed `Reply { caller }` (a server
+///       that received a `call` but never replied): the caller is Blocked
+///       awaiting a reply that will never come -- wake it.
+///   (b) the dying process holds the last sender (or receiver) capability on an
+///       endpoint whose queue holds blocked receivers (or senders): those peers
+///       can never rendezvous -- wake them all.
+pub(crate) fn reap_dying(caps: &CapTable) {
+    // Tally this process's own per-endpoint references, and wake any caller it
+    // still owed a reply.
+    let mut dying_senders = [0u32; MAX_ENDPOINTS];
+    let mut dying_receivers = [0u32; MAX_ENDPOINTS];
+    for cap in caps.iter() {
+        match cap.object {
+            CapObject::Reply { caller } => {
+                if scheduler::is_blocked(caller) {
+                    scheduler::wake_with(caller, IPC_PEER_DIED, 0, NO_CAP);
+                }
+            }
+            CapObject::Endpoint { id } if id < MAX_ENDPOINTS => {
+                if cap.rights & RIGHT_SEND != 0 {
+                    dying_senders[id] += 1;
+                }
+                if cap.rights & RIGHT_RECV != 0 {
+                    dying_receivers[id] += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    // For each endpoint this process referenced, if its death removes the last
+    // sender (or receiver), the opposite side's blocked waiters are stranded.
+    // The queue only ever holds one side, and a queued waiter still holds a
+    // capability (so it is counted) -- which is why a zero post-death count on
+    // one side implies the queue cannot hold that same side.
+    for id in 0..MAX_ENDPOINTS {
+        // SAFETY: scalar read of the single-CPU table; copy out before waking.
+        let ep = unsafe { (*addr_of!(ENDPOINTS))[id] };
+        if ep.in_use && ep.death_strands_peers(dying_senders[id], dying_receivers[id]) {
+            wake_all_stranded(id);
+        }
+    }
+}
+
+/// Drain endpoint `id`'s entire wait queue, waking each blocked waiter with
+/// `IPC_PEER_DIED`. The caller has established that the queued side has lost its
+/// only possible counterpart.
+fn wake_all_stranded(id: usize) {
+    loop {
+        // SAFETY: single CPU, IF=0; ENDPOINTS and WAIT_LINKS are distinct
+        // statics, so the borrows below do not alias.
+        let woken = unsafe {
+            let eps = &mut *addr_of_mut!(ENDPOINTS);
+            scheduler::with_wait_links(|links| eps[id].queue.dequeue(links))
+        };
+        match woken {
+            Some(slot) => scheduler::wake_with(slot, IPC_PEER_DIED, 0, NO_CAP),
+            None => break,
+        }
+    }
+}
+
 /// The IPC interrupt dispatcher. Reached only from `ipc_entry`. Reads the
 /// operation and its args from the saved trap frame (rax = op, rdi/rsi =
 /// args), and either returns a result (non-blocking) or never returns (the
@@ -365,7 +449,14 @@ fn ipc_send(ep_slot: u64, msg: u64, cap_slot: u64, frame_ptr: u64) -> u64 {
         scheduler::wake_with(receiver, IPC_OK, msg, landing);
         return IPC_OK;
     }
-    // No receiver waiting: stash the word + cap slot and block as a sender.
+    // No receiver waiting. If no live capability can ever receive here, blocking
+    // would be forever -- report the dead peer instead (closes the race where
+    // the only receiver died before this send was reached). Single CPU + IF=0
+    // make this check-then-block atomic: no peer can die between them.
+    if endpoint_receivers(id) == 0 {
+        return IPC_PEER_DIED;
+    }
+    // Stash the word + cap slot and block as a sender.
     let cur = scheduler::current_slot();
     scheduler::set_pending(cur, msg, cap_slot, false);
     enqueue_waiter(id, cur, true);
@@ -402,8 +493,15 @@ fn ipc_recv(ep_slot: u64, frame_ptr: u64) -> u64 {
         write_rdx(frame_ptr, landing); // the landing slot in our rdx
         return IPC_OK;
     }
-    // No sender waiting: block as a receiver. A later sender does the transfer
-    // and wakes us with (msg, landing) via wake_with.
+    // No sender waiting. If no live capability can ever send here, blocking
+    // would be forever -- report the dead peer instead (closes the race where
+    // the only sender died before this recv was reached, e.g. a spawned worker
+    // that faulted before the parent reached its wait). Atomic under IF=0.
+    if endpoint_senders(id) == 0 {
+        return IPC_PEER_DIED;
+    }
+    // Block as a receiver. A later sender does the transfer and wakes us with
+    // (msg, landing) via wake_with.
     let cur = scheduler::current_slot();
     enqueue_waiter(id, cur, false);
     scheduler::block_current(frame_ptr)
@@ -425,8 +523,14 @@ fn ipc_call(ep_slot: u64, req: u64, frame_ptr: u64) -> u64 {
         let reply_slot = mint_reply_cap_into_blocked(server, caller);
         scheduler::wake_with(server, IPC_OK, req, reply_slot);
     } else {
-        // No server yet: block as a call-sender. The receiver will mint the
-        // reply cap and leave us blocked until `reply` wakes us.
+        // No server is waiting. If no live capability can ever receive (serve)
+        // here, the call can never be answered -- report the dead peer now
+        // rather than block forever. Atomic under IF=0.
+        if endpoint_receivers(id) == 0 {
+            return IPC_PEER_DIED;
+        }
+        // Block as a call-sender. The receiver will mint the reply cap and
+        // leave us blocked until `reply` wakes us.
         let cur = scheduler::current_slot();
         scheduler::set_pending(cur, req, NO_CAP, true);
         enqueue_waiter(id, cur, true);
@@ -592,6 +696,20 @@ fn endpoint_id_for(slot: u64, right: u8) -> Option<usize> {
 fn endpoint_in_use(id: usize) -> bool {
     // SAFETY: scalar read of the single-CPU table.
     unsafe { (*addr_of!(ENDPOINTS))[id].in_use }
+}
+
+/// Count of live capabilities that can send on / receive from endpoint `id`.
+/// The block-time liveness check reads these: a process about to wait for a
+/// counterpart that can never arrive (zero on the opposite side) is told the
+/// peer is gone instead of blocking forever.
+fn endpoint_senders(id: usize) -> u32 {
+    // SAFETY: scalar read of the single-CPU table.
+    unsafe { (*addr_of!(ENDPOINTS))[id].senders }
+}
+
+fn endpoint_receivers(id: usize) -> u32 {
+    // SAFETY: scalar read of the single-CPU table.
+    unsafe { (*addr_of!(ENDPOINTS))[id].receivers }
 }
 
 /// Dequeue a waiting receiver if the queue holds receivers; else None.

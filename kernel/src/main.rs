@@ -123,8 +123,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // then the same workload runs under two different library OSes
         // with a deliberate crash between them -- the kernel logs the
         // fault, reclaims the process, and keeps going.
-        // Binaries a process may launch with spawn, by id. id 0 = grantee.
-        const SPAWNABLE: &[&[u8]] = &[include_bytes!(concat!(env!("OUT_DIR"), "/grantee-user"))];
+        // Binaries a process may launch with spawn, by id. id 0 = grantee (a
+        // worker that sends its result), id 1 = faultchild (a worker that
+        // faults before sending, to exercise death-time reaping).
+        const SPAWNABLE: &[&[u8]] = &[
+            include_bytes!(concat!(env!("OUT_DIR"), "/grantee-user")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/faultchild-user")),
+        ];
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
 

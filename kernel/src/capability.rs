@@ -95,6 +95,13 @@ impl CapTable {
         Err(CapError::TableFull)
     }
 
+    /// Iterate the live capabilities in this table (skipping empty slots), by
+    /// value. Read-only -- the death-time IPC reaping uses it to find the
+    /// endpoint and reply capabilities a dying process held.
+    pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
+        self.slots.iter().filter_map(|slot| *slot)
+    }
+
     /// Fetch the capability at `slot`, requiring every right in `required`.
     pub fn lookup(&self, slot: usize, required: u8) -> Result<Capability, CapError> {
         let entry = *self.slots.get(slot).ok_or(CapError::BadSlot)?;

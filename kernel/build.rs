@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 const USER_BINARIES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "share", "rpc",
+    "share", "rpc", "faultchild",
 ];
 
 fn main() {

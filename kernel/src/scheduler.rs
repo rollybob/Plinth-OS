@@ -545,6 +545,12 @@ pub fn on_exit() -> ! {
         .take()
         .expect("no CURRENT process at exit");
     memory::switch_to_kernel();
+    // Wake any live peer this death would otherwise strand -- a caller awaiting
+    // a reply this process owed, or a process blocked on an endpoint whose last
+    // counterpart this was. Runs BEFORE teardown drains the caps, so the reply
+    // targets and endpoint queues are still intact; teardown then applies the
+    // refcount decrements and frees the slot (hardening D5).
+    ipc::reap_dying(&proc.caps);
     let boot_frames = unsafe { (*addr_of!(TABLE))[cur].boot_frames };
     let l4 = proc.l4;
     process::teardown(proc, &boot_frames);

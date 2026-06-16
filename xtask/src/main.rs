@@ -35,7 +35,7 @@ fn main() {
 /// embedded or booted.
 const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "share", "rpc", "template",
+    "share", "rpc", "faultchild", "template",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -612,6 +612,20 @@ fn check_spawn(actual: &str, result: u64) {
     }
 }
 
+/// Verify crash reaping: the parent waits on a child that faults before
+/// sending, and must report that the dead child was reaped -- i.e. its wait was
+/// woken with `IPC_PEER_DIED` instead of blocking forever. The spawn frame and
+/// endpoint baselines additionally prove the crashed child leaked nothing.
+fn check_reap(actual: &str) {
+    let marker = "spawner: dead child reaped";
+    if actual.lines().any(|l| l.contains(marker)) {
+        println!("smoke: crash reaping ok (parent observed IPC_PEER_DIED, did not hang)");
+    } else {
+        eprintln!("smoke: FAIL crash reaping: no '{marker}' line -- the parent hung or mis-reported");
+        std::process::exit(1);
+    }
+}
+
 fn smoke(uefi_path: &Path) {
     let actual = run_capture(uefi_path);
     let expected_path = workspace_root().join("expected_boot_log.txt");
@@ -628,6 +642,7 @@ fn smoke(uefi_path: &Path) {
     check_frames_baseline(&actual, "rpc");
     check_endpoints_baseline(&actual, "rpc");
     check_spawn(&actual, SPAWN_RESULT);
+    check_reap(&actual);
     check_frames_baseline(&actual, "spawn");
     check_endpoints_baseline(&actual, "spawn");
 }

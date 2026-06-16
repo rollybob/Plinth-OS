@@ -191,6 +191,7 @@ pub const NO_CAP: u64 = u64::MAX;
 /// `IPC_PEER_DIED` is delivered by the kernel's death-time reaping.
 pub const IPC_OK: u64 = 0;
 pub const IPC_ERR: u64 = 1;
+pub const IPC_PEER_DIED: u64 = 2;
 
 /// Send the one-word message `msg` on the endpoint capability at `ep_slot`,
 /// blocking until a receiver takes it. Returns `IPC_OK`, or `IPC_ERR` for a
@@ -305,6 +306,25 @@ pub fn sys_reply(reply_slot: u64, msg: u64) -> u64 {
         );
     }
     ret
+}
+
+/// Spawn child `child_id` and block until it reports a result -- the common
+/// "launch a worker and collect its answer" pattern, expressed as a libOS-level
+/// helper over the raw mechanism (`spawn` returns a handle; the wait is a `recv`
+/// on it). Returns `(status, result)`:
+/// - `(IPC_OK, value)` -- the child sent `value` and the wait collected it;
+/// - `(IPC_PEER_DIED, _)` -- the child died before sending; the kernel's
+///   death-time reaping woke the wait instead of leaving it blocked forever;
+/// - `(IPC_ERR, _)` -- the spawn itself failed.
+///
+/// `transfer_slot` moves one capability into the child (or `NO_CAP` for none).
+#[inline]
+pub fn spawn_and_wait(child_id: u64, transfer_slot: u64) -> (u64, u64) {
+    let handle = sys_spawn(child_id, transfer_slot);
+    if handle == SYS_ERR {
+        return (IPC_ERR, 0);
+    }
+    sys_recv(handle)
 }
 
 // ---------------------------------------------------------------------------

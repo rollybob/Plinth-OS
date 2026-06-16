@@ -23,6 +23,14 @@ within a major series.
   independent scheduled process and returns a handle (a receive capability on
   a result channel); the parent waits by `recv`-ing it. This removed the old
   synchronous spawn nesting (per-depth syscall stacks and depth limit).
+- IPC / scheduler liveness hardening: per-endpoint capability reference counts
+  reclaim an endpoint table slot once no capability can reach it (fixing the
+  bounded-table leak where every `spawn` minted an endpoint that was never
+  freed), and a process blocked on a peer that dies is now woken with
+  `IPC_PEER_DIED` instead of hanging -- via a death-time reaping pass plus a
+  block-time liveness check (so a counterpart that dies either before or while
+  you wait is handled). `spawn_and_wait` surfaces a crashed child as a status,
+  not a hang. The wait queue was extracted into a pure, unit-tested structure.
 
 ### Changed
 - **ABI v2** (see [ABI.md](ABI.md)): `spawn` no longer returns the child's exit

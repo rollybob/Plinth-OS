@@ -1,36 +1,45 @@
-//! Spawn + wait demo (parent half).
+//! Spawn + wait demo (parent half), including crash reaping.
 //!
 //! `spawn` no longer runs a child synchronously nested under the caller; it
 //! launches the child as an independent, concurrently scheduled process and
 //! returns a handle -- a receive capability on a result channel the kernel set
 //! up. The parent collects the child's result with `recv` on that handle, and
-//! that recv IS the wait. The child runs alongside this process under the
-//! scheduler.
+//! that recv IS the wait (`spawn_and_wait` packages the two).
+//!
+//! This parent waits on two children: one that sends a result and exits
+//! cleanly, and one (`faultchild`) that faults before sending. The second wait
+//! must NOT hang -- the kernel's death-time reaping wakes it with
+//! `IPC_PEER_DIED`, so the parent observes the crash and continues. Both result
+//! endpoints are reclaimed regardless, so a crashed child leaks nothing.
 
 #![no_std]
 #![no_main]
 
-use libplinth::{sys_exit, sys_recv, sys_spawn, sys_write, IPC_OK, NO_CAP, SYS_ERR};
+use libplinth::{spawn_and_wait, sys_exit, sys_write, IPC_OK, IPC_PEER_DIED, NO_CAP};
 
-/// Spawnable child id (see the kernel's SPAWNABLE table).
+/// Spawnable child ids (see the kernel's SPAWNABLE table).
 const WORKER_ID: u64 = 0;
+const FAULT_WORKER_ID: u64 = 1;
 
 #[no_mangle]
 pub extern "C" fn _start(_id: u64) -> ! {
-    // Launch the worker; no capability handed over (NO_CAP). The returned
-    // handle is the receive end of the result channel.
-    let handle = sys_spawn(WORKER_ID, NO_CAP);
-    if handle == SYS_ERR {
-        sys_exit(101);
-    }
-    sys_write(b"spawner: launched worker\n");
-
-    // Wait for the worker's result -- the join is just a recv.
-    let (status, result) = sys_recv(handle);
+    // 1) A worker that sends its result back -- the normal join.
+    let (status, result) = spawn_and_wait(WORKER_ID, NO_CAP);
     if status != IPC_OK {
         sys_exit(102);
     }
     emit(result);
+
+    // 2) A worker that faults before sending. The wait must be woken by the
+    // kernel's reaping (IPC_PEER_DIED), not left blocked forever.
+    let (status, _) = spawn_and_wait(FAULT_WORKER_ID, NO_CAP);
+    if status == IPC_PEER_DIED {
+        sys_write(b"spawner: dead child reaped\n");
+    } else {
+        sys_write(b"spawner: expected a dead child -- reaping FAILED\n");
+        sys_exit(103);
+    }
+
     sys_exit(0)
 }
 
