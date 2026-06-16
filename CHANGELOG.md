@@ -2,8 +2,10 @@
 
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
-follow semantic versioning. ABI v1 (see [ABI.md](ABI.md)) is frozen:
-released versions do not break it.
+follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
+current contract is **v2**. v2 adds IPC and revised `spawn`, breaking v1 --
+the one incompatible ABI change so far; later additions will not break v2
+within a major series.
 
 ## [Unreleased]
 
@@ -21,9 +23,10 @@ released versions do not break it.
   synchronous spawn nesting (per-depth syscall stacks and depth limit).
 
 ### Changed
-- `spawn` no longer returns the child's exit code synchronously; it returns a
-  wait handle and the child reports results over IPC. (An ABI v2 note is owed
-  before release; ABI v1 still documents the old behavior.)
+- **ABI v2** (see [ABI.md](ABI.md)): `spawn` no longer returns the child's exit
+  code synchronously -- it returns a wait handle and the child reports results
+  over IPC. The IPC operations and the `Endpoint`/`Reply` capability kinds are
+  also new in v2. This breaks ABI v1.
 
 ### Added (scheduler, earlier this cycle)
 - Preemptive round-robin scheduler (`kernel/src/scheduler.rs`): a 100 Hz PIT

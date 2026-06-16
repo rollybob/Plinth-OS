@@ -60,7 +60,8 @@ against the cost to determinism rather than taken for granted.
 
 ## Stability
 
-ABI v1 is frozen: the syscalls, error conventions, executable format, and
-process entry state documented in [ABI.md](ABI.md) will not change
-incompatibly. New capabilities are added without breaking existing
-programs. Anything not in ABI.md is an implementation detail and may move.
+The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2**.
+v2 added IPC and revised `spawn`, the one incompatible change from v1 (made
+while Phase 2 is still pre-release). Within a major series, new capabilities
+are added without breaking existing programs. Anything not in ABI.md is an
+implementation detail and may move.
