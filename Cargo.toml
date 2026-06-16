@@ -2,12 +2,13 @@
 members = ["kernel", "xtask"]
 resolver = "2"
 
-# The kernel has no unwinding machinery; abort everywhere so panic paths
-# stay small and the panic handler is the single point of failure handling.
-[profile.dev]
-panic = "abort"
-
+# The kernel aborts on panic (no unwinding machinery), keeping panic paths
+# small with the panic handler as the single point of failure handling. That
+# comes from the bare-metal x86_64-unknown-none target spec (panic-strategy =
+# abort), so it is deliberately NOT set as a workspace profile: a workspace-wide
+# `panic = "abort"` also applies to the host-side `xtask` tool, whose
+# precompiled std uses unwinding, and fails to link. The kernel and the user
+# crates (a separate workspace) both get abort from the target regardless.
 [profile.release]
-panic = "abort"
 opt-level = 3
 lto = true

@@ -124,7 +124,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // with a deliberate crash between them -- the kernel logs the
         // fault, reclaims the process, and keeps going.
         // Binaries a process may launch with spawn, by id. id 0 = grantee.
-        const SPAWNABLE: &[&[u8]] = &[include_bytes!(env!("GRANTEE_BIN"))];
+        const SPAWNABLE: &[&[u8]] = &[include_bytes!(concat!(env!("OUT_DIR"), "/grantee-user"))];
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
 
@@ -138,12 +138,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // is no longer synchronous, so the spawner demo now runs under the
         // scheduler instead (see the spawn demo below).
         const DEMOS: &[(&str, &[u8])] = &[
-            ("hello", include_bytes!(env!("HELLO_BIN"))),
-            ("bump-demo", include_bytes!(env!("BUMP_BIN"))),
-            ("crash-demo", include_bytes!(env!("CRASH_BIN"))),
-            ("list-demo", include_bytes!(env!("LIST_BIN"))),
-            ("greedy-demo", include_bytes!(env!("GREEDY_BIN"))),
-            ("lazy-demo", include_bytes!(env!("LAZY_BIN"))),
+            ("hello", include_bytes!(concat!(env!("OUT_DIR"), "/hello-user"))),
+            ("bump-demo", include_bytes!(concat!(env!("OUT_DIR"), "/bump-user"))),
+            ("crash-demo", include_bytes!(concat!(env!("OUT_DIR"), "/crash-user"))),
+            ("list-demo", include_bytes!(concat!(env!("OUT_DIR"), "/list-user"))),
+            ("greedy-demo", include_bytes!(concat!(env!("OUT_DIR"), "/greedy-user"))),
+            ("lazy-demo", include_bytes!(concat!(env!("OUT_DIR"), "/lazy-user"))),
         ];
 
         for (name, binary) in DEMOS {
@@ -186,7 +186,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // interleave in the log -- preemption made visible -- while each
         // process's own lines stay in program order. Frame counts bracket the
         // demo to show it leaks nothing once every process has exited.
-        const SPIN_BIN: &[u8] = include_bytes!(env!("SPIN_BIN"));
+        const SPIN_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spin-user"));
         let before = free_frames();
         let _ = writeln!(serial, "plinth: {before} frames free before scheduler");
         scheduler::run("scheduler demo", &[SPIN_BIN, SPIN_BIN, SPIN_BIN], phys_offset, &[None, None, None]);
@@ -196,7 +196,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // IPC demo (Phase 2): a pinger and a ponger rendezvous over one
         // synchronous endpoint the kernel creates and grants to both. Their
         // ping/pong lines interleave; each process's own stay in program order.
-        const PINGPONG_BIN: &[u8] = include_bytes!(env!("PINGPONG_BIN"));
+        const PINGPONG_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pingpong-user"));
         let before_ipc = free_frames();
         let _ = writeln!(serial, "plinth: {before_ipc} frames free before ipc");
         match ipc::create_endpoint() {
@@ -223,7 +223,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // hands its capability to a consumer over IPC; the consumer maps the
         // same physical frame and reads the data. Ownership moves -- the
         // producer is unmapped -- so the frame is reclaimed exactly once.
-        const SHARE_BIN: &[u8] = include_bytes!(env!("SHARE_BIN"));
+        const SHARE_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/share-user"));
         let before_share = free_frames();
         let _ = writeln!(serial, "plinth: {before_share} frames free before share");
         match ipc::create_endpoint() {
@@ -251,7 +251,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // only. The client `call`s; the server `recv`s the request with a
         // one-shot reply capability and answers it (no send right needed -- the
         // reply cap is the authority).
-        const RPC_BIN: &[u8] = include_bytes!(env!("RPC_BIN"));
+        const RPC_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rpc-user"));
         let before_rpc = free_frames();
         let _ = writeln!(serial, "plinth: {before_rpc} frames free before rpc");
         match ipc::create_endpoint() {
@@ -283,7 +283,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // worker sends its result back over the channel spawn set up, and the
         // parent collects it with recv -- the join. This is spawn reconciled
         // with the scheduler: no synchronous nesting.
-        const SPAWNER_BIN: &[u8] = include_bytes!(env!("SPAWNER_BIN"));
+        const SPAWNER_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spawner-user"));
         let before_spawn = free_frames();
         let _ = writeln!(serial, "plinth: {before_spawn} frames free before spawn");
         scheduler::run("spawn demo", &[SPAWNER_BIN], phys_offset, &[None]);
