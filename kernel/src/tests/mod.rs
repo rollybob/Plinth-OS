@@ -13,6 +13,7 @@
 mod capability;
 mod elf;
 mod frame_alloc;
+mod ipc;
 mod scheduler;
 
 use crate::frame_alloc::FrameAlloc;
@@ -79,6 +80,12 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "elf::too_large", run: elf::too_large },
     TestCase { name: "elf::bad_entry", run: elf::bad_entry },
     TestCase { name: "elf::segment_overlap", run: elf::segment_overlap },
+    TestCase { name: "ipc::wq_fifo_order", run: ipc::wq_fifo_order },
+    TestCase { name: "ipc::wq_single", run: ipc::wq_single },
+    TestCase { name: "ipc::wq_take_matches_sender_side", run: ipc::wq_take_matches_sender_side },
+    TestCase { name: "ipc::wq_take_matches_receiver_side", run: ipc::wq_take_matches_receiver_side },
+    TestCase { name: "ipc::wq_take_empty", run: ipc::wq_take_empty },
+    TestCase { name: "ipc::wq_refill_other_side", run: ipc::wq_refill_other_side },
     TestCase { name: "scheduler::picks_next_ready", run: scheduler::picks_next_ready },
     TestCase { name: "scheduler::skips_empty", run: scheduler::skips_empty },
     TestCase { name: "scheduler::wraps_around", run: scheduler::wraps_around },

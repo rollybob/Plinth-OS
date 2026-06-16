@@ -58,22 +58,75 @@ const NO_CAP: u64 = u64::MAX;
 /// Bounded endpoint table -- no heap, like the rest of Plinth.
 const MAX_ENDPOINTS: usize = 8;
 
-/// A rendezvous point. It holds at most a queue of blocked threads on ONE
-/// side at a time (`are_senders` says which); the moment a peer arrives on the
-/// other side they rendezvous and the queue never holds both. The queue is
-/// intrusive -- the links live in the process slots (scheduler.rs) -- so an
-/// endpoint stores only head/tail slot indices.
+/// An intrusive FIFO of blocked waiters on one endpoint, plus the rendezvous
+/// side it currently holds. The queue only ever holds waiters from ONE side at
+/// a time (`are_senders` says which); the instant a peer arrives on the other
+/// side they rendezvous, so it never mixes senders and receivers.
+///
+/// The links *between* waiters are deliberately NOT stored here: they live in
+/// an external link array indexed by process slot (the scheduler's
+/// `WAIT_LINKS`), passed into every method. That makes `WaitQueue` a pure
+/// function of (its own fields, the link array) -- unit-testable with a plain
+/// local array and no process table or hardware (see tests/ipc.rs), exactly as
+/// `pick_next` is pure over a `[State; N]`.
 #[derive(Clone, Copy)]
-struct Endpoint {
-    in_use: bool,
+pub(crate) struct WaitQueue {
     head: Option<usize>,
     tail: Option<usize>,
     are_senders: bool,
 }
 
+impl WaitQueue {
+    pub(crate) const fn empty() -> WaitQueue {
+        WaitQueue { head: None, tail: None, are_senders: false }
+    }
+
+    /// Append `slot` to the FIFO and record which side is now waiting. The new
+    /// tail's link is cleared; the previous tail (if any) is linked to it.
+    pub(crate) fn enqueue(&mut self, slot: usize, are_senders: bool, links: &mut [Option<usize>]) {
+        links[slot] = None;
+        match self.tail {
+            Some(tail) => links[tail] = Some(slot),
+            None => self.head = Some(slot),
+        }
+        self.tail = Some(slot);
+        self.are_senders = are_senders;
+    }
+
+    /// Remove and return the head, advancing to its linked successor. Returns
+    /// None when the queue is empty.
+    pub(crate) fn dequeue(&mut self, links: &[Option<usize>]) -> Option<usize> {
+        let head = self.head?;
+        self.head = links[head];
+        if self.head.is_none() {
+            self.tail = None;
+        }
+        Some(head)
+    }
+
+    /// Dequeue the head only if the queued side matches `want_senders`: a
+    /// `recv` (wanting a sender) takes a waiting sender, a `send` (wanting a
+    /// receiver) takes a waiting receiver, and neither touches a queue that
+    /// holds its own side. This is the rendezvous-match decision.
+    pub(crate) fn take_if(&mut self, want_senders: bool, links: &[Option<usize>]) -> Option<usize> {
+        if self.head.is_some() && self.are_senders == want_senders {
+            self.dequeue(links)
+        } else {
+            None
+        }
+    }
+}
+
+/// A rendezvous point: a capability-named endpoint with its wait queue.
+#[derive(Clone, Copy)]
+struct Endpoint {
+    in_use: bool,
+    queue: WaitQueue,
+}
+
 impl Endpoint {
     const fn empty() -> Endpoint {
-        Endpoint { in_use: false, head: None, tail: None, are_senders: false }
+        Endpoint { in_use: false, queue: WaitQueue::empty() }
     }
 }
 
@@ -154,7 +207,7 @@ pub fn create_endpoint() -> Option<usize> {
         let eps = &mut *addr_of_mut!(ENDPOINTS);
         for (i, ep) in eps.iter_mut().enumerate() {
             if !ep.in_use {
-                *ep = Endpoint { in_use: true, head: None, tail: None, are_senders: false };
+                *ep = Endpoint { in_use: true, queue: WaitQueue::empty() };
                 return Some(i);
             }
         }
@@ -406,57 +459,32 @@ fn endpoint_in_use(id: usize) -> bool {
 
 /// Dequeue a waiting receiver if the queue holds receivers; else None.
 fn take_waiting_receiver(id: usize) -> Option<usize> {
-    // SAFETY: single CPU, IF=0.
-    unsafe {
-        let eps = &*addr_of!(ENDPOINTS);
-        if eps[id].head.is_some() && !eps[id].are_senders {
-            Some(dequeue_waiter(id))
-        } else {
-            None
-        }
-    }
+    take_waiting(id, false)
 }
 
 /// Dequeue a waiting sender if the queue holds senders; else None.
 fn take_waiting_sender(id: usize) -> Option<usize> {
-    // SAFETY: single CPU, IF=0.
+    take_waiting(id, true)
+}
+
+/// Take endpoint `id`'s head waiter iff it is on the `want_senders` side,
+/// driving the pure `WaitQueue` over the scheduler's link array.
+fn take_waiting(id: usize, want_senders: bool) -> Option<usize> {
+    // SAFETY: single CPU, IF=0. ENDPOINTS and WAIT_LINKS are distinct statics,
+    // so the two mutable borrows below do not alias.
     unsafe {
-        let eps = &*addr_of!(ENDPOINTS);
-        if eps[id].head.is_some() && eps[id].are_senders {
-            Some(dequeue_waiter(id))
-        } else {
-            None
-        }
+        let eps = &mut *addr_of_mut!(ENDPOINTS);
+        scheduler::with_wait_links(|links| eps[id].queue.take_if(want_senders, links))
     }
 }
 
 /// Append `slot` to endpoint `id`'s FIFO wait queue, recording which side is
-/// waiting. The link lives in the slot (scheduler.rs).
+/// waiting. The links live in the scheduler's `WAIT_LINKS` array.
 fn enqueue_waiter(id: usize, slot: usize, are_senders: bool) {
-    scheduler::set_wait_next(slot, None);
-    // SAFETY: single CPU, IF=0.
+    // SAFETY: single CPU, IF=0. ENDPOINTS and WAIT_LINKS are distinct statics,
+    // so the two mutable borrows below do not alias.
     unsafe {
         let eps = &mut *addr_of_mut!(ENDPOINTS);
-        match eps[id].tail {
-            Some(tail) => scheduler::set_wait_next(tail, Some(slot)),
-            None => eps[id].head = Some(slot),
-        }
-        eps[id].tail = Some(slot);
-        eps[id].are_senders = are_senders;
-    }
-}
-
-/// Remove and return the head of endpoint `id`'s wait queue. Caller has
-/// checked the queue is non-empty.
-fn dequeue_waiter(id: usize) -> usize {
-    // SAFETY: single CPU, IF=0; caller guarantees a non-empty queue.
-    unsafe {
-        let eps = &mut *addr_of_mut!(ENDPOINTS);
-        let head = eps[id].head.expect("dequeue from empty endpoint queue");
-        eps[id].head = scheduler::wait_next(head);
-        if eps[id].head.is_none() {
-            eps[id].tail = None;
-        }
-        head
+        scheduler::with_wait_links(|links| eps[id].queue.enqueue(slot, are_senders, links));
     }
 }

@@ -94,10 +94,6 @@ struct Slot {
     kernel_rsp: u64,
     /// (va, phys) pairs the kernel mapped for this process, for teardown.
     boot_frames: [Option<(u64, u64)>; MAX_BOOT_FRAMES],
-    /// Intrusive link to the next waiter in an endpoint's queue (ipc.rs).
-    /// Meaningful only while Blocked and enqueued; the queue nodes are the
-    /// process slots themselves, so the wait queue needs no heap.
-    wait_next: Option<usize>,
     /// Message a blocked *sender* is waiting to hand over (ipc.rs).
     pending_msg: u64,
     /// Capability slot a blocked *sender* wants transferred with the message,
@@ -116,7 +112,6 @@ impl Slot {
             process: None,
             kernel_rsp: 0,
             boot_frames: [None; MAX_BOOT_FRAMES],
-            wait_next: None,
             pending_msg: 0,
             pending_cap: u64::MAX,
             pending_call: false,
@@ -132,6 +127,15 @@ struct KStack(#[allow(dead_code)] [u8; KSTACK_SIZE]);
 /// Running` and `process = None`. Single CPU + IF=0 in all kernel code make
 /// the bare `static mut` safe (same discipline as usermode.rs / fault.rs).
 static mut TABLE: [Slot; MAX_PROCESSES] = [const { Slot::empty() }; MAX_PROCESSES];
+
+/// Intrusive next-links for the IPC wait queues (ipc.rs). Indexed by process
+/// slot: `WAIT_LINKS[s]` is the slot after `s` in whatever endpoint queue `s`
+/// is enqueued on. Meaningful only while a slot is Blocked and enqueued; the
+/// link nodes are the process slots themselves, so the wait queue needs no
+/// heap. Kept as a standalone array (rather than a `Slot` field) so the pure
+/// `WaitQueue` structure can be handed the whole link store as one slice. Same
+/// single-CPU + IF=0 discipline as `TABLE`.
+static mut WAIT_LINKS: [Option<usize>; MAX_PROCESSES] = [None; MAX_PROCESSES];
 
 /// Index in TABLE of the process currently on the CPU.
 static mut CURRENT_SLOT: usize = 0;
@@ -540,10 +544,14 @@ pub fn on_exit() -> ! {
     let l4 = proc.l4;
     process::teardown(proc, &boot_frames);
     memory::destroy_address_space(l4);
-    // SAFETY: single CPU, IF=0; the slot is the dying process's own.
+    // SAFETY: single CPU, IF=0; the slot is the dying process's own. A dying
+    // process is never itself an enqueued waiter (death only hits Running), so
+    // clearing its link is hygiene, not correctness -- enqueue rewrites the
+    // link before any reuse anyway.
     unsafe {
         let table = &mut *addr_of_mut!(TABLE);
         table[cur] = Slot::empty();
+        (*addr_of_mut!(WAIT_LINKS))[cur] = None;
     }
 
     // The current process is gone, so when nothing else is runnable it means
@@ -609,15 +617,13 @@ pub fn current_slot() -> usize {
     unsafe { CURRENT_SLOT }
 }
 
-/// Set / read a slot's intrusive wait-queue link.
-pub fn set_wait_next(slot: usize, next: Option<usize>) {
-    // SAFETY: single CPU, IF=0; reached only from IPC dispatch.
-    unsafe { (*addr_of_mut!(TABLE))[slot].wait_next = next }
-}
-
-pub fn wait_next(slot: usize) -> Option<usize> {
-    // SAFETY: as above.
-    unsafe { (*addr_of!(TABLE))[slot].wait_next }
+/// Run `f` with the wait-queue link array, so the IPC layer can drive its pure
+/// `WaitQueue` over the real (single-CPU) link store. Reached only from IPC
+/// dispatch (IF=0); `WAIT_LINKS` is distinct from every other static the IPC
+/// path borrows, so this never aliases.
+pub fn with_wait_links<R>(f: impl FnOnce(&mut [Option<usize>]) -> R) -> R {
+    // SAFETY: single CPU, IF=0; the borrow lives only for the call to `f`.
+    unsafe { f(&mut *addr_of_mut!(WAIT_LINKS)) }
 }
 
 /// Stash the message, cap-slot, and call-flag a blocked sender carries.
@@ -752,5 +758,6 @@ fn teardown_all() {
             }
             *slot = Slot::empty();
         }
+        *addr_of_mut!(WAIT_LINKS) = [None; MAX_PROCESSES];
     }
 }
