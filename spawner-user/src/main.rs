@@ -10,7 +10,7 @@
 #![no_std]
 #![no_main]
 
-use libplinth::{sys_exit, sys_recv, sys_spawn, sys_write, NO_CAP, SYS_ERR};
+use libplinth::{sys_exit, sys_recv, sys_spawn, sys_write, IPC_OK, NO_CAP, SYS_ERR};
 
 /// Spawnable child id (see the kernel's SPAWNABLE table).
 const WORKER_ID: u64 = 0;
@@ -26,7 +26,10 @@ pub extern "C" fn _start(_id: u64) -> ! {
     sys_write(b"spawner: launched worker\n");
 
     // Wait for the worker's result -- the join is just a recv.
-    let result = sys_recv(handle);
+    let (status, result) = sys_recv(handle);
+    if status != IPC_OK {
+        sys_exit(102);
+    }
     emit(result);
     sys_exit(0)
 }

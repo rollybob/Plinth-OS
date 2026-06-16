@@ -664,19 +664,22 @@ pub fn is_blocked(slot: usize) -> bool {
     unsafe { (*addr_of!(TABLE))[slot].state == State::Blocked }
 }
 
-/// Wake a Blocked process: make it Ready and write `rax`/`rdx` into its saved
-/// trap frame, so when the scheduler resumes it the blocking IPC call returns
-/// those values (rax = the word, rdx = the transferred cap's landing slot or
-/// NO_CAP). The receiver reads both; a woken sender ignores rdx (its send
-/// wrapper treats rdx as clobbered).
-pub fn wake_with(slot: usize, rax: u64, rdx: u64) {
+/// Wake a Blocked process: make it Ready and write the IPC result into its
+/// saved trap frame, so when the scheduler resumes it the blocking IPC call
+/// returns these values. ABI v2 splits the result across three registers:
+/// `status` in rax (IPC_OK / IPC_PEER_DIED / IPC_ERR), the message `payload` in
+/// rsi, and the transferred cap's `landing` slot (or NO_CAP) in rdx. A receiver
+/// reads all three; a woken sender reads only the status (its send wrapper
+/// treats rsi/rdx as clobbered).
+pub fn wake_with(slot: usize, status: u64, payload: u64, landing: u64) {
     // SAFETY: the slot is Blocked, so its kernel_rsp points at a valid saved
     // trap frame on its own (live) kernel stack; single CPU, IF=0.
     unsafe {
         let table = &mut *addr_of_mut!(TABLE);
         let frame = table[slot].kernel_rsp as *mut TrapFrame;
-        (*frame).gp[GP_RAX] = rax;
-        (*frame).gp[GP_RDX] = rdx;
+        (*frame).gp[GP_RAX] = status;
+        (*frame).gp[GP_RSI] = payload;
+        (*frame).gp[GP_RDX] = landing;
         table[slot].state = State::Ready;
     }
 }

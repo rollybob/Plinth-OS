@@ -14,7 +14,7 @@
 
 use libplinth::{
     sys_exit, sys_frame_alloc, sys_frame_map, sys_recv_cap, sys_send_cap, sys_write, ENDPOINT_SLOT,
-    MAP_BASE, NO_CAP, SYS_ERR,
+    IPC_OK, MAP_BASE, NO_CAP, SYS_ERR,
 };
 
 /// The data the producer writes and the consumer must read back.
@@ -54,7 +54,10 @@ fn producer() {
 }
 
 fn consumer() {
-    let (_tag, cap_slot) = sys_recv_cap(ENDPOINT_SLOT);
+    let (status, _tag, cap_slot) = sys_recv_cap(ENDPOINT_SLOT);
+    if status != IPC_OK {
+        fail(b"share: consumer recv failed\n");
+    }
     if cap_slot == NO_CAP {
         fail(b"share: consumer received no capability\n");
     }

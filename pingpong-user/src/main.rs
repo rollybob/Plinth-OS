@@ -16,7 +16,7 @@
 #![no_std]
 #![no_main]
 
-use libplinth::{sys_exit, sys_recv, sys_send, sys_write, ENDPOINT_SLOT};
+use libplinth::{sys_exit, sys_recv, sys_send, sys_write, ENDPOINT_SLOT, IPC_OK};
 
 /// Rounds each side performs before exiting.
 const ROUNDS: u64 = 4;
@@ -38,7 +38,10 @@ fn pinger() {
     let mut i = 0;
     while i < ROUNDS {
         sys_send(ENDPOINT_SLOT, i);
-        let reply = sys_recv(ENDPOINT_SLOT);
+        let (status, reply) = sys_recv(ENDPOINT_SLOT);
+        if status != IPC_OK {
+            sys_exit(112);
+        }
         emit(b"ping", i, reply);
         i += 1;
     }
@@ -47,7 +50,10 @@ fn pinger() {
 fn ponger() {
     let mut i = 0;
     while i < ROUNDS {
-        let msg = sys_recv(ENDPOINT_SLOT);
+        let (status, msg) = sys_recv(ENDPOINT_SLOT);
+        if status != IPC_OK {
+            sys_exit(112);
+        }
         sys_send(ENDPOINT_SLOT, msg + PONG_OFFSET);
         emit(b"pong", i, msg);
         i += 1;

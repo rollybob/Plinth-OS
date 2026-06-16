@@ -17,8 +17,9 @@
 //! interrupt gate (vector 0x80, DPL 3): the stub captures a full trap frame,
 //! and a blocked process slots straight into the scheduler's existing
 //! Blocked/`sched_resume` machinery with no change to the context-switch core.
-//! A peer wakes it by writing the result into the saved frame's rax slot
-//! (`scheduler::wake_with`) and flipping it back to Ready. The non-blocking
+//! A peer wakes it by writing the result into the saved frame (`rax` = status,
+//! `rsi` = payload, `rdx` = transferred-cap slot; ABI v2) via
+//! `scheduler::wake_with` and flipping it back to Ready. The non-blocking
 //! syscalls keep using the fast `syscall` path.
 //!
 //! Endpoint creation is the kernel's job in this stage: the boot path makes an
@@ -47,8 +48,15 @@ const IPC_RECV: u64 = 1;
 const IPC_CALL: u64 = 2;
 const IPC_REPLY: u64 = 3;
 
-/// Error sentinel, same convention as the syscall layer (`u64::MAX`).
-const IPC_ERR: u64 = u64::MAX;
+/// IPC status, returned in rax -- separate from the message payload (rsi) and
+/// the transferred-cap landing slot (rdx). Splitting status from the payload
+/// (ABI v2) means no message value, not even `u64::MAX`, can be mistaken for an
+/// error: a peer controls the full payload word, so an in-band error sentinel
+/// would be ambiguous. `IPC_OK` is the only status the rendezvous path produces
+/// today; `IPC_PEER_DIED` arrives with the death-time reaping (Stage C2). See
+/// Design/ipc.md.
+const IPC_OK: u64 = 0;
+const IPC_ERR: u64 = 1;
 
 /// "No capability" sentinel for the optional cap-transfer slot in `send`, and
 /// for the landing-slot `recv` reports when no cap arrived. A real slot is a
@@ -348,14 +356,14 @@ fn ipc_send(ep_slot: u64, msg: u64, cap_slot: u64, frame_ptr: u64) -> u64 {
     };
     if let Some(receiver) = take_waiting_receiver(id) {
         // Rendezvous now: this sender does the transfer into the blocked
-        // receiver, then wakes it with the word and the landing slot.
+        // receiver, then wakes it with OK + the word + the landing slot.
         let landing = if cap_slot != NO_CAP {
             transfer_current_to_blocked(receiver, cap_slot)
         } else {
             NO_CAP
         };
-        scheduler::wake_with(receiver, msg, landing);
-        return 0;
+        scheduler::wake_with(receiver, IPC_OK, msg, landing);
+        return IPC_OK;
     }
     // No receiver waiting: stash the word + cap slot and block as a sender.
     let cur = scheduler::current_slot();
@@ -376,10 +384,11 @@ fn ipc_recv(ep_slot: u64, frame_ptr: u64) -> u64 {
         if scheduler::take_pending_call(sender) {
             // The sender is a caller awaiting a reply: mint it a one-shot
             // reply capability into us and leave it Blocked (only `reply`
-            // wakes it). rdx carries the reply cap's slot.
+            // wakes it). rsi carries the request, rdx the reply cap's slot.
             let reply_slot = mint_reply_cap_into_current(sender);
+            write_rsi(frame_ptr, msg);
             write_rdx(frame_ptr, reply_slot);
-            return msg;
+            return IPC_OK;
         }
         // Plain send: pull any transferred cap, then wake the sender.
         let sender_cap = scheduler::take_pending_cap(sender);
@@ -388,9 +397,10 @@ fn ipc_recv(ep_slot: u64, frame_ptr: u64) -> u64 {
         } else {
             NO_CAP
         };
-        scheduler::wake_with(sender, 0, NO_CAP); // the sender's send() returns 0
-        write_rdx(frame_ptr, landing); // report the landing slot in our rdx
-        return msg;
+        scheduler::wake_with(sender, IPC_OK, 0, NO_CAP); // the sender's send() returns OK
+        write_rsi(frame_ptr, msg); // the message word in our rsi
+        write_rdx(frame_ptr, landing); // the landing slot in our rdx
+        return IPC_OK;
     }
     // No sender waiting: block as a receiver. A later sender does the transfer
     // and wakes us with (msg, landing) via wake_with.
@@ -413,7 +423,7 @@ fn ipc_call(ep_slot: u64, req: u64, frame_ptr: u64) -> u64 {
         // us, wake the server, and block awaiting the reply.
         let caller = scheduler::current_slot();
         let reply_slot = mint_reply_cap_into_blocked(server, caller);
-        scheduler::wake_with(server, req, reply_slot);
+        scheduler::wake_with(server, IPC_OK, req, reply_slot);
     } else {
         // No server yet: block as a call-sender. The receiver will mint the
         // reply cap and leave us blocked until `reply` wakes us.
@@ -450,13 +460,14 @@ fn ipc_reply(reply_slot: u64, msg: u64) -> u64 {
     if !scheduler::is_blocked(caller) {
         return IPC_ERR;
     }
-    scheduler::wake_with(caller, msg, NO_CAP);
+    // The caller's `call` resumes with OK + the reply word in rsi.
+    scheduler::wake_with(caller, IPC_OK, msg, NO_CAP);
     // One-shot: consume the reply capability.
     let mut guard = process::CURRENT.lock();
     if let Some(p) = guard.as_mut() {
         let _ = p.caps.revoke(reply_slot as usize);
     }
-    0
+    IPC_OK
 }
 
 /// Mint a one-shot reply capability naming `caller` into the current (server)
@@ -544,8 +555,20 @@ fn transfer_blocked_to_current(sender: usize, cap_slot: u64) -> u64 {
     }
 }
 
+/// Write `val` into the rsi slot of the trap frame at `frame_ptr`, so a
+/// non-blocking `recv`/`call` returns the message payload there (the stub
+/// restores rsi on iretq). rax carries the status; rsi the payload (ABI v2).
+fn write_rsi(frame_ptr: u64, val: u64) {
+    // SAFETY: frame_ptr is this call's trap frame on the current process's
+    // kernel stack; valid for this call.
+    unsafe {
+        (*(frame_ptr as *mut TrapFrame)).gp[GP_RSI] = val;
+    }
+}
+
 /// Write `val` into the rdx slot of the trap frame at `frame_ptr`, so the
-/// non-blocking `recv` returns it in rdx (the stub restores rdx on iretq).
+/// non-blocking `recv` returns the transferred-cap landing slot in rdx (the
+/// stub restores rdx on iretq).
 fn write_rdx(frame_ptr: u64, val: u64) {
     // SAFETY: frame_ptr is this call's trap frame on the current process's
     // kernel stack; valid for this call.

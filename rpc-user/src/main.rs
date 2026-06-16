@@ -11,7 +11,7 @@
 #![no_std]
 #![no_main]
 
-use libplinth::{sys_call, sys_exit, sys_recv_cap, sys_reply, sys_write, ENDPOINT_SLOT};
+use libplinth::{sys_call, sys_exit, sys_recv_cap, sys_reply, sys_write, ENDPOINT_SLOT, IPC_OK};
 
 /// Number of requests exchanged.
 const N: u64 = 3;
@@ -32,7 +32,10 @@ pub extern "C" fn _start(id: u64) -> ! {
 fn server() {
     let mut i = 0;
     while i < N {
-        let (req, reply_cap) = sys_recv_cap(ENDPOINT_SLOT);
+        let (status, req, reply_cap) = sys_recv_cap(ENDPOINT_SLOT);
+        if status != IPC_OK {
+            sys_exit(112);
+        }
         sys_reply(reply_cap, req + RESP_OFFSET);
         emit_one(b"server: served ", req);
         i += 1;
@@ -42,7 +45,10 @@ fn server() {
 fn client() {
     let mut i = 0;
     while i < N {
-        let resp = sys_call(ENDPOINT_SLOT, i);
+        let (status, resp) = sys_call(ENDPOINT_SLOT, i);
+        if status != IPC_OK {
+            sys_exit(112);
+        }
         emit_two(b"client: call ", i, b" got ", resp);
         i += 1;
     }

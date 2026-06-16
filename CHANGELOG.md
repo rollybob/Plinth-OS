@@ -16,7 +16,9 @@ within a major series.
   frame); `call`/`reply` is request/response RPC, where the server answers via
   a one-shot reply capability and needs no send right of its own. Blocking
   operations enter through a software-interrupt gate so they reuse the
-  scheduler's context-switch path.
+  scheduler's context-switch path. An IPC operation returns a status (`RAX`)
+  separately from its message payload (`RSI`), so a peer-controlled word can
+  never be mistaken for an error.
 - `spawn` is reconciled with the scheduler: it launches the child as an
   independent scheduled process and returns a handle (a receive capability on
   a result channel); the parent waits by `recv`-ing it. This removed the old

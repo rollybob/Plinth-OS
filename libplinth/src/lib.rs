@@ -169,7 +169,9 @@ pub fn sys_fault_return() -> ! {
 // resumable with a return value, and the kernel resumes a process by
 // restoring a full register trap frame -- which an interrupt entry saves but
 // the syscall fast path does not. The op selector goes in rax, args in
-// rdi/rsi, result in rax, mirroring the syscall ABI.
+// rdi/rsi; the result comes back as status in rax, payload in rsi, and any
+// transferred-cap slot in rdx (ABI v2 -- status is split from the payload so a
+// peer-controlled word can never be mistaken for an error).
 
 const IPC_SEND: u64 = 0;
 const IPC_RECV: u64 = 1;
@@ -181,8 +183,17 @@ const IPC_REPLY: u64 = 3;
 /// A real slot is a small index, so `u64::MAX` is unambiguous.
 pub const NO_CAP: u64 = u64::MAX;
 
+/// IPC status, returned in rax separately from the message payload (rsi) and
+/// any transferred-cap slot (rdx). A peer controls the whole payload word, so
+/// the status MUST be its own field: no value -- not even `u64::MAX` -- can be
+/// mistaken for an error or a dead peer (ABI v2). `recv`/`call` return
+/// `(status, ...)`; a non-`IPC_OK` status means no message was delivered.
+/// `IPC_PEER_DIED` is delivered by the kernel's death-time reaping.
+pub const IPC_OK: u64 = 0;
+pub const IPC_ERR: u64 = 1;
+
 /// Send the one-word message `msg` on the endpoint capability at `ep_slot`,
-/// blocking until a receiver takes it. Returns 0 on success, or SYS_ERR for a
+/// blocking until a receiver takes it. Returns `IPC_OK`, or `IPC_ERR` for a
 /// bad slot or missing send right.
 #[inline]
 pub fn sys_send(ep_slot: u64, msg: u64) -> u64 {
@@ -214,63 +225,71 @@ pub fn sys_send_cap(ep_slot: u64, msg: u64, cap_slot: u64) -> u64 {
 }
 
 /// Receive a one-word message from the endpoint capability at `ep_slot`,
-/// blocking until a sender arrives. Returns the message, or SYS_ERR for a bad
-/// slot or missing receive right. Any capability the sender transferred lands
-/// in this process's table but its slot is dropped -- use `sys_recv_cap` when
-/// you expect a capability.
+/// blocking until a sender arrives. Returns `(status, msg)`: `status` is
+/// `IPC_OK` on a real message (or `IPC_PEER_DIED` / `IPC_ERR`), and `msg` is
+/// meaningful only when `status == IPC_OK`. Any capability the sender
+/// transferred lands in this process's table but its slot is dropped -- use
+/// `sys_recv_cap` when you expect a capability.
 #[inline]
-pub fn sys_recv(ep_slot: u64) -> u64 {
-    let (msg, _cap_slot) = sys_recv_cap(ep_slot);
-    msg
+pub fn sys_recv(ep_slot: u64) -> (u64, u64) {
+    let (status, msg, _cap_slot) = sys_recv_cap(ep_slot);
+    (status, msg)
 }
 
-/// Receive a message and any transferred capability. Returns `(msg,
-/// cap_slot)`, where `cap_slot` is where the capability landed in this
-/// process's table, or `NO_CAP` if none was sent.
+/// Receive a message and any transferred capability. Returns `(status, msg,
+/// cap_slot)`: `status` (rax) is `IPC_OK` / `IPC_PEER_DIED` / `IPC_ERR`, `msg`
+/// (rsi) is the message word, and `cap_slot` (rdx) is where a transferred
+/// capability landed in this process's table, or `NO_CAP` if none was sent.
+/// `msg` and `cap_slot` are meaningful only when `status == IPC_OK`.
 #[inline]
-pub fn sys_recv_cap(ep_slot: u64) -> (u64, u64) {
+pub fn sys_recv_cap(ep_slot: u64) -> (u64, u64, u64) {
+    let status: u64;
     let msg: u64;
     let cap_slot: u64;
-    // SAFETY: as sys_send_cap. recv returns msg in rax and the landing slot
-    // in rdx.
+    // SAFETY: as sys_send_cap. recv returns status in rax, the message in rsi,
+    // and the transferred-cap landing slot in rdx (ABI v2).
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            inlateout("rax") IPC_RECV => msg,
+            inlateout("rax") IPC_RECV => status,
             in("rdi") ep_slot,
+            out("rsi") msg,
             out("rdx") cap_slot,
-            out("rsi") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
             options(nostack),
         );
     }
-    (msg, cap_slot)
+    (status, msg, cap_slot)
 }
 
 /// Send a request and block for a reply (RPC). Sends `req` on the endpoint at
-/// `ep_slot` and returns the reply word the server sends back. Returns SYS_ERR
-/// for a bad slot or missing send right. The kernel mints the server a one-shot
-/// reply capability naming this caller; the server answers with `sys_reply`.
+/// `ep_slot` and returns `(status, reply)`: `status` (rax) is `IPC_OK` /
+/// `IPC_PEER_DIED` / `IPC_ERR`, and `reply` (rsi) is the server's reply word,
+/// meaningful only when `status == IPC_OK`. The kernel mints the server a
+/// one-shot reply capability naming this caller; the server answers with
+/// `sys_reply`.
 #[inline]
-pub fn sys_call(ep_slot: u64, req: u64) -> u64 {
-    let ret: u64;
-    // SAFETY: as sys_send_cap.
+pub fn sys_call(ep_slot: u64, req: u64) -> (u64, u64) {
+    let status: u64;
+    let reply: u64;
+    // SAFETY: as sys_send_cap. rsi carries the request in and the reply out.
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            inlateout("rax") IPC_CALL => ret,
+            inlateout("rax") IPC_CALL => status,
             in("rdi") ep_slot,
-            in("rsi") req,
+            inlateout("rsi") req => reply,
             out("rdx") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
             options(nostack),
         );
     }
-    ret
+    (status, reply)
 }
 
 /// Reply to the caller named by the one-shot reply capability at `reply_slot`
 /// (which `sys_recv_cap` returned when it received a `call`), delivering `msg`
-/// as the caller's `sys_call` result. Consumes the capability. Returns 0, or
-/// SYS_ERR if the slot is not a live reply capability.
+/// as the caller's `sys_call` result. Consumes the capability. Returns
+/// `IPC_OK`, or `IPC_ERR` if the slot is not a live reply capability.
 #[inline]
 pub fn sys_reply(reply_slot: u64, msg: u64) -> u64 {
     let ret: u64;

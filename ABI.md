@@ -15,7 +15,11 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
 
 - **New: synchronous IPC** -- endpoints, `send`/`recv`, capability transfer
   through messages, and `call`/`reply` RPC (the "IPC interface" section). These
-  enter through a software-interrupt gate, not `syscall`.
+  enter through a software-interrupt gate, not `syscall`. An IPC operation
+  returns a **status** separately from its **payload** (status in `RAX`, payload
+  in `RSI`), so a peer-controlled message word can never be mistaken for an
+  error -- including the `IPC_PEER_DIED` status that frees a process blocked on
+  a dead counterpart.
 - **New: capability kinds** -- `Endpoint` and `Reply`, with `SEND`/`RECV`
   rights.
 - **Changed: `spawn`** no longer runs a child synchronously and returns its
@@ -92,18 +96,23 @@ suspend and later resume it, which the `syscall` fast path does not do. The
 convention mirrors the syscall one:
 
 - The operation selector goes in `RAX`; arguments in `RDI`, `RSI`, `RDX`.
-- Results come back in `RAX` (and `RDX` for `recv`, below).
+- Results come back as a **status in `RAX`** -- `IPC_OK = 0`,
+  `IPC_PEER_DIED = 2`, or `IPC_ERR = 1` (bad slot or missing right) -- the
+  **message payload in `RSI`** (`recv`/`call`), and the transferred-capability
+  slot in `RDX` (`recv`). The payload and cap slot are meaningful only when the
+  status is `IPC_OK`. Splitting status from the payload means no message word,
+  not even `u64::MAX`, can be mistaken for an error or a dead peer.
 - The handler returns via `iretq`, which restores every register except the
-  result register(s); for forward compatibility treat `RCX`, `R8`-`R11` (and
+  result registers; for forward compatibility treat `RCX`, `R8`-`R11` (and
   `RDX` where it is not a documented result) as clobbered.
-- `SYS_ERR` and `NO_CAP` are both `u64::MAX`.
+- `NO_CAP = u64::MAX` is the `RDX` "no capability was transferred" sentinel.
 
-| Op (RAX) | Name  | Args (RDI, RSI, RDX)        | Returns (RAX, RDX)                |
-|----------|-------|-----------------------------|-----------------------------------|
-| 0        | send  | ep_slot, msg, cap_slot      | 0 or `SYS_ERR`                    |
-| 1        | recv  | ep_slot                     | msg; cap landing slot or `NO_CAP`|
-| 2        | call  | ep_slot, req                | reply word                        |
-| 3        | reply | reply_slot, msg             | 0 or `SYS_ERR`                    |
+| Op (RAX) | Name  | Args (RDI, RSI, RDX)   | Returns (RAX status, RSI, RDX)            |
+|----------|-------|------------------------|-------------------------------------------|
+| 0        | send  | ep_slot, msg, cap_slot | status                                    |
+| 1        | recv  | ep_slot                | status; msg in RSI; cap slot/`NO_CAP` RDX |
+| 2        | call  | ep_slot, req           | status; reply word in RSI                 |
+| 3        | reply | reply_slot, msg        | status                                    |
 
 Notes:
 
@@ -115,23 +124,26 @@ Notes:
   `cap_slot` is not `NO_CAP`, the capability there is transferred to the
   receiver: it is revoked from the sender (and, if it is a mapped frame,
   unmapped here -- the capability and the access leave together), and minted
-  into the receiver, which learns its slot from `recv`. Returns 0, or
-  `SYS_ERR` for a bad slot or missing right.
+  into the receiver, which learns its slot from `recv`. Returns the status in
+  `RAX` (`IPC_OK`, or `IPC_ERR` for a bad slot or missing right).
 - **recv(ep_slot)** requires `RIGHT_RECV`. It blocks until a sender arrives,
-  then returns the message word in `RAX` and, in `RDX`, the slot where a
-  transferred capability landed (or `NO_CAP` if none). A `recv` that picks up
-  a `call` instead returns a one-shot **reply capability** in `RDX` -- use it
-  with `reply`.
+  then returns `IPC_OK` in `RAX`, the message word in `RSI`, and in `RDX` the
+  slot where a transferred capability landed (or `NO_CAP` if none). A `recv`
+  that picks up a `call` instead returns a one-shot **reply capability** in
+  `RDX` -- use it with `reply`. A non-`IPC_OK` status (`IPC_PEER_DIED` if the
+  only counterpart died, `IPC_ERR` for a bad slot/right) means no message: the
+  `RSI`/`RDX` values are not valid.
 - **call(ep_slot, req)** requires `RIGHT_SEND`. It sends a request and blocks
-  for a reply, returning the reply word. The kernel mints the receiving server
-  a one-shot reply capability naming this caller; the caller stays blocked
-  until the server `reply`s.
+  for a reply, returning `IPC_OK` in `RAX` and the reply word in `RSI`. The
+  kernel mints the receiving server a one-shot reply capability naming this
+  caller; the caller stays blocked until the server `reply`s -- or is woken
+  with `IPC_PEER_DIED` if the server dies holding the reply capability.
 - **reply(reply_slot, msg)** wakes the caller named by the one-shot reply
   capability at `reply_slot` (which `recv` returned), delivering `msg` as the
   caller's `call` result, and consumes the capability. No endpoint right is
   needed -- holding the reply capability is the authority, so a receive-only
-  server can still answer. Returns 0, or `SYS_ERR` if the slot is not a live
-  reply capability.
+  server can still answer. Returns the status in `RAX` (`IPC_OK`, or `IPC_ERR`
+  if the slot is not a live reply capability).
 
 A program creates its own endpoints only indirectly so far: the kernel makes
 one per `spawn` (the result channel) and may grant one at launch. A
