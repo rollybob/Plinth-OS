@@ -12,6 +12,7 @@
 //! |  8 | fault_return| --                  | (resumes), or ERR        |
 //! |  9 | spawn       | child_id, slot      | child exit code, or ERR  |
 //! | 10 | block_read  | rng, frm, sec, count| BLK_OK, or a BLK_E_* code |
+//! | 11 | spawn_buf   | buf_va, len, slot   | wait handle, or ERR      |
 //!
 //! block_read is the first syscall to take a fourth argument: it arrives in r8
 //! (the System V C ABI's fifth register, after nr+three args), which the entry
@@ -183,6 +184,7 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         8 => sys_fault_return(),
         9 => sys_spawn(a1, a2),
         10 => sys_block_read(a1, a2, a3, a4),
+        11 => sys_spawn_from_buffer(a1, a2, a3),
         _ => ERR,
     }
 }
@@ -441,6 +443,80 @@ fn sys_spawn(child_id: u64, transfer_slot: u64) -> u64 {
     let Some(binary) = process::spawnable(child_id as usize) else {
         return ERR;
     };
+    spawn_scheduled(binary, transfer_slot)
+}
+
+/// Largest ELF the spawn-from-buffer path accepts, in bytes. The real user
+/// binaries are ~7-13 KiB; this is generous headroom while still bounding the
+/// page-validation loop and the image the child must fit. A larger buffer is
+/// rejected up front.
+const MAX_SPAWN_ELF: u64 = 256 * 1024;
+
+/// spawn_from_buffer(buf_va, len, transfer_slot): like `spawn`, but the child's
+/// ELF image comes from `len` bytes at `buf_va` in the CALLER's address space
+/// (a library OS's buffer -- e.g. an FS libOS that read the bytes off disk),
+/// not the kernel's embedded `SPAWNABLE` table. This is the load-from-disk path
+/// (ABI v2.x): application binaries live on disk, while embedded `SPAWNABLE`
+/// stays as the built-in bootstrap loader (D8b).
+///
+/// The buffer is untrusted input -- a libOS-supplied ELF can lie about every
+/// field -- so it flows through the same audited `elf::parse` validator as
+/// every other binary (elf.rs, D8a audit). Before reading it, the kernel checks
+/// (exactly as `write` does) that the whole range lies in the user map window
+/// and every page is mapped and user-accessible, so a bogus pointer faults the
+/// syscall cleanly instead of reading kernel memory. Syscalls run with
+/// interrupts masked on a single CPU, so the caller cannot run (or remap) while
+/// the kernel copies the bytes into the child's frames.
+fn sys_spawn_from_buffer(buf_va: u64, len: u64, transfer_slot: u64) -> u64 {
+    if len == 0 || len > MAX_SPAWN_ELF || buf_va % FRAME_SIZE != 0 {
+        return ERR;
+    }
+    let Some(last) = buf_va.checked_add(len - 1) else {
+        return ERR;
+    };
+    if !(USER_MAP_BASE..USER_MAP_END).contains(&buf_va)
+        || !(USER_MAP_BASE..USER_MAP_END).contains(&last)
+    {
+        return ERR;
+    }
+
+    // Every page of the buffer must be mapped and user-accessible in the
+    // caller's address space (the active one) before the kernel reads it.
+    let l4 = {
+        let cur = process::CURRENT.lock();
+        match cur.as_ref() {
+            Some(proc) => proc.l4,
+            None => return ERR,
+        }
+    };
+    let mut page = buf_va & !(FRAME_SIZE - 1);
+    loop {
+        if !memory::user_accessible(l4, page) {
+            return ERR;
+        }
+        if page >= last & !(FRAME_SIZE - 1) {
+            break;
+        }
+        page += FRAME_SIZE;
+    }
+
+    // SAFETY: every page in [buf_va, buf_va+len) was just verified mapped and
+    // user-accessible in the active address space; IF is masked and the CPU is
+    // single, so no other process can run to unmap it and the caller is
+    // suspended in this syscall. scheduler::spawn consumes the bytes
+    // synchronously (it copies the segments into the child's frames) before
+    // this returns, so the borrow never outlives the mapping.
+    let binary = unsafe { core::slice::from_raw_parts(buf_va as *const u8, len as usize) };
+
+    spawn_scheduled(binary, transfer_slot)
+}
+
+/// Shared body of the two spawn syscalls: launch `binary` as an independent,
+/// concurrently scheduled process with a fresh result channel, optionally
+/// moving one capability from the caller into the child (at GRANT_SLOT), and
+/// return the caller's RECV handle on that channel (recv on it IS the wait).
+/// Returns the handle slot, or ERR. Non-blocking.
+fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
     let phys = process::phys_offset();
 
     // A fresh result channel for this spawn.
@@ -519,7 +595,7 @@ fn sys_block_read(range_slot: u64, frame_slot: u64, sector_off: u64, count: u64)
 
     // Resolve both capabilities under the CURRENT lock, then drop it before the
     // (polled) device I/O -- nothing the read touches needs CURRENT.
-    let (abs_sector, frame_phys) = {
+    let (dev, abs_sector, frame_phys) = {
         let cur = process::CURRENT.lock();
         let Some(proc) = cur.as_ref() else {
             return BLK_E_RIGHTS;
@@ -529,7 +605,7 @@ fn sys_block_read(range_slot: u64, frame_slot: u64, sector_off: u64, count: u64)
         let Ok(range) = proc.caps.lookup(range_slot as usize, RIGHT_READ) else {
             return BLK_E_RIGHTS;
         };
-        let CapObject::BlockRange { start, count: range_count } = range.object else {
+        let CapObject::BlockRange { dev, start, count: range_count } = range.object else {
             return BLK_E_RIGHTS;
         };
         // Multiplexing guarantee: [sector_off, sector_off+count) must lie inside
@@ -549,10 +625,10 @@ fn sys_block_read(range_slot: u64, frame_slot: u64, sector_off: u64, count: u64)
             return BLK_E_RIGHTS;
         };
 
-        (start + sector_off, addr)
+        (dev, start + sector_off, addr)
     };
 
-    match virtio_blk::read(abs_sector, count, frame_phys) {
+    match virtio_blk::read(dev as usize, abs_sector, count, frame_phys) {
         Ok(()) => BLK_OK,
         Err(_) => BLK_E_DEV,
     }

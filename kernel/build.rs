@@ -11,9 +11,12 @@
 
 use std::path::PathBuf;
 
+// Embedded in the kernel. fsdemo (the FS library-OS loader) is embedded as the
+// bootstrap loader; diskhello is deliberately absent -- it lives only in the
+// boot archive, so running it proves the load-from-disk path.
 const USER_BINARIES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "share", "rpc", "faultchild", "blk",
+    "share", "rpc", "faultchild", "blk", "fsdemo",
 ];
 
 fn main() {

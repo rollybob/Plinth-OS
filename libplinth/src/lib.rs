@@ -19,6 +19,7 @@
 //! |  8 | fault_return| --           | (resumes faulting insn)  |
 //! |  9 | spawn       | child_id, slot| child exit code, or ERR |
 //! | 10 | block_read  | rng,frm,sec,cnt| BLK_OK, or a BLK_E_* code |
+//! | 11 | spawn_buf   | buf_va, len, slot| wait handle, or SYS_ERR |
 
 #![no_std]
 
@@ -171,6 +172,19 @@ pub fn sys_cpu_charge(slot: u64, amount: u64) -> u64 {
 #[inline]
 pub fn sys_spawn(child_id: u64, transfer_slot: u64) -> u64 {
     syscall3(9, child_id, transfer_slot, 0)
+}
+
+/// Launch a child from an ELF image the caller holds in its own memory, rather
+/// than from the kernel's embedded table. `buf` must be a page-aligned,
+/// contiguous, mapped buffer (e.g. frames the caller allocated and mapped from
+/// MAP_BASE) holding the whole ELF; this is how a library OS launches a program
+/// it read from disk. Returns a wait handle (like `sys_spawn`), or SYS_ERR if
+/// the buffer is unmapped/out of range/too large or the spawn failed.
+/// `transfer_slot` moves one capability into the child (or NO_CAP for none).
+/// Non-blocking; collect the result with `sys_recv(handle)`.
+#[inline]
+pub fn sys_spawn_from_buffer(buf: &[u8], transfer_slot: u64) -> u64 {
+    syscall3(11, buf.as_ptr() as u64, buf.len() as u64, transfer_slot)
 }
 
 /// Register `entry` as this process's page-fault handler, to run on the

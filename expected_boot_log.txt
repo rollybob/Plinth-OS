@@ -8,15 +8,21 @@ plinth: IDT loaded
 plinth: syscall interface ready
 plinth: timer armed
 
-# Stage 1 storage bring-up: discover virtio-blk over legacy PCI config space,
-# bring up the modern device, and prove it with a single polled read of sector 0
-# verified against the deterministic byte-ramp image. Only the stable summary
-# lines are asserted -- the per-BAR / per-capability lines carry addresses that
-# can shift across QEMU versions.
+# Storage bring-up: discover virtio-blk over legacy PCI config space and bring
+# up every device. Two disks are attached: device 0 (slot 3) is the 1 MiB
+# byte-ramp test image, device 1 (slot 4) is the read-only boot archive. Each
+# is proved with a single polled read of sector 0 -- the ramp disk against the
+# deterministic ramp, the archive disk only as a distinct, readable second
+# device (the kernel does not parse the archive format; that is the FS libOS's
+# job). Only stable summary lines are asserted: the per-BAR / per-capability
+# lines carry addresses that can shift across QEMU versions, and device 1's
+# capacity line is omitted because the archive size tracks the user ELFs.
 plinth: scanning PCI bus
 plinth: virtio-blk found at 00:03.0
-plinth: virtio-blk ready (queue 0, size 64, capacity 2048 sectors)
-plinth: virtio-blk sector 0 read ok (ramp verified)
+plinth: virtio-blk found at 00:04.0
+plinth: virtio-blk[0] ready (queue 0, size 64, capacity 2048 sectors)
+plinth: virtio-blk[0] sector 0 read ok (ramp verified)
+plinth: virtio-blk[1] sector 0 read ok (distinct disk)
 
 plinth: running hello
 hello: ring 3
@@ -128,5 +134,19 @@ plinth: blk demo: 1 processes
 blk: read ok b0=1 b1=2 b5=6
 blk: out-of-range rejected
 plinth: blk demo: all done
+
+# Phase 2 storage, load-from-disk: the FS library-OS demo. The kernel grants
+# fsdemo a BlockRange over the archive device; fsdemo uses libfs to parse the
+# on-disk archive, find "diskhello" by name, read its ELF off the disk, and
+# launch it via spawn_from_buffer. diskhello is NOT embedded in the kernel (it
+# lives only in the archive), so its "running from disk" line proves the load
+# path end to end; it reports 777 back over the spawn result channel. The frame
+# counts around the demo must match (check_frames_baseline) -- fsdemo's and
+# diskhello's frames are all reclaimed at teardown.
+plinth: fs demo: 1 processes
+fsdemo: loading 'diskhello' from the boot archive
+diskhello: running from disk
+fsdemo: diskhello returned 777
+plinth: fs demo: all done
 
 plinth: boot ok

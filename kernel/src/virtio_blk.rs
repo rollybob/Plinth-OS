@@ -88,9 +88,21 @@ struct VirtioBlk {
     status_phys: u64,
     /// Last used-ring index we have consumed (the ring's idx is free-running).
     last_used: u16,
+    /// Device capacity in 512-byte sectors (virtio-blk device-config offset 0).
+    /// The boot code grants a whole-device BlockRange of this many sectors.
+    capacity: u64,
 }
 
-static VIRTIO_BLK: Mutex<Option<VirtioBlk>> = Mutex::new(None);
+/// One slot per virtio-blk device the kernel tracks (pci::MAX_DEVICES). A
+/// device's index here is its PCI-slot discovery order (see `pci`); the boot
+/// code brings each up at its index and mints BlockRange capabilities against
+/// it. Per-device locks (rather than one lock around the array) keep the
+/// devices independent -- though Plinth is uniprocessor, so it is the cleaner
+/// shape rather than a performance need. The `[CONST; N]` form is how a
+/// non-Copy `Mutex` array is built in a `static`.
+const NEW_DEVICE: Mutex<Option<VirtioBlk>> = Mutex::new(None);
+static DEVICES: [Mutex<Option<VirtioBlk>>; pci::MAX_DEVICES] =
+    [NEW_DEVICE; pci::MAX_DEVICES];
 
 // --- volatile MMIO / ring accessors ---
 #[inline]
@@ -226,14 +238,19 @@ fn required_span(info: &VirtioBlkInfo) -> u64 {
         .max(end(info.notify))
 }
 
-/// Bring the device up: enable bus mastering, map its BAR, negotiate features,
-/// stand up queue 0, and stash it for `read_block`. Call once at boot, after
-/// `pci::discover`.
+/// Bring device `dev` up: enable bus mastering, map its BAR, negotiate
+/// features, stand up queue 0, and stash it in `DEVICES[dev]` for `read`. Call
+/// once per device at boot, after `pci::discover_all`; `dev` is the device's
+/// index in the discovered map.
 pub fn init<W: Write>(
     out: &mut W,
     info: &VirtioBlkInfo,
     phys_offset: u64,
+    dev: usize,
 ) -> Result<(), &'static str> {
+    if dev >= pci::MAX_DEVICES {
+        return Err("virtio-blk device index out of range");
+    }
     let bar = info.common.bar;
     if info.isr.bar != bar || info.device.bar != bar || info.notify.bar != bar {
         return Err("virtio-blk spreads structures across multiple BARs (unsupported)");
@@ -319,7 +336,7 @@ pub fn init<W: Write>(
     // SAFETY: device_cfg is the mapped device-config MMIO.
     let capacity = unsafe { r64(device_cfg) };
 
-    *VIRTIO_BLK.lock() = Some(VirtioBlk {
+    *DEVICES[dev].lock() = Some(VirtioBlk {
         notify,
         notify_mult: info.notify_mult,
         queue_notify_off,
@@ -333,70 +350,84 @@ pub fn init<W: Write>(
         status_va: buf_va + 16,
         status_phys: buf_phys + 16,
         last_used: 0,
+        capacity,
     });
 
     let _ = writeln!(
         out,
-        "plinth: virtio-blk ready (queue 0, size {qsize}, capacity {capacity} sectors)"
+        "plinth: virtio-blk[{dev}] ready (queue 0, size {qsize}, capacity {capacity} sectors)"
     );
     Ok(())
 }
 
-/// True once the device is brought up and ready for `read`. The block demo
-/// and the block syscall gate on this.
-pub fn ready() -> bool {
-    VIRTIO_BLK.lock().is_some()
+/// True once device `dev` is brought up and ready for `read`. The block demo
+/// and the block syscall gate on this. An out-of-range index is simply "not
+/// ready".
+pub fn ready(dev: usize) -> bool {
+    DEVICES.get(dev).is_some_and(|m| m.lock().is_some())
 }
 
-/// Read `count` 512-byte sectors starting at `sector` into the frame at
-/// `data_phys` (the device DMAs there). The kernel block syscall calls this;
-/// the caller is responsible for the buffer being at least count*512 bytes and
-/// for validating the range against the holder's BlockRange capability.
-pub fn read(sector: u64, count: u64, data_phys: u64) -> Result<(), &'static str> {
-    let mut guard = VIRTIO_BLK.lock();
+/// Capacity of device `dev` in 512-byte sectors, or None if it is not present.
+/// The boot code uses this to grant a BlockRange spanning the whole device.
+pub fn capacity(dev: usize) -> Option<u64> {
+    DEVICES.get(dev).and_then(|m| m.lock().as_ref().map(|d| d.capacity))
+}
+
+/// Read `count` 512-byte sectors starting at `sector` from device `dev` into
+/// the frame at `data_phys` (the device DMAs there). The kernel block syscall
+/// calls this; the caller is responsible for the buffer being at least
+/// count*512 bytes and for validating the range (device, start, count) against
+/// the holder's BlockRange capability.
+pub fn read(dev: usize, sector: u64, count: u64, data_phys: u64) -> Result<(), &'static str> {
+    let mut guard = DEVICES.get(dev).ok_or("invalid block device")?.lock();
     match guard.as_mut() {
-        Some(dev) => dev.read_block(sector, count, data_phys),
+        Some(d) => d.read_block(sector, count, data_phys),
         None => Err("virtio-blk not initialised"),
     }
 }
 
-/// Stage 1 proof: read sector 0 into a scratch frame and verify it against the
-/// deterministic byte ramp the xtask image is filled with (byte i == i % 256).
+/// Storage bring-up proof: read sector 0 of device `dev` into a scratch frame
+/// and check it. `ramp` selects the expectation:
+///
+/// - `true` (the ramp/test disk, device 0): the sector must match the
+///   deterministic byte ramp the xtask image is filled with (byte i == i%256).
+/// - `false` (any other disk, e.g. the archive on device 1): the read must
+///   succeed and the sector must NOT be the ramp -- proving it is a distinct,
+///   separately readable device, without the kernel knowing that disk's format
+///   (the on-disk layout is the FS libOS's business, not the kernel's).
+///
 /// Allocates and frees the scratch frame, so it leaves the frame pool as it
 /// found it. Returns true on success.
-pub fn selftest_read<W: Write>(out: &mut W, phys_offset: u64) -> bool {
+pub fn selftest_read<W: Write>(out: &mut W, phys_offset: u64, dev: usize, ramp: bool) -> bool {
     let (phys, va) = match alloc_zeroed(phys_offset) {
         Ok(x) => x,
         Err(e) => {
-            let _ = writeln!(out, "plinth: virtio-blk selftest: {e}");
+            let _ = writeln!(out, "plinth: virtio-blk[{dev}] selftest: {e}");
             return false;
         }
     };
 
-    let result = {
-        let mut guard = VIRTIO_BLK.lock();
-        match guard.as_mut() {
-            Some(dev) => dev.read_block(0, 1, phys),
-            None => Err("virtio-blk not initialised"),
+    let result = read(dev, 0, 1, phys);
+
+    // Whether the first SECTOR_SIZE bytes match the ramp formula (byte i==i%256).
+    let is_ramp = || {
+        for i in 0..SECTOR_SIZE {
+            // SAFETY: va is the scratch frame, mapped, and 512 bytes were just
+            // DMA'd into it.
+            if unsafe { r8(va + i) } != (i % 256) as u8 {
+                return false;
+            }
         }
+        true
     };
 
     let ok = match result {
-        Ok(()) => {
-            let mut good = true;
-            for i in 0..SECTOR_SIZE {
-                // SAFETY: va is the scratch frame, mapped and 512 bytes were
-                // just DMA'd into it.
-                let b = unsafe { r8(va + i) };
-                if b != (i % 256) as u8 {
-                    good = false;
-                    break;
-                }
-            }
-            good
-        }
+        Ok(()) if ramp => is_ramp(),
+        // A non-ramp disk: the read succeeded; require it to differ from the
+        // ramp so we know it is genuinely a second disk and not the same image.
+        Ok(()) => !is_ramp(),
         Err(e) => {
-            let _ = writeln!(out, "plinth: virtio-blk read error: {e}");
+            let _ = writeln!(out, "plinth: virtio-blk[{dev}] read error: {e}");
             false
         }
     };
@@ -405,10 +436,16 @@ pub fn selftest_read<W: Write>(out: &mut W, phys_offset: u64) -> bool {
         let _ = fa.dealloc(phys);
     }
 
-    if ok {
-        let _ = writeln!(out, "plinth: virtio-blk sector 0 read ok (ramp verified)");
-    } else {
-        let _ = writeln!(out, "plinth: virtio-blk sector 0 read FAILED");
+    match (ok, ramp) {
+        (true, true) => {
+            let _ = writeln!(out, "plinth: virtio-blk[{dev}] sector 0 read ok (ramp verified)");
+        }
+        (true, false) => {
+            let _ = writeln!(out, "plinth: virtio-blk[{dev}] sector 0 read ok (distinct disk)");
+        }
+        (false, _) => {
+            let _ = writeln!(out, "plinth: virtio-blk[{dev}] sector 0 read FAILED");
+        }
     }
     ok
 }

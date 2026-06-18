@@ -3,13 +3,28 @@
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
 follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
-current contract is **v2**. v2 adds IPC and revised `spawn`, breaking v1 --
-the one incompatible ABI change so far; later additions will not break v2
-within a major series.
+current contract is **v2.1**. v2 added IPC and revised `spawn`, breaking v1 --
+the one incompatible ABI change so far; v2.1 adds `spawn_from_buffer` (the
+load-from-disk path) without breaking v2.
 
 ## [Unreleased]
 
 ### Added
+- Load-from-disk (Phase 2 close, final piece). A read-only **boot archive**
+  (superblock + directory of `(name, first_sector, byte_len)` + sector-aligned
+  ELF blobs) is assembled by xtask and attached as a **second virtio-blk
+  device**; `BlockRange` now names `(dev, start, count)`, so a range is bound to
+  one device. A new **`libfs`** library OS parses the archive (a pure,
+  host-unit-tested parser -- the filesystem as unprivileged policy) and, given a
+  `BlockRange` over the archive disk, reads a named program's ELF off the disk
+  into frames and launches it via a new **`spawn_from_buffer`** syscall (ABI
+  v2.1, additive). The kernel runs the disk-supplied ELF through the same
+  validator as embedded binaries, audited for untrusted input (bounds and
+  overflow checks on every header and segment field). An `fsdemo` library OS
+  loads `diskhello` -- a program that exists *only* in the archive, not embedded
+  in the kernel -- and collects its result, proving the path end to end;
+  embedded `spawn`-by-id stays as the bootstrap loader. `xtask smoke` verifies
+  the loaded program ran and that frames return to baseline.
 - Block storage (Phase 2 close), in three pieces. The kernel brings up a
   **virtio-blk modern (virtio-pci) device** (`kernel/src/pci.rs`,
   `kernel/src/virtio_blk.rs`): PCI enumeration over legacy config space

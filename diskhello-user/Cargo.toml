@@ -1,0 +1,27 @@
+# Standalone crate -- intentionally not a workspace member.
+#
+# This program is deliberately NOT embedded in the kernel (it is absent from
+# kernel/build.rs's USER_BINARIES). It exists only inside the boot archive on
+# disk, so running it proves the load-from-disk path end to end: the FS libOS
+# read these bytes off the archive device and spawned them via spawn_from_buffer.
+[workspace]
+
+[package]
+name = "diskhello-user"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "diskhello-user"
+path = "src/main.rs"
+
+[dependencies]
+libplinth = { path = "../libplinth" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true

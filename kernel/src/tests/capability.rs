@@ -134,6 +134,31 @@ pub fn cpu_charge_wrong_type(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A BlockRange names a device + sector run and gates the two I/O directions
+/// by RIGHT_READ / RIGHT_WRITE. A range minted read-only must satisfy a read
+/// lookup and refuse a write lookup -- the cap-level half of the block
+/// multiplexing guard (the sector-bounds half lives in the block syscall and is
+/// exercised end-to-end by the blk demo). Also pins that the device index is
+/// carried in the capability, not inferred.
+pub fn block_range_rights(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut table = CapTable::new();
+    let obj = CapObject::BlockRange { dev: 1, start: 8, count: 4 };
+    let slot = table.mint(obj, RIGHT_READ).map_err(|_| "mint failed")?;
+
+    let cap = table.lookup(slot, RIGHT_READ).map_err(|_| "read lookup failed")?;
+    test_assert!(cap.object == obj, "BlockRange did not round-trip through the table");
+    let CapObject::BlockRange { dev, start, count } = cap.object else {
+        return Err("looked-up capability is not a BlockRange");
+    };
+    test_assert!(dev == 1 && start == 8 && count == 4, "BlockRange fields altered");
+
+    test_assert!(
+        table.lookup(slot, RIGHT_WRITE) == Err(CapError::RightsDenied),
+        "write allowed by a read-only BlockRange"
+    );
+    Ok(())
+}
+
 /// The full ownership story: a frame moves from the allocator into a
 /// capability, the capability is revoked, and the frame returns to the
 /// allocator. This is the cycle the syscall layer will drive for real

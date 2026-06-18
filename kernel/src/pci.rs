@@ -144,10 +144,23 @@ fn read8(bus: u8, slot: u8, func: u8, offset: u8) -> u8 {
     (dword >> ((offset as u32 & 3) * 8)) as u8
 }
 
-/// Scan for the virtio-blk device. q35 places it on bus 0, but we sweep all
+/// The most virtio-blk devices the kernel tracks. Two today: a test/ramp disk
+/// and the boot archive (see `virtio_blk` and the boot code). Raising this is a
+/// one-line change here plus a wider `virtio_blk` device array.
+pub const MAX_DEVICES: usize = 2;
+
+/// Scan for virtio-blk devices. q35 places them on bus 0, but we sweep all
 /// 256 buses x 32 slots anyway (cheap, and it avoids hard-coding placement),
-/// function 0 only -- virtio-blk is not multifunction. Returns the first match.
-pub fn find_virtio_blk() -> Option<Location> {
+/// function 0 only -- virtio-blk is not multifunction. Returns up to
+/// MAX_DEVICES locations in ascending PCI (bus, slot) order, plus the count.
+///
+/// The ascending order is the contract that lets the boot code assign a device
+/// *index* by position: index 0 is the lowest-slot device, and so on. QEMU pins
+/// each disk to a fixed PCI slot, so the index-to-disk mapping is deterministic
+/// across runs.
+fn find_all_virtio_blk() -> ([Option<Location>; MAX_DEVICES], usize) {
+    let mut found = [None; MAX_DEVICES];
+    let mut n = 0;
     for bus in 0u16..256 {
         let bus = bus as u8;
         for slot in 0u8..32 {
@@ -156,11 +169,15 @@ pub fn find_virtio_blk() -> Option<Location> {
             }
             let device = read16(bus, slot, 0, 0x02);
             if device == VIRTIO_BLK_MODERN || device == VIRTIO_BLK_LEGACY {
-                return Some(Location { bus, slot, func: 0 });
+                found[n] = Some(Location { bus, slot, func: 0 });
+                n += 1;
+                if n == MAX_DEVICES {
+                    return (found, n);
+                }
             }
         }
     }
-    None
+    (found, n)
 }
 
 /// Print the device's BARs, decoded. The next milestone maps one of these
@@ -237,21 +254,28 @@ fn fill_caps(info: &mut VirtioBlkInfo) {
     }
 }
 
-/// Find the virtio-blk device and read its full structure map. Pure
-/// config-space reads; no MMIO mapping or DMA.
-pub fn discover() -> Option<VirtioBlkInfo> {
-    let loc = find_virtio_blk()?;
-    let mut info = VirtioBlkInfo {
-        loc,
-        device_id: read16(loc.bus, loc.slot, loc.func, 0x02),
-        common: VirtioCfg::default(),
-        notify: VirtioCfg::default(),
-        notify_mult: 0,
-        isr: VirtioCfg::default(),
-        device: VirtioCfg::default(),
-    };
-    fill_caps(&mut info);
-    Some(info)
+/// Find every virtio-blk device (up to MAX_DEVICES) and read its full
+/// structure map. Pure config-space reads; no MMIO mapping or DMA. The returned
+/// array is dense from index 0 in PCI-slot order; `count` says how many slots
+/// are filled.
+pub fn discover_all() -> ([Option<VirtioBlkInfo>; MAX_DEVICES], usize) {
+    let (locs, n) = find_all_virtio_blk();
+    let mut infos = [None; MAX_DEVICES];
+    for i in 0..n {
+        let loc = locs[i].expect("dense up to n");
+        let mut info = VirtioBlkInfo {
+            loc,
+            device_id: read16(loc.bus, loc.slot, loc.func, 0x02),
+            common: VirtioCfg::default(),
+            notify: VirtioCfg::default(),
+            notify_mult: 0,
+            isr: VirtioCfg::default(),
+            device: VirtioCfg::default(),
+        };
+        fill_caps(&mut info);
+        infos[i] = Some(info);
+    }
+    (infos, n)
 }
 
 /// Print a discovered device's BARs and virtio structure map.
@@ -283,25 +307,27 @@ fn report<W: Write>(out: &mut W, info: &VirtioBlkInfo) {
     let _ = writeln!(out, "plinth:   notify multiplier 0x{:x}", info.notify_mult);
 }
 
-/// Stage 1 discovery entry point: find virtio-blk and report what was found.
-/// Returns the device map on success. Pure config-space reads; call once at
-/// boot.
-pub fn init<W: Write>(out: &mut W) -> Option<VirtioBlkInfo> {
+/// Storage discovery entry point: find every virtio-blk device and report what
+/// was found. Returns the dense device map and the count. Pure config-space
+/// reads; call once at boot. Each device's index in the returned array is the
+/// index the boot code uses when it brings the device up and mints BlockRange
+/// capabilities against it.
+pub fn init<W: Write>(out: &mut W) -> ([Option<VirtioBlkInfo>; MAX_DEVICES], usize) {
     let _ = writeln!(out, "plinth: scanning PCI bus");
-    match discover() {
-        Some(info) => {
-            report(out, &info);
-            let loc = info.loc;
-            let _ = writeln!(
-                out,
-                "plinth: virtio-blk found at {:02x}:{:02x}.{}",
-                loc.bus, loc.slot, loc.func
-            );
-            Some(info)
-        }
-        None => {
-            let _ = writeln!(out, "plinth: virtio-blk not found");
-            None
-        }
+    let (infos, n) = discover_all();
+    if n == 0 {
+        let _ = writeln!(out, "plinth: virtio-blk not found");
+        return (infos, 0);
     }
+    for i in 0..n {
+        let info = infos[i].as_ref().expect("dense up to n");
+        report(out, info);
+        let loc = info.loc;
+        let _ = writeln!(
+            out,
+            "plinth: virtio-blk found at {:02x}:{:02x}.{}",
+            loc.bus, loc.slot, loc.func
+        );
+    }
+    (infos, n)
 }

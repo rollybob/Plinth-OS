@@ -153,15 +153,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // single polled read of sector 0 verified against the known image.
         // This runs before any process is created, so the BAR's kernel-half
         // MMIO mapping propagates to every process address space.
-        if let Some(info) = pci::init(&mut serial) {
-            match virtio_blk::init(&mut serial, &info, phys_offset) {
-                Ok(()) => {
-                    virtio_blk::selftest_read(&mut serial, phys_offset);
-                }
-                Err(e) => {
-                    let _ = writeln!(serial, "plinth: virtio-blk init failed: {e}");
-                }
+        let (infos, ndev) = pci::init(&mut serial);
+        for i in 0..ndev {
+            let info = infos[i].as_ref().expect("dense up to ndev");
+            if let Err(e) = virtio_blk::init(&mut serial, info, phys_offset, i) {
+                let _ = writeln!(serial, "plinth: virtio-blk[{i}] init failed: {e}");
             }
+        }
+        // Prove each device reads back. Device 0 is the ramp/test disk (the
+        // 1 MiB byte-ramp image -- verify the ramp); device 1, if present, is
+        // the boot archive (verify it reads and is a distinct disk, without the
+        // kernel knowing the archive format -- that is the FS libOS's job).
+        if virtio_blk::ready(0) {
+            virtio_blk::selftest_read(&mut serial, phys_offset, 0, true);
+        }
+        if virtio_blk::ready(1) {
+            virtio_blk::selftest_read(&mut serial, phys_offset, 1, false);
         }
 
         // The synchronous, one-at-a-time demos (run via process::run). spawn
@@ -341,20 +348,48 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // range -- the multiplexing guarantee. Runs only if the device came up.
         // Frame counts bracket the demo: the process frame_allocs its I/O frame
         // and teardown reclaims it, so the count returns to baseline.
-        if virtio_blk::ready() {
+        if virtio_blk::ready(0) {
             const BLK_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blk-user"));
             let before_blk = free_frames();
             let _ = writeln!(serial, "plinth: {before_blk} frames free before blk");
-            // Grant disk sectors [1, 5): start=1 so an offset-0 read is sector 1
-            // (distinguishable from sector 0), count=4 so offset 4 is just past
-            // the grant -- the out-of-range probe the demo makes.
+            // Grant device 0 (the ramp disk) sectors [1, 5): start=1 so an
+            // offset-0 read is sector 1 (distinguishable from sector 0), count=4
+            // so offset 4 is just past the grant -- the out-of-range probe the
+            // demo makes.
             let range = Capability {
-                object: CapObject::BlockRange { start: 1, count: 4 },
+                object: CapObject::BlockRange { dev: 0, start: 1, count: 4 },
                 rights: capability::RIGHT_READ,
             };
             scheduler::run("blk demo", &[BLK_BIN], phys_offset, &[Some(range)]);
             let after_blk = free_frames();
             let _ = writeln!(serial, "plinth: {after_blk} frames free after blk");
+        }
+
+        // Phase 2 storage, load-from-disk: the filesystem library-OS demo. The
+        // kernel grants fsdemo one capability -- a BlockRange over the whole
+        // archive device (device 1) -- and nothing else. fsdemo uses libfs to
+        // parse the on-disk archive, find a program by name, read its ELF off
+        // the disk, and launch it with spawn_from_buffer. The loaded program
+        // (diskhello) is NOT embedded in the kernel; it lives only in the
+        // archive, so its "running from disk" line proves the path end to end.
+        // The kernel never parses the archive format -- it only multiplexes the
+        // disk (the BlockRange) and validates the ELF libfs hands back. Frame
+        // counts bracket the demo: fsdemo's scratch/image frames and
+        // diskhello's image frames are all reclaimed at teardown.
+        if let Some(cap) = virtio_blk::capacity(1) {
+            const FSDEMO_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fsdemo-user"));
+            let before_fs = free_frames();
+            let _ = writeln!(serial, "plinth: {before_fs} frames free before fs");
+            // The whole archive device, from sector 0 -- so a range-relative
+            // sector is an archive sector (what the directory records).
+            // Read-only: the boot archive is never written.
+            let range = Capability {
+                object: CapObject::BlockRange { dev: 1, start: 0, count: cap },
+                rights: capability::RIGHT_READ,
+            };
+            scheduler::run("fs demo", &[FSDEMO_BIN], phys_offset, &[Some(range)]);
+            let after_fs = free_frames();
+            let _ = writeln!(serial, "plinth: {after_fs} frames free after fs");
         }
 
         // The tick count is proof the timer fired during ring-3 execution.

@@ -1,4 +1,4 @@
-# Plinth ABI v2
+# Plinth ABI v2.1
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -31,6 +31,19 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   process and returns a *wait handle*; the child reports results over IPC. This
   is the one incompatible change from v1.
 
+### v2.1 (additive)
+
+- **New: `spawn_from_buffer`** launches a child from an ELF image the caller
+  holds in its own mapped memory, rather than from the kernel's embedded set.
+  This is the load-from-disk path: a filesystem library OS reads a program off a
+  block device and launches it. The buffer is untrusted input and flows through
+  the same ELF validator as every embedded binary. Embedded `spawn`-by-id stays
+  as the built-in bootstrap loader. Purely additive -- no v2 call changed.
+- **`BlockRange` now names a device.** A range is `(dev, start, count)`: the
+  device index is part of the capability, so a holder cannot reach another
+  device's blocks any more than another range's. `block_read`'s arguments are
+  unchanged (the device rides in the capability, not the call).
+
 ## Syscall interface
 
 The non-blocking calls use the `syscall`/`sysretq` instructions:
@@ -56,6 +69,7 @@ The non-blocking calls use the `syscall`/`sysretq` instructions:
 | 8  | fault_return | --                    | resumes the faulting instruction |
 | 9  | spawn        | child_id, transfer    | wait handle, or `SYS_ERR`        |
 | 10 | block_read   | range, frame, sec, cnt| `BLK_OK`, or a `BLK_E_*` status  |
+| 11 | spawn_from_buffer | buf_va, len, transfer | wait handle, or `SYS_ERR`   |
 
 Notes:
 
@@ -106,6 +120,17 @@ Notes:
   guarantee), `BLK_E_RIGHTS = 3` (bad slot, wrong kind, or missing right), or
   `BLK_E_DEV = 4` (device error). A `block_write` counterpart is not yet part of
   the ABI -- the first filesystem is read-only.
+- **spawn_from_buffer(buf_va, len, transfer)** is `spawn` for a binary the
+  caller already holds: `len` bytes at `buf_va` in the caller's address space
+  are the child's ELF image, instead of an embedded `child_id`. This is how a
+  filesystem library OS launches a program it read off disk. `buf_va` must be
+  page-aligned, the whole `[buf_va, buf_va+len)` range must lie in the Map
+  window and be mapped, and `len` must not exceed the kernel's image ceiling
+  (256 KiB) -- otherwise `SYS_ERR`. The bytes are untrusted: the kernel runs
+  them through the same ELF validator as every embedded binary. The result
+  channel, `ENDPOINT_SLOT` send capability, `transfer`, and the returned wait
+  handle all behave exactly as for `spawn`. Embedded `spawn`-by-id is not
+  retired -- it remains the built-in bootstrap loader.
 
 ## IPC interface
 
@@ -181,14 +206,15 @@ index into a per-process table; the records never leave the kernel. Kinds:
 | CpuTime  | a spendable CPU-tick budget      | `CONSUME`                     |
 | Endpoint   | an IPC rendezvous channel        | `SEND`, `RECV`              |
 | Reply      | one-shot authority to reply once | (none -- holding it suffices) |
-| BlockRange | a run of `count` disk sectors    | `READ`, `WRITE`            |
+| BlockRange | `count` sectors on a device      | `READ`, `WRITE`            |
 
 Rights are checked at use, not at transfer. `Reply` capabilities are minted by
 the kernel (on receiving a `call`) and consumed on use; you cannot create one. A
-`BlockRange` names sectors `[start, start+count)`; the holder addresses them
-relative to `start` (offset 0 is the first sector of the grant), and the kernel
-refuses any access beyond `count` -- so disjoint ranges handed to different
-library OSes cannot reach each other's blocks.
+`BlockRange` names sectors `[start, start+count)` on a specific block device
+`dev`; the holder addresses them relative to `start` (offset 0 is the first
+sector of the grant), and the kernel refuses any access beyond `count` or onto
+another device -- so disjoint ranges handed to different library OSes cannot
+reach each other's blocks, and a range on one disk cannot read another.
 
 ### Well-known initial capabilities
 

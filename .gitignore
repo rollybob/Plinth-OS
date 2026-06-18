@@ -1,2 +1,5 @@
-/target
+# Cargo build output, at the workspace root and in any standalone crate
+# (the user crates normally share the root target/ via CARGO_TARGET_DIR, but a
+# direct `cargo test` -- e.g. for libfs's host tests -- creates a local one).
+target/
 qemu_debug.log

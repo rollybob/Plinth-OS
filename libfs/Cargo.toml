@@ -1,0 +1,23 @@
+# Standalone crate -- intentionally not a workspace member. User crates that
+# load programs from disk depend on it by path and build it for
+# x86_64-unknown-none themselves; the parser also builds for the host so its
+# unit tests run with `cargo test` (the same pure-function discipline as the
+# kernel's elf::parse, which is tested in the in-kernel harness).
+[workspace]
+
+[package]
+name = "libfs"
+version = "0.1.0"
+edition = "2021"
+
+# The syscall-backed load helper (block_read + spawn_from_buffer) only exists
+# on the bare target; it is added in the spawn-from-buffer milestone. Declaring
+# the dependency target-gated keeps the host `cargo test` build -- which only
+# compiles the pure archive parser -- from pulling in libplinth's inline-asm
+# syscall stubs.
+[target.'cfg(target_os = "none")'.dependencies]
+libplinth = { path = "../libplinth" }
+
+[profile.release]
+opt-level = 3
+lto = true

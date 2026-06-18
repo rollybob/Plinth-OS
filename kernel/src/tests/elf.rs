@@ -300,6 +300,78 @@ pub fn bad_entry(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     Ok(())
 }
 
+// --- D8a untrusted-input audit: integer-overflow and table-shape attacks ---
+//
+// These cover the cases a hostile, libOS-supplied ELF can construct that a
+// trusted build-time binary never would: fields whose arithmetic wraps, and a
+// program-header table whose shape is a lie. Each must be rejected before any
+// out-of-bounds read or wild mapping. (e_phoff / p_offset / p_filesz / p_memsz
+// bounds and overlap are exercised by the cases above; these add the overflow
+// edges named in the gate.)
+
+/// e_phentsize that is not sizeof(Elf64_Phdr): the parser must not trust a
+/// device-supplied stride and walk the table at the wrong pitch.
+pub fn bad_phentsize(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut buf = [0u8; 256];
+    let len = minimal(&mut buf);
+    put_u16(&mut buf, 54, 55); // e_phentsize @54, one short of 56
+    test_assert!(check(&buf, len) == Err(ElfError::BadPhEntSize), "bad phentsize not rejected");
+    Ok(())
+}
+
+/// e_phnum beyond the fixed cap: rejected wholesale rather than truncated, so a
+/// huge count can never drive an unbounded loop or a giant table read.
+pub fn too_many_phdrs(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut buf = [0u8; 256];
+    let len = minimal(&mut buf);
+    put_u16(&mut buf, E_PHNUM, (crate::elf::MAX_PHDRS + 1) as u16);
+    test_assert!(check(&buf, len) == Err(ElfError::TooManyPhdrs), "oversize phnum not rejected");
+    Ok(())
+}
+
+/// e_phoff so large that phoff + phnum*phentsize wraps u64: the checked
+/// table-extent arithmetic must catch it instead of computing a small,
+/// in-bounds-looking end.
+pub fn phoff_overflow(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut buf = [0u8; 256];
+    let len = minimal(&mut buf);
+    put_u64(&mut buf, 32, u64::MAX - 8); // e_phoff @32; +1*56 wraps
+    test_assert!(
+        check(&buf, len) == Err(ElfError::PhdrsOutOfBounds),
+        "phoff overflow not rejected"
+    );
+    Ok(())
+}
+
+/// p_offset + p_filesz wraps u64: the file-range check must reject it rather
+/// than wrap to a small end that passes the `<= len` test.
+pub fn segment_file_offset_overflow(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut buf = [0u8; 256];
+    let len = minimal(&mut buf);
+    put_u64(&mut buf, PH0 + 8, u64::MAX - 8); // p_offset @PH0+8
+    put_u64(&mut buf, PH0_FILESZ, 0x20); // filesz: offset+filesz wraps
+    put_u64(&mut buf, PH0_MEMSZ, 0x20); // keep filesz <= memsz
+    test_assert!(
+        check(&buf, len) == Err(ElfError::SegmentFileRange),
+        "p_offset+p_filesz overflow not rejected"
+    );
+    Ok(())
+}
+
+/// p_vaddr + p_memsz wraps u64: the placement check must reject it rather than
+/// wrap to an address that falls back inside the image window.
+pub fn segment_vaddr_overflow(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut buf = [0u8; 256];
+    let len = minimal(&mut buf);
+    put_u64(&mut buf, PH0_VADDR, 0xFFFF_FFFF_FFFF_F000); // page-aligned, near the top
+    put_u64(&mut buf, PH0_MEMSZ, 0x2000); // vaddr+memsz wraps past u64::MAX
+    test_assert!(
+        check(&buf, len) == Err(ElfError::SegmentOverflow),
+        "p_vaddr+p_memsz overflow not rejected"
+    );
+    Ok(())
+}
+
 pub fn segment_overlap(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     let mut buf = [0u8; 512];
     const SEG_OFF: usize = PH0 + 2 * 56;

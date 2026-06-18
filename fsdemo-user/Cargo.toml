@@ -1,0 +1,29 @@
+# Standalone crate -- intentionally not a workspace member.
+#
+# The filesystem library-OS demo: it holds a BlockRange capability over the
+# boot-archive device and uses libfs to load a program by name off disk and run
+# it. Embedded in the kernel as the bootstrap loader (the embedded SPAWNABLE
+# role that stays permanently); the program it loads (diskhello) lives only on
+# disk.
+[workspace]
+
+[package]
+name = "fsdemo-user"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fsdemo-user"
+path = "src/main.rs"
+
+[dependencies]
+libplinth = { path = "../libplinth" }
+libfs = { path = "../libfs" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true

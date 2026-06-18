@@ -16,6 +16,32 @@
 //! `parse` is a pure function over a byte slice -- it touches no frames and
 //! no page tables -- which is what lets the whole validator be unit-tested
 //! in the in-kernel test build without ever entering ring 3.
+//!
+//! ## D8a untrusted-input audit (2026-06-18)
+//!
+//! When programs load from disk, the bytes originate in a library OS buffer,
+//! not the kernel's embedded table -- a libOS-supplied ELF can lie about every
+//! field. This validator was audited against that threat model before the
+//! spawn-from-buffer path was wired, and found sufficient:
+//!
+//! - Every header/phdr field is read through the bounds-checked `rd_*` helpers,
+//!   which return `TooSmall` rather than read past the slice.
+//! - The program-header table extent (`e_phoff + e_phnum * e_phentsize`) is
+//!   computed with `checked_mul`/`checked_add` and rejected if it overflows or
+//!   exceeds the slice, so every per-header read below it is in bounds. `phnum`
+//!   is capped (`MAX_PHDRS`) and `phentsize` pinned to the exact Elf64 stride.
+//! - Each segment's file range (`p_offset + p_filesz`) and address span
+//!   (`p_vaddr + p_memsz`) use checked arithmetic; the file range must lie
+//!   within the slice, the address span within the caller's image window, and
+//!   `p_filesz <= p_memsz`. Overlap between accepted segments is rejected.
+//! - W^X, readability, alignment, the page budget, and entry-in-an-executable-
+//!   segment are all enforced; a bad field is rejected, never clamped.
+//!
+//! CALLER CONTRACT (the half this function cannot enforce): `parse` validates
+//! offsets and sizes against `bytes.len()`, so the caller MUST pass that exact
+//! same slice to `load_and_map`, and `bytes` must be a single readable region
+//! valid for its whole length. A `LoadSeg`'s `offset`/`filesz` are safe to copy
+//! from *only* relative to the slice they were validated against.
 
 use x86_64::structures::paging::PageTableFlags;
 

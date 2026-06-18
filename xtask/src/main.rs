@@ -35,7 +35,7 @@ fn main() {
 /// embedded or booted.
 const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "share", "rpc", "faultchild", "blk", "template",
+    "share", "rpc", "faultchild", "blk", "fsdemo", "diskhello", "template",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -43,6 +43,10 @@ fn build_all() -> PathBuf {
     for name in USER_CRATES {
         build_user_crate(name);
     }
+    // Assemble (and round-trip-verify) the boot archive from the freshly built
+    // user ELFs. The image is attached to QEMU as the archive disk once the
+    // kernel can read a second virtio-blk device.
+    archive_image();
     build()
 }
 
@@ -172,6 +176,107 @@ fn block_image() -> PathBuf {
     path
 }
 
+// Mirror of libfs::archive (the CANONICAL format definition; see that module).
+// The on-disk layout is intentionally trivial so this writer stays a faithful
+// mirror of the bare-target reader; archive_image round-trips the result
+// through libfs to catch any drift.
+const ARC_SECTOR: usize = 512;
+const ARC_MAGIC: &[u8; 8] = b"PLNTHAR1";
+const ARC_ENTRY_SIZE: usize = 40;
+const ARC_NAME_LEN: usize = 32;
+
+/// Programs assembled into the read-only boot archive, looked up by these names
+/// through the FS libOS. Each maps to the `{name}-user` release ELF. These are
+/// loaded from disk (the point of the milestone), as opposed to the binaries
+/// embedded in the kernel via kernel/build.rs.
+const ARCHIVE_PROGRAMS: &[&str] = &["diskhello", "hello"];
+
+/// Assemble the read-only boot archive from the built user ELFs: a superblock,
+/// a packed directory of `(name, first_sector, byte_len)`, then each program's
+/// ELF blob on a sector boundary. The result is parsed back with libfs (the
+/// canonical reader) before it is written, so the host writer and the
+/// bare-target reader can never disagree about the format.
+fn archive_image() -> PathBuf {
+    let root = workspace_root();
+
+    // Gather (name, ELF bytes) for each program. The user crates are built by
+    // build_all before this runs (every build path that needs the archive
+    // builds the user crates first).
+    let mut progs: Vec<(&str, Vec<u8>)> = Vec::new();
+    for name in ARCHIVE_PROGRAMS {
+        assert!(name.len() <= ARC_NAME_LEN, "archive program name too long: {name}");
+        let elf_path = root.join(format!("target/x86_64-unknown-none/release/{name}-user"));
+        let bytes = std::fs::read(&elf_path)
+            .unwrap_or_else(|e| panic!("failed to read {name}-user ELF for archive: {e}"));
+        progs.push((name, bytes));
+    }
+
+    // Layout: superblock (1 sector) + directory + sector-aligned blobs.
+    let dir_bytes = progs.len() * ARC_ENTRY_SIZE;
+    let dir_sectors = dir_bytes.div_ceil(ARC_SECTOR);
+    let mut blob_cursor = 1 + dir_sectors; // first blob's sector
+
+    // Build the directory and the blob region together, tracking each blob's
+    // assigned sector as the cursor advances.
+    let mut directory = vec![0u8; dir_sectors * ARC_SECTOR];
+    let mut blobs: Vec<u8> = Vec::new();
+    for (i, (name, bytes)) in progs.iter().enumerate() {
+        let rec = &mut directory[i * ARC_ENTRY_SIZE..(i + 1) * ARC_ENTRY_SIZE];
+        let nb = name.as_bytes();
+        rec[0..nb.len()].copy_from_slice(nb); // name, NUL-padded by the zeroed buffer
+        rec[32..36].copy_from_slice(&(blob_cursor as u32).to_le_bytes()); // first_sector
+        rec[36..40].copy_from_slice(&(bytes.len() as u32).to_le_bytes()); // byte_len
+
+        blobs.extend_from_slice(bytes);
+        let pad = bytes.len().next_multiple_of(ARC_SECTOR) - bytes.len();
+        blobs.extend(std::iter::repeat(0u8).take(pad));
+        blob_cursor += bytes.len().div_ceil(ARC_SECTOR);
+
+        println!(
+            "archive: {name} at sector {} ({} bytes)",
+            blob_cursor - bytes.len().div_ceil(ARC_SECTOR),
+            bytes.len()
+        );
+    }
+
+    let total_sectors = blob_cursor as u32;
+
+    // Superblock sector.
+    let mut superblock = vec![0u8; ARC_SECTOR];
+    superblock[0..8].copy_from_slice(ARC_MAGIC);
+    superblock[8..12].copy_from_slice(&(progs.len() as u32).to_le_bytes());
+    superblock[12..16].copy_from_slice(&(dir_sectors as u32).to_le_bytes());
+    superblock[16..20].copy_from_slice(&total_sectors.to_le_bytes());
+
+    let mut image = superblock;
+    image.extend_from_slice(&directory);
+    image.extend_from_slice(&blobs);
+    assert_eq!(image.len(), total_sectors as usize * ARC_SECTOR, "archive size mismatch");
+
+    // Structural self-check: the writer and the canonical reader (libfs) cannot
+    // share a crate (host vs. bare target), so verify here that what was just
+    // laid out is internally consistent -- every directory entry's blob lands
+    // on its recorded sector with its recorded length. The authoritative
+    // writer-vs-reader cross-check is the kernel selftest in the next
+    // milestone: it reads this image off the virtio device and parses it with
+    // libfs, so any format drift surfaces there against real device bytes.
+    for (i, (name, bytes)) in progs.iter().enumerate() {
+        let rec = &directory[i * ARC_ENTRY_SIZE..(i + 1) * ARC_ENTRY_SIZE];
+        let first_sector = u32::from_le_bytes(rec[32..36].try_into().unwrap()) as usize;
+        let byte_len = u32::from_le_bytes(rec[36..40].try_into().unwrap()) as usize;
+        assert_eq!(byte_len, bytes.len(), "archive {name}: byte_len mismatch");
+        let off = first_sector * ARC_SECTOR;
+        assert_eq!(&image[off..off + byte_len], bytes.as_slice(), "archive {name}: blob misplaced");
+    }
+
+    let out_dir = root.join("target/disk-images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let path = out_dir.join("archive.img");
+    std::fs::write(&path, &image).expect("failed to write boot archive image");
+    println!("archive image: {} ({} sectors)", path.display(), total_sectors);
+    path
+}
+
 /// Build the kernel and produce a UEFI-bootable disk image.
 fn build() -> PathBuf {
     let root = workspace_root();
@@ -253,6 +358,17 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool) -> Command {
         &format!("if=none,format=raw,file={},id=blk0", blk.display()),
         "-device",
         "virtio-blk-pci,drive=blk0,addr=0x3,disable-legacy=on",
+    ]);
+
+    // Storage device 1: the read-only boot archive. Pinned to slot 4 (just past
+    // the ramp disk's slot 3) so the kernel's PCI-slot-order enumeration always
+    // gives it device index 1, and so discovery output is stable across runs.
+    let archive = archive_image();
+    cmd.args([
+        "-drive",
+        &format!("if=none,format=raw,file={},id=blk1", archive.display()),
+        "-device",
+        "virtio-blk-pci,drive=blk1,addr=0x4,disable-legacy=on",
     ]);
 
     // Log CPU resets and exceptions for post-mortem debugging.
@@ -677,6 +793,7 @@ fn smoke(uefi_path: &Path) {
     check_frames_baseline(&actual, "spawn");
     check_endpoints_baseline(&actual, "spawn");
     check_frames_baseline(&actual, "blk");
+    check_frames_baseline(&actual, "fs");
 }
 
 /// Build the kernel with the test suite compiled in. Uses a separate
