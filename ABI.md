@@ -21,7 +21,11 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   error -- including the `IPC_PEER_DIED` status that frees a process blocked on
   a dead counterpart.
 - **New: capability kinds** -- `Endpoint` and `Reply`, with `SEND`/`RECV`
-  rights.
+  rights; and `BlockRange`, naming a run of disk sectors, with `READ`/`WRITE`.
+- **New: block storage** -- a `block_read` syscall reads disk sectors, named
+  *relative* to a `BlockRange` capability, into a frame the device DMAs into.
+  Like IPC, it returns a **status** word (the data lands in the frame), so no
+  read-back value can be mistaken for an error.
 - **Changed: `spawn`** no longer runs a child synchronously and returns its
   exit code. It launches the child as an independent, concurrently scheduled
   process and returns a *wait handle*; the child reports results over IPC. This
@@ -31,8 +35,9 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
 
 The non-blocking calls use the `syscall`/`sysretq` instructions:
 
-- The syscall number goes in `RAX`; arguments in `RDI`, `RSI`, `RDX`; the
-  return value comes back in `RAX`.
+- The syscall number goes in `RAX`; arguments in `RDI`, `RSI`, `RDX`, and -- for
+  the one call that takes a fourth, `block_read` -- `R8`; the return value comes
+  back in `RAX`.
 - The `syscall` instruction clobbers `RCX` and `R11`; the kernel's
   dispatcher may clobber the caller-saved registers `R8`-`R10` and the
   argument registers. A caller must treat all of `RDI`, `RSI`, `RDX`,
@@ -50,6 +55,7 @@ The non-blocking calls use the `syscall`/`sysretq` instructions:
 | 7  | fault_reg    | entry, stack_top      | 0, or `SYS_ERR`                  |
 | 8  | fault_return | --                    | resumes the faulting instruction |
 | 9  | spawn        | child_id, transfer    | wait handle, or `SYS_ERR`        |
+| 10 | block_read   | range, frame, sec, cnt| `BLK_OK`, or a `BLK_E_*` status  |
 
 Notes:
 
@@ -86,6 +92,20 @@ Notes:
   `spawn` does not block -- the child runs alongside the caller. To wait for
   and collect the child's result, `recv` the handle (see IPC); that recv is
   the join. Returns `SYS_ERR` if the child could not be created.
+- **block_read(range, frame, sector_off, count)** reads `count` 512-byte
+  sectors -- starting `sector_off` sectors into the `BlockRange` capability at
+  slot `range` -- into the frame named by slot `frame`. The fourth argument
+  (`count`) is passed in `R8`. The device DMAs the data into the frame, so map
+  that frame (`frame_map`) to read the bytes; the frame capability must carry
+  `RIGHT_WRITE` (`frame_alloc` grants it). Sectors are named **relative** to the
+  range -- the kernel adds the range's start -- so a holder can never address
+  blocks outside its grant. The result is a *status* word in `RAX`, not a data
+  value (the data is in the frame): `BLK_OK = 0` on success, or
+  `BLK_E_BADARG = 1` (zero count or a count larger than one frame),
+  `BLK_E_RANGE = 2` (the request falls outside the range -- the multiplexing
+  guarantee), `BLK_E_RIGHTS = 3` (bad slot, wrong kind, or missing right), or
+  `BLK_E_DEV = 4` (device error). A `block_write` counterpart is not yet part of
+  the ABI -- the first filesystem is read-only.
 
 ## IPC interface
 
@@ -159,11 +179,16 @@ index into a per-process table; the records never leave the kernel. Kinds:
 |----------|----------------------------------|-------------------------------|
 | Frame    | one physical frame               | `READ`, `WRITE`, `MAP`        |
 | CpuTime  | a spendable CPU-tick budget      | `CONSUME`                     |
-| Endpoint | an IPC rendezvous channel        | `SEND`, `RECV`                |
-| Reply    | one-shot authority to reply once | (none -- holding it suffices) |
+| Endpoint   | an IPC rendezvous channel        | `SEND`, `RECV`              |
+| Reply      | one-shot authority to reply once | (none -- holding it suffices) |
+| BlockRange | a run of `count` disk sectors    | `READ`, `WRITE`            |
 
 Rights are checked at use, not at transfer. `Reply` capabilities are minted by
-the kernel (on receiving a `call`) and consumed on use; you cannot create one.
+the kernel (on receiving a `call`) and consumed on use; you cannot create one. A
+`BlockRange` names sectors `[start, start+count)`; the holder addresses them
+relative to `start` (offset 0 is the first sector of the grant), and the kernel
+refuses any access beyond `count` -- so disjoint ranges handed to different
+library OSes cannot reach each other's blocks.
 
 ### Well-known initial capabilities
 
@@ -171,12 +196,13 @@ A few slots are well-known, the way file descriptor 0 is on Unix:
 
 - `CPU_CAP_SLOT = 0` -- the CPU-time budget minted for every process. Pass it
   to `cpu_charge`.
-- `GRANT_SLOT = ENDPOINT_SLOT = 1` -- the first capability the kernel grants a
-  process after its CPU budget. For a spawned child this is the **send**
-  capability on its parent's result channel (use it to report a result); for a
-  process the kernel launches with an endpoint, it is that endpoint
-  capability. A capability moved in via `spawn`'s `transfer` argument lands in
-  the next slot after this one.
+- `GRANT_SLOT = ENDPOINT_SLOT = BLOCK_SLOT = 1` -- the first capability the
+  kernel grants a process after its CPU budget. For a spawned child this is the
+  **send** capability on its parent's result channel (use it to report a
+  result); for a process the kernel launches with an endpoint, it is that
+  endpoint capability; for one launched with disk access, it is a `BlockRange`.
+  A capability moved in via `spawn`'s `transfer` argument lands in the next slot
+  after this one.
 
 All other slots start empty.
 

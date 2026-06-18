@@ -50,6 +50,19 @@ pub enum CapObject {
     /// slot it names always denotes that same caller while the cap exists --
     /// no generation counter is needed. Owns no poolable resource.
     Reply { caller: usize },
+    /// A contiguous run of disk blocks (512-byte virtio sectors): `count`
+    /// sectors starting at sector `start`. This is the unit by which the kernel
+    /// multiplexes the one block device among library OSes -- disjoint ranges to
+    /// different holders, the same "secure bindings over a raw resource" move as
+    /// frames. RIGHT_READ / RIGHT_WRITE gate the two I/O directions.
+    ///
+    /// Pure inline data: the range names no pooled kernel resource (unlike an
+    /// Endpoint, which owns a table slot), so teardown just drops it -- no
+    /// reference count. (When a read-write filesystem later hands out
+    /// *allocated* ranges from a pool, that pool's reservation will need the
+    /// endpoint-style refcount; the range capability itself stays inline. This
+    /// is the agreed narrowing of hardening ruling D3b, 2026-06-17.)
+    BlockRange { start: u64, count: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

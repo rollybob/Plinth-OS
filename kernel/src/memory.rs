@@ -16,13 +16,13 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::registers::control::{Cr3, Cr3Flags};
-use x86_64::structures::paging::mapper::TranslateResult;
+use x86_64::structures::paging::mapper::{MapToError, TranslateResult};
 use x86_64::structures::paging::{
     Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB, Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
-use crate::frame_alloc::{FrameAlloc, FRAME_ALLOC};
+use crate::frame_alloc::{FrameAlloc, FRAME_ALLOC, FRAME_SIZE};
 
 /// All physical memory is reachable at `phys + PHYS_OFFSET`.
 static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -155,6 +155,63 @@ pub fn map_user_page(
         .map_err(|_| "page already mapped or table allocation failed")?
         .flush();
     Ok(())
+}
+
+/// Make `size` bytes of device MMIO at physical `phys` reachable from the
+/// kernel, returning the virtual address. The address follows the phys-offset
+/// convention (va = phys_offset + phys), so translating back is trivial.
+///
+/// On this platform the bootloader's `Mapping::Dynamic` physical-memory window
+/// already spans the device BARs (the virtio-blk BAR sits at 0xc000000000) with
+/// huge pages, so usually there is nothing to do: each page is checked, and one
+/// already translating to the target frame is reused as-is. Any page NOT
+/// already covered is mapped fresh -- non-cacheable and kernel-only (never
+/// USER_ACCESSIBLE), so nothing in ring 3 can reach device registers.
+///
+/// Caveat: a page the bootloader already mapped keeps the bootloader's
+/// (cacheable) attributes; this is harmless under QEMU, where BAR accesses are
+/// treated as device MMIO regardless. A real-hardware port would force UC here.
+///
+/// Must be called at boot, BEFORE any process address space is created: a
+/// freshly mapped page lands in the kernel half of `kernel_l4`, which each
+/// process L4 copies at creation, so it becomes visible under every process CR3
+/// without a later shootdown.
+pub fn map_kernel_mmio(phys: u64, size: u64) -> Result<u64, &'static str> {
+    let mut fa_guard = FRAME_ALLOC.lock();
+    let fa = fa_guard.as_mut().ok_or("frame allocator not initialised")?;
+    // SAFETY: kernel_l4() is the live kernel L4; we are the only mapper over it
+    // here (single CPU, boot-time), and any page we add is a fresh MMIO page
+    // that aliases nothing else.
+    let mut mapper = unsafe { mapper_for(kernel_l4()) };
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+    // Intermediate tables stay kernel-only (no USER_ACCESSIBLE).
+    let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+
+    let first = phys & !(FRAME_SIZE - 1);
+    let last = (phys + size + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
+    let mut p = first;
+    while p < last {
+        let va = phys_offset() + p;
+        // Already covered (e.g. by the bootloader's huge-page phys window)? Then
+        // reuse the existing mapping rather than collide with the huge parent.
+        if mapper.translate_addr(VirtAddr::new(va)) != Some(PhysAddr::new(p)) {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
+            let frame = PhysFrame::containing_address(PhysAddr::new(p));
+            // SAFETY: [p, p+FRAME_SIZE) is device MMIO (a BAR the kernel owns),
+            // va is the matching phys-offset address, and the parent flags never
+            // weaken existing kernel mappings.
+            unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, fa) }
+                .map_err(|e| match e {
+                    MapToError::FrameAllocationFailed => "mmio map: frame alloc failed",
+                    MapToError::ParentEntryHugePage => "mmio map: parent huge page",
+                    MapToError::PageAlreadyMapped(_) => "mmio map: page already mapped",
+                })?
+                .flush();
+        }
+        p += FRAME_SIZE;
+    }
+    Ok(phys_offset() + phys)
 }
 
 pub fn unmap_user_page(l4: u64, va: u64) {

@@ -35,7 +35,7 @@ fn main() {
 /// embedded or booted.
 const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "share", "rpc", "faultchild", "template",
+    "share", "rpc", "faultchild", "blk", "template",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -153,6 +153,25 @@ fn workspace_root() -> PathBuf {
     manifest_dir.parent().unwrap().to_path_buf()
 }
 
+/// Path to the deterministic Stage-1 block image, created on demand. Each
+/// 512-byte sector carries a distinguishable ramp: byte j of sector s is
+/// (s + j) & 0xFF. So a read of sector s is verifiable against a trivial
+/// formula AND distinguishable from every other sector (which the BlockRange
+/// demo relies on -- a whole-disk ramp of i%256 would make every sector
+/// identical, since 512 is a multiple of 256). Sector 0 is still j & 0xFF, so
+/// the milestone-2 self-test (which checks sector 0 against i%256) still holds.
+/// 1 MiB; content-stable, so QEMU sees identical bytes every run.
+fn block_image() -> PathBuf {
+    let out_dir = workspace_root().join("target/disk-images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let path = out_dir.join("blk.img");
+    let data: Vec<u8> = (0..1024u64 * 1024)
+        .map(|i| ((i / 512 + i % 512) & 0xFF) as u8)
+        .collect();
+    std::fs::write(&path, &data).expect("failed to write Stage-1 block image");
+    path
+}
+
 /// Build the kernel and produce a UEFI-bootable disk image.
 fn build() -> PathBuf {
     let root = workspace_root();
@@ -222,6 +241,18 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool) -> Command {
         // isa-debug-exit: the kernel writes N to port 0xF4 and QEMU exits
         // with status (N << 1) | 1. Kernel success (N=0) -> exit code 1.
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    ]);
+
+    // Stage 1 storage: a deterministic raw disk behind a modern virtio-blk-pci
+    // device, pinned to slot 3 so discovery output is stable across runs.
+    // disable-legacy=on forces the modern (MMIO-capability) device the driver
+    // targets, rather than a transitional device with a legacy PIO BAR.
+    let blk = block_image();
+    cmd.args([
+        "-drive",
+        &format!("if=none,format=raw,file={},id=blk0", blk.display()),
+        "-device",
+        "virtio-blk-pci,drive=blk0,addr=0x3,disable-legacy=on",
     ]);
 
     // Log CPU resets and exceptions for post-mortem debugging.
@@ -645,6 +676,7 @@ fn smoke(uefi_path: &Path) {
     check_reap(&actual);
     check_frames_baseline(&actual, "spawn");
     check_endpoints_baseline(&actual, "spawn");
+    check_frames_baseline(&actual, "blk");
 }
 
 /// Build the kernel with the test suite compiled in. Uses a separate

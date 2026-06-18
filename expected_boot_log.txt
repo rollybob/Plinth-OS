@@ -7,6 +7,17 @@ plinth: GDT + TSS loaded
 plinth: IDT loaded
 plinth: syscall interface ready
 plinth: timer armed
+
+# Stage 1 storage bring-up: discover virtio-blk over legacy PCI config space,
+# bring up the modern device, and prove it with a single polled read of sector 0
+# verified against the deterministic byte-ramp image. Only the stable summary
+# lines are asserted -- the per-BAR / per-capability lines carry addresses that
+# can shift across QEMU versions.
+plinth: scanning PCI bus
+plinth: virtio-blk found at 00:03.0
+plinth: virtio-blk ready (queue 0, size 64, capacity 2048 sectors)
+plinth: virtio-blk sector 0 read ok (ramp verified)
+
 plinth: running hello
 hello: ring 3
 hello: frame mapped and writable
@@ -107,5 +118,15 @@ plinth: rpc demo: all done
 # (the join). The returned value is checked by xtask; frame counts must match.
 plinth: spawn demo: 1 processes
 plinth: spawn demo: all done
+
+# Phase 2 storage, BlockRange multiplexing: the kernel grants a process a
+# BlockRange capability naming disk sectors [1,5); the process reads sector 1
+# through it (bytes verified against the image ramp: byte j == (1+j)&0xFF) and
+# is denied a read one sector past its range. The frame counts around the demo
+# must match (check_frames_baseline) -- the I/O frame is reclaimed at teardown.
+plinth: blk demo: 1 processes
+blk: read ok b0=1 b1=2 b5=6
+blk: out-of-range rejected
+plinth: blk demo: all done
 
 plinth: boot ok

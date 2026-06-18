@@ -93,6 +93,13 @@ impl FrameAlloc {
             alloc.mark_used(idx);
         }
 
+        // Reserve the null frame (physical 0). It is never a valid allocation:
+        // a returned address of 0 is indistinguishable from "none", and a
+        // device DMA ring placed at guest-physical 0 is rejected by virtio
+        // (which reads 0 as "queue unset"). Keeping frame 0 out of the pool
+        // closes both at the source.
+        alloc.mark_used(0);
+
         alloc
     }
 

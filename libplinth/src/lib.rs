@@ -18,6 +18,7 @@
 //! |  7 | fault_reg   | entry, stack | 0, or SYS_ERR            |
 //! |  8 | fault_return| --           | (resumes faulting insn)  |
 //! |  9 | spawn       | child_id, slot| child exit code, or ERR |
+//! | 10 | block_read  | rng,frm,sec,cnt| BLK_OK, or a BLK_E_* code |
 
 #![no_std]
 
@@ -47,6 +48,11 @@ pub const GRANT_SLOT: u64 = 1;
 /// other depending on how it was launched.)
 pub const ENDPOINT_SLOT: u64 = 1;
 
+/// A BlockRange capability the kernel grants a scheduler-launched block process
+/// lands here too -- the same first-grant slot as ENDPOINT_SLOT/GRANT_SLOT.
+/// Pass it to sys_block_read.
+pub const BLOCK_SLOT: u64 = 1;
+
 /// Demand-paged window. A not-present access here, once the process has
 /// registered a fault handler (sys_fault_reg), is delivered to that handler
 /// instead of killing the process. Inside [MAP_BASE, MAP_END), so the
@@ -73,6 +79,31 @@ fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             inlateout("rdx") a3 => _,
             out("rcx") _,
             out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    ret
+}
+
+/// Four-argument syscall stub. Adds a fourth argument in r8 -- the System V C
+/// ABI's fifth register, which the kernel's entry stub leaves untouched, so the
+/// dispatcher receives it directly. Same clobber discipline as syscall3 (r8 is
+/// an input here, so it is inlateout rather than a plain clobber).
+#[inline]
+fn syscall4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") nr => ret,
+            inlateout("rdi") a1 => _,
+            inlateout("rsi") a2 => _,
+            inlateout("rdx") a3 => _,
+            inlateout("r8") a4 => _,
+            out("rcx") _,
             out("r9") _,
             out("r10") _,
             out("r11") _,
@@ -159,6 +190,34 @@ pub fn sys_fault_return() -> ! {
     syscall3(8, 0, 0, 0);
     // Reached only if the kernel refused the resume -- treat as fatal.
     sys_exit(120)
+}
+
+// ---------------------------------------------------------------------------
+// Block storage
+// ---------------------------------------------------------------------------
+
+/// block_read status, returned in rax. The data lands in the caller's frame, so
+/// status is its own word (the same status/payload split as IPC): no read-back
+/// byte can be mistaken for an error. BLK_OK means the sectors were read.
+pub const BLK_OK: u64 = 0;
+/// count is zero, or count*512 would overflow the I/O frame.
+pub const BLK_E_BADARG: u64 = 1;
+/// The request falls outside the holder's BlockRange (the multiplexing guard).
+pub const BLK_E_RANGE: u64 = 2;
+/// Bad slot, wrong object kind, or a missing right on the range or frame cap.
+pub const BLK_E_RIGHTS: u64 = 3;
+/// The device reported an error or is not initialised.
+pub const BLK_E_DEV: u64 = 4;
+
+/// Read `count` 512-byte sectors -- starting `sector_off` sectors into the
+/// BlockRange capability at `range_slot` -- into the frame named by
+/// `frame_slot`. The device DMAs into the frame, so map it (sys_frame_map) to
+/// read the bytes; the frame cap must carry the write right (frame_alloc grants
+/// it). Sectors are named relative to the range, never absolutely. Returns
+/// BLK_OK, or a BLK_E_* status.
+#[inline]
+pub fn sys_block_read(range_slot: u64, frame_slot: u64, sector_off: u64, count: u64) -> u64 {
+    syscall4(10, range_slot, frame_slot, sector_off, count)
 }
 
 // ---------------------------------------------------------------------------

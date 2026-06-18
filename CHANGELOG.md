@@ -10,6 +10,21 @@ within a major series.
 ## [Unreleased]
 
 ### Added
+- Block storage (Phase 2 close), in three pieces. The kernel brings up a
+  **virtio-blk modern (virtio-pci) device** (`kernel/src/pci.rs`,
+  `kernel/src/virtio_blk.rs`): PCI enumeration over legacy config space
+  (0xCF8/0xCFC), a mapped MMIO BAR, modern feature negotiation, one split
+  virtqueue, and a bounded polled block read. The disk is multiplexed through a
+  new **`BlockRange` capability** (`READ`/`WRITE`) naming a run of 512-byte
+  sectors; a **`block_read` syscall** reads sectors -- named relative to the
+  range, so a holder can never reach blocks outside its grant -- into a
+  caller-owned frame the device DMAs into, returning a status word (the data is
+  in the frame, so no read-back value can be mistaken for an error). A
+  `blk-user` demo reads a sector through a granted sub-range and is denied a read
+  past it (the multiplexing guarantee); `xtask smoke` verifies the read-back
+  bytes against a deterministic image and that the I/O frame returns to baseline.
+  The null physical frame is now reserved (it can never be a valid allocation,
+  and it keeps a DMA ring off guest-physical 0).
 - Synchronous IPC: capability-named endpoints (`kernel/src/ipc.rs`).
   `send`/`recv` are a bufferless rendezvous; a message can transfer a
   capability (a zero-copy frame handoff -- the receiver maps the same physical

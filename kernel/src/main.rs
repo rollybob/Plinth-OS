@@ -28,6 +28,14 @@ mod interrupts;
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod ipc;
 mod memory;
+// PCI discovery runs only on the userspace boot path (Stage 1 storage
+// bring-up); the test build stops before it.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod pci;
+// The virtio-blk driver (Stage 1 storage) runs only on the userspace boot
+// path, after PCI discovery.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod virtio_blk;
 // process/usermode are driven from the normal boot path only; the test
 // build stops before userspace, so silence their dead-code noise there.
 #[cfg_attr(feature = "tests", allow(dead_code))]
@@ -138,6 +146,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // does not yet switch processes.
         timer::arm(100);
         let _ = writeln!(serial, "plinth: timer armed (100 Hz)");
+
+        // Stage 1 storage bring-up: discover the virtio-blk device over legacy
+        // PCI config space, then bring up the modern device (map its BAR,
+        // negotiate features, stand up one virtqueue) and prove it with a
+        // single polled read of sector 0 verified against the known image.
+        // This runs before any process is created, so the BAR's kernel-half
+        // MMIO mapping propagates to every process address space.
+        if let Some(info) = pci::init(&mut serial) {
+            match virtio_blk::init(&mut serial, &info, phys_offset) {
+                Ok(()) => {
+                    virtio_blk::selftest_read(&mut serial, phys_offset);
+                }
+                Err(e) => {
+                    let _ = writeln!(serial, "plinth: virtio-blk init failed: {e}");
+                }
+            }
+        }
 
         // The synchronous, one-at-a-time demos (run via process::run). spawn
         // is no longer synchronous, so the spawner demo now runs under the
@@ -308,6 +333,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let after_spawn = free_frames();
         let _ = writeln!(serial, "plinth: {after_spawn} frames free after spawn");
         let _ = writeln!(serial, "plinth: {} endpoints free after spawn", free_endpoints());
+
+        // Block-storage demo (Stage 2): the exokernel multiplexing surface. The
+        // kernel grants a process a BlockRange capability naming a sub-range of
+        // the disk; the process reads a sector through it (verifying the bytes
+        // against the known image) and is denied a read one sector past its
+        // range -- the multiplexing guarantee. Runs only if the device came up.
+        // Frame counts bracket the demo: the process frame_allocs its I/O frame
+        // and teardown reclaims it, so the count returns to baseline.
+        if virtio_blk::ready() {
+            const BLK_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blk-user"));
+            let before_blk = free_frames();
+            let _ = writeln!(serial, "plinth: {before_blk} frames free before blk");
+            // Grant disk sectors [1, 5): start=1 so an offset-0 read is sector 1
+            // (distinguishable from sector 0), count=4 so offset 4 is just past
+            // the grant -- the out-of-range probe the demo makes.
+            let range = Capability {
+                object: CapObject::BlockRange { start: 1, count: 4 },
+                rights: capability::RIGHT_READ,
+            };
+            scheduler::run("blk demo", &[BLK_BIN], phys_offset, &[Some(range)]);
+            let after_blk = free_frames();
+            let _ = writeln!(serial, "plinth: {after_blk} frames free after blk");
+        }
 
         // The tick count is proof the timer fired during ring-3 execution.
         // It is nondeterministic under wall-clock timing (it varies with how
