@@ -1,0 +1,20 @@
+# Standalone crate -- intentionally not a workspace member. User crates that
+# read the console depend on it by path and build it for x86_64-unknown-none
+# themselves; the keymap also builds for the host so its unit tests run with
+# `cargo test` (the same pure-function discipline as libfs's archive parser).
+[workspace]
+
+[package]
+name = "libinput"
+version = "0.1.0"
+edition = "2021"
+
+# The line reader (event_recv) only exists on the bare target. Target-gating the
+# dependency keeps the host `cargo test` build -- which compiles only the pure
+# keymap -- from pulling in libplinth's inline-asm syscall stubs.
+[target.'cfg(target_os = "none")'.dependencies]
+libplinth = { path = "../libplinth" }
+
+[profile.release]
+opt-level = 3
+lto = true

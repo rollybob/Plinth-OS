@@ -54,7 +54,12 @@ against the cost to determinism rather than taken for granted.
 - [ ] **Storage and a filesystem.** A block device driver and a minimal
   filesystem -- the path to loading programs from disk rather than
   embedding them at build time.
-- [ ] **Console input.** Today `write` is output only.
+- [x] **Console input.** The i8042 keyboard's IRQ feeds raw scancodes into a
+  bounded event ring behind an interrupt-controller seam; an `EventSource`
+  capability multiplexes the device, and a blocking `event_recv` (on the IPC
+  gate) delivers events. A process blocked on input is not a deadlock -- the
+  kernel idles waiting for a keystroke. Keymaps and line editing are a library
+  OS (`libinput`); the kernel ships only raw events.
 - [ ] **Broader hardware.** SMP and real-machine device support, each taken
   on its own merits.
 

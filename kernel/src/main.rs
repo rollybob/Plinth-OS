@@ -435,10 +435,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 rights: capability::RIGHT_READ,
             };
             // 'A' make code (0x1E), delivered the moment the reader blocks.
-            input::arm_synthetic(0x1E);
+            input::arm_synthetic(&[0x1E]);
             scheduler::run("evt demo", &[EVT_BIN], phys_offset, &[Some(source)]);
             let after_evt = free_frames();
             let _ = writeln!(serial, "plinth: {after_evt} frames free after evt");
+        }
+
+        // Phase 2 console input (Stage 3): a line read through a library OS. The
+        // kernel grants kbd-user the same keyboard EventSource; the process uses
+        // libinput (an unprivileged keymap + line reader) to turn raw scancodes
+        // into a line and echo it -- so "input is output-only" is retired, with
+        // the keymap as libOS policy and the kernel still shipping only raw
+        // events. The scripted scancodes spell "Hi" + Enter (shift down, h, shift
+        // up, i, enter), delivered one per block as the reader idles on input.
+        {
+            const KBD_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kbd-user"));
+            let before_kbd = free_frames();
+            let _ = writeln!(serial, "plinth: {before_kbd} frames free before kbd");
+            let source = Capability {
+                object: CapObject::EventSource { id: 0 },
+                rights: capability::RIGHT_READ,
+            };
+            // Set-1 scancodes for "Hi\n": LShift make, h, LShift break, i, Enter.
+            input::arm_synthetic(&[0x2A, 0x23, 0xAA, 0x17, 0x1C]);
+            scheduler::run("kbd demo", &[KBD_BIN], phys_offset, &[Some(source)]);
+            let after_kbd = free_frames();
+            let _ = writeln!(serial, "plinth: {after_kbd} frames free after kbd");
         }
 
         // The tick count is proof the timer fired during ring-3 execution.

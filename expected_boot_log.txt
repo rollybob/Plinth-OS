@@ -169,4 +169,15 @@ evt: non-source rejected
 evt: got scancode 0x1e
 plinth: evt demo: all done
 
+# Phase 2 console input (Stage 3): a line read through a library OS. kbd-user
+# uses libinput (an unprivileged keymap + line reader) to turn raw scancodes
+# into a line and echo it -- "input is output-only" retired, the keymap as libOS
+# policy. The scripted scancodes spell "Hi" (shift down, h, shift up, i, enter),
+# so the keymap's shift handling shows up in the echoed line. Frame counts
+# around the demo must match (check_frames_baseline).
+plinth: kbd demo: 1 processes
+kbd: type a line
+kbd: read 'Hi'
+plinth: kbd demo: all done
+
 plinth: boot ok

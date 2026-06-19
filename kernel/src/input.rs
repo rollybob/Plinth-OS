@@ -15,8 +15,6 @@
 //! sequences, line editing) is library-OS policy. The kernel multiplexes the
 //! device and ships bytes; it does not own a keymap (D3).
 
-use core::sync::atomic::{AtomicU32, Ordering};
-
 use spin::Mutex;
 
 use crate::capability::{CapObject, RIGHT_READ};
@@ -245,30 +243,59 @@ fn write_rsi(frame_ptr: u64, val: u64) {
     }
 }
 
-// --- synthetic injection (test scaffold for the Stage-2 delivery demo) -------
+// --- synthetic injection (test scaffold for the input demos) -----------------
 //
-// A one-shot synthetic event lets a process blocked on `event_recv` be woken
-// deterministically in headless smoke, without a real keypress. The boot path
-// arms it; the scheduler delivers it when it would otherwise idle on a blocked
-// reader (driving the exact record -> wake path a real IRQ would). Real
-// keystrokes replace this in Stage 3; an armed value of 0 means disarmed.
+// A synthetic scancode SEQUENCE lets a process blocked on `event_recv` be driven
+// deterministically in headless smoke, without real keypresses. The boot path
+// arms a sequence; the scheduler delivers the next scancode each time it would
+// otherwise idle on a blocked reader (driving the exact record -> wake path a
+// real IRQ would, one scancode per wake). Real keystrokes replace this entirely
+// -- they arrive via the keyboard IRQ during the same idle. The sequence is the
+// stimulus a scripted `sendkey` smoke would otherwise provide.
 
-/// Armed synthetic scancode, with bit 8 as the armed flag (so scancode 0 is
-/// representable). 0 = disarmed.
-static SYNTHETIC: AtomicU32 = AtomicU32::new(0);
-const SYNTHETIC_ARMED: u32 = 0x100;
+const MAX_SYNTHETIC: usize = 16;
 
-/// Arm a one-shot synthetic keyboard event (for the Stage-2 delivery demo).
-pub fn arm_synthetic(scancode: u8) {
-    SYNTHETIC.store(SYNTHETIC_ARMED | scancode as u32, Ordering::Relaxed);
+struct Synthetic {
+    codes: [u8; MAX_SYNTHETIC],
+    len: usize,
+    pos: usize,
 }
 
-/// If a synthetic event is armed, deliver it once through `record` (waking any
-/// reader blocked on the keyboard) and disarm. Called from the scheduler's
-/// idle-on-input path. A no-op when nothing is armed (the real-keystroke case).
+impl Synthetic {
+    const fn new() -> Synthetic {
+        Synthetic { codes: [0; MAX_SYNTHETIC], len: 0, pos: 0 }
+    }
+}
+
+static SYNTHETIC: Mutex<Synthetic> = Mutex::new(Synthetic::new());
+
+/// Arm a synthetic scancode sequence (capped at MAX_SYNTHETIC). Each
+/// `deliver_synthetic` records the next one; once exhausted, delivery is a
+/// no-op. Used by the input demos to script a key sequence deterministically.
+pub fn arm_synthetic(scancodes: &[u8]) {
+    let mut s = SYNTHETIC.lock();
+    let n = scancodes.len().min(MAX_SYNTHETIC);
+    s.codes[..n].copy_from_slice(&scancodes[..n]);
+    s.len = n;
+    s.pos = 0;
+}
+
+/// Record the next armed synthetic scancode (if any) through `record`, waking a
+/// reader blocked on the keyboard. Called from the scheduler's idle-on-input
+/// path. A no-op once the sequence is exhausted (the real-keystroke case, where
+/// the keyboard IRQ is the producer instead).
 pub fn deliver_synthetic() {
-    let v = SYNTHETIC.swap(0, Ordering::Relaxed);
-    if v & SYNTHETIC_ARMED != 0 {
-        record(SOURCE_KEYBOARD, Event::key((v & 0xFF) as u8));
+    let next = {
+        let mut s = SYNTHETIC.lock();
+        if s.pos < s.len {
+            let sc = s.codes[s.pos];
+            s.pos += 1;
+            Some(sc)
+        } else {
+            None
+        }
+    };
+    if let Some(sc) = next {
+        record(SOURCE_KEYBOARD, Event::key(sc));
     }
 }

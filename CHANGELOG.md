@@ -22,6 +22,11 @@ both additive over v2.
   so the kernel idles waiting for a keystroke. Events are raw: keymaps and
   characters are library-OS policy. An `evt-user` demo reads an event through
   its granted source and is denied reading through a non-source capability.
+  Interpretation lives in a new **`libinput`** library OS -- a Set-1 keymap with
+  shift and a line reader over `event_recv` (the keymap is pure and
+  host-tested, like libfs's archive parser). A `kbd-user` demo reads a line and
+  echoes it, so "input is output-only" is retired with the keymap as
+  unprivileged policy and the kernel still shipping only raw events.
 - Load-from-disk (Phase 2 close, final piece). A read-only **boot archive**
   (superblock + directory of `(name, first_sector, byte_len)` + sector-aligned
   ELF blobs) is assembled by xtask and attached as a **second virtio-blk
