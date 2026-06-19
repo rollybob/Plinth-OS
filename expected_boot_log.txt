@@ -8,6 +8,14 @@ plinth: IDT loaded
 plinth: syscall interface ready
 plinth: timer armed
 
+# Console input bring-up (Stage 1): the i8042 keyboard comes up as the first
+# event source and IRQ1 is unmasked. The selftest pushes a known scancode
+# through the same record path the IRQ handler uses and reads it back from the
+# event ring -- proving the scancode -> ring -> reader wiring without a real
+# keypress (the scripted-keystroke smoke arrives with the keymap libOS).
+plinth: keyboard ready (i8042, IRQ1)
+plinth: keyboard selftest ok
+
 # Storage bring-up: discover virtio-blk over legacy PCI config space and bring
 # up every device. Two disks are attached: device 0 (slot 3) is the 1 MiB
 # byte-ramp test image, device 1 (slot 4) is the read-only boot archive. Each

@@ -22,11 +22,24 @@ mod fault;
 mod frame_alloc;
 mod gdt;
 mod interrupts;
+// The interrupt-controller seam (8259 PIC today). Its remap/unmask/eoi are
+// driven only from the userspace boot path (the timer is armed there), so
+// silence dead-code noise in the test build, like `timer`.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod irq;
 // IPC endpoints are driven from the userspace boot path (and the no_mangle
 // dispatcher); create_endpoint is unused in the test build, which stops
 // before userspace.
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod ipc;
+// The event ring (its `EventRing` is unit-tested) plus the boot-path producer/
+// consumer helpers, which are unused in the test build.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod input;
+// The i8042 keyboard device (the first event source) runs only on the userspace
+// boot path; its IRQ1 vector is installed in every build (interrupts::init).
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod keyboard;
 mod memory;
 // PCI discovery runs only on the userspace boot path (Stage 1 storage
 // bring-up); the test build stops before it.
@@ -141,11 +154,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
 
+        // Initialise the interrupt controller (remap the PIC off the exception
+        // vectors, mask every line); devices unmask their own line as they arm.
+        irq::init();
+
         // Arm the periodic timer. It fires only once a process is in ring 3
         // (where interrupts are enabled); Stage 1 just counts the ticks, it
         // does not yet switch processes.
         timer::arm(100);
         let _ = writeln!(serial, "plinth: timer armed (100 Hz)");
+
+        // Bring up the i8042 keyboard (the first input event source) and unmask
+        // IRQ1. The synthetic selftest proves the scancode -> ring -> reader
+        // wiring without a real keypress; live keys flow once a process blocks
+        // on the source (Stage 2). Input is raw scancodes -- the keymap is libOS
+        // policy, so nothing here turns a scancode into a character.
+        keyboard::init();
+        let _ = writeln!(serial, "plinth: keyboard ready (i8042, IRQ1)");
+        keyboard::selftest(&mut serial);
 
         // Stage 1 storage bring-up: discover the virtio-blk device over legacy
         // PCI config space, then bring up the modern device (map its BAR,

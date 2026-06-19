@@ -13,6 +13,7 @@
 mod capability;
 mod elf;
 mod frame_alloc;
+mod input;
 mod ipc;
 mod scheduler;
 
@@ -86,6 +87,11 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "elf::phoff_overflow", run: elf::phoff_overflow },
     TestCase { name: "elf::segment_file_offset_overflow", run: elf::segment_file_offset_overflow },
     TestCase { name: "elf::segment_vaddr_overflow", run: elf::segment_vaddr_overflow },
+    TestCase { name: "input::fifo_order", run: input::fifo_order },
+    TestCase { name: "input::empty_pop_is_none", run: input::empty_pop_is_none },
+    TestCase { name: "input::overflow_drops_newest", run: input::overflow_drops_newest },
+    TestCase { name: "input::wraps_after_drain", run: input::wraps_after_drain },
+    TestCase { name: "input::key_event_encoding", run: input::key_event_encoding },
     TestCase { name: "ipc::wq_fifo_order", run: ipc::wq_fifo_order },
     TestCase { name: "ipc::wq_single", run: ipc::wq_single },
     TestCase { name: "ipc::wq_take_matches_sender_side", run: ipc::wq_take_matches_sender_side },

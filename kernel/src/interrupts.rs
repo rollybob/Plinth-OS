@@ -50,6 +50,9 @@ pub fn init() {
         // The blocking IPC operations enter through a software-interrupt gate
         // (vector 0x80, DPL 3) so they save a full trap frame -- see `ipc`.
         crate::ipc::register(idt);
+        // IRQ1 (the i8042 keyboard), at the remapped vector. Installed now; the
+        // device is brought up and the line unmasked later, on the boot path.
+        crate::keyboard::register(idt);
         (*addr_of!(IDT_STORAGE)).as_ref().unwrap().load();
     }
 }

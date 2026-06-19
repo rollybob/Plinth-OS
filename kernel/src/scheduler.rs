@@ -367,7 +367,7 @@ fn quantum_expired() -> bool {
 #[no_mangle]
 extern "C" fn timer_tick(frame: *const TrapFrame) -> u64 {
     timer::note_tick();
-    timer::eoi();
+    crate::irq::eoi(0); // acknowledge IRQ0 at the interrupt controller
 
     // SAFETY: the stub passes a pointer to the TrapFrame it built on the
     // current kernel stack; valid for this call.
