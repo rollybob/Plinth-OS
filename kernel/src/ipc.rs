@@ -47,6 +47,11 @@ const IPC_RECV: u64 = 1;
 /// caller named by a one-shot reply capability.
 const IPC_CALL: u64 = 2;
 const IPC_REPLY: u64 = 3;
+/// event_recv: read the next input event from an `EventSource` capability. Not
+/// IPC, but it shares this gate -- a blocking read needs the same resumable
+/// trap frame, so the dispatch branches by subsystem (the handler lives in
+/// `input`, not here).
+const EVENT_RECV: u64 = 4;
 
 /// IPC status, returned in rax -- separate from the message payload (rsi) and
 /// the transferred-cap landing slot (rdx). Splitting status from the payload
@@ -426,6 +431,9 @@ extern "C" fn ipc_dispatch(frame: *mut TrapFrame) -> u64 {
         IPC_RECV => ipc_recv(a1, frame as u64),
         IPC_CALL => ipc_call(a1, a2, frame as u64),
         IPC_REPLY => ipc_reply(a1, a2),
+        // Shares the gate, dispatched to the input subsystem (a1 = the
+        // EventSource capability slot, in rdi).
+        EVENT_RECV => crate::input::event_recv(a1, frame as u64),
         _ => IPC_ERR,
     }
 }

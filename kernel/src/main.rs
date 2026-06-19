@@ -418,6 +418,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_fs} frames free after fs");
         }
 
+        // Phase 2 console input (Stage 2): event delivery through an EventSource
+        // capability. The kernel grants evt-user a read capability on input
+        // source 0 (the keyboard) and nothing else; the process reads one event
+        // through it (a raw scancode -- characters are libOS policy) and is
+        // rejected when it reads through a non-source capability. Its read finds
+        // the ring empty and blocks, so the kernel idles waiting for input; a
+        // synthetic scancode is delivered to wake it deterministically (a real
+        // keypress would otherwise). Frame counts bracket the demo (no leak).
+        {
+            const EVT_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/evt-user"));
+            let before_evt = free_frames();
+            let _ = writeln!(serial, "plinth: {before_evt} frames free before evt");
+            let source = Capability {
+                object: CapObject::EventSource { id: 0 },
+                rights: capability::RIGHT_READ,
+            };
+            // 'A' make code (0x1E), delivered the moment the reader blocks.
+            input::arm_synthetic(0x1E);
+            scheduler::run("evt demo", &[EVT_BIN], phys_offset, &[Some(source)]);
+            let after_evt = free_frames();
+            let _ = writeln!(serial, "plinth: {after_evt} frames free after evt");
+        }
+
         // The tick count is proof the timer fired during ring-3 execution.
         // It is nondeterministic under wall-clock timing (it varies with how
         // long the demos took) and deterministic only under -icount; nothing

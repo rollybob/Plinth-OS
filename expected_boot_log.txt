@@ -157,4 +157,16 @@ diskhello: running from disk
 fsdemo: diskhello returned 777
 plinth: fs demo: all done
 
+# Phase 2 console input (Stage 2): the kernel grants evt-user a read capability
+# on input source 0 (the keyboard). The process is rejected reading through a
+# non-source capability, then reads one event through its EventSource. The ring
+# is empty so it blocks; the kernel idles on input and a synthetic scancode
+# (0x1e, 'A' make) is delivered to wake it deterministically (a real keypress
+# would otherwise). The scancode is raw -- turning it into a character is libOS
+# policy. Frame counts around the demo must match (check_frames_baseline).
+plinth: evt demo: 1 processes
+evt: non-source rejected
+evt: got scancode 0x1e
+plinth: evt demo: all done
+
 plinth: boot ok

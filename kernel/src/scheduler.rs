@@ -590,30 +590,85 @@ enum LauncherOnIdle {
 unsafe fn switch_to_next(on_idle: LauncherOnIdle) -> ! {
     let cur = CURRENT_SLOT;
     match pick_next(&states(), cur) {
-        Some(next) => {
-            let table = &mut *addr_of_mut!(TABLE);
-            let nproc = table[next]
-                .process
-                .take()
-                .expect("Ready slot has no process");
-            table[next].state = State::Running;
-            let rsp = table[next].kernel_rsp;
-            let l4 = nproc.l4;
-            *process::CURRENT.lock() = Some(nproc);
-            CURRENT_SLOT = next;
-            memory::switch_to(l4);
-            gdt::set_kernel_stack(kstack_top(next));
-            sched_resume(rsp)
-        }
-        None => match on_idle {
-            // SAFETY: sched_start saved the anchor before entering the first
-            // process, and its stack frame is still live.
-            LauncherOnIdle::Return => sched_return_to_kernel(0),
-            LauncherOnIdle::Deadlock => {
-                panic!("scheduler: every process is blocked (IPC deadlock)")
+        Some(next) => resume_process(next),
+        None => {
+            // Nothing runnable. A process blocked on EXTERNAL input is not a
+            // deadlock -- a keystroke can still arrive -- so idle and wait for it
+            // rather than treat it as a stuck system. (An IPC block with no
+            // possible peer is the genuine deadlock the block-time liveness check
+            // already guards; the panic below is reached only when nobody is
+            // waiting on input either.)
+            if crate::input::any_waiter() {
+                // Deterministic delivery for headless smoke: if a synthetic event
+                // is armed, deliver it now (it wakes the blocked reader). Real
+                // keystrokes arrive via the keyboard IRQ during the idle below.
+                crate::input::deliver_synthetic();
+                idle_until_runnable()
+            } else {
+                match on_idle {
+                    // SAFETY: sched_start saved the anchor before entering the
+                    // first process, and its stack frame is still live.
+                    LauncherOnIdle::Return => sched_return_to_kernel(0),
+                    LauncherOnIdle::Deadlock => {
+                        panic!("scheduler: every process is blocked (IPC deadlock)")
+                    }
+                }
             }
-        },
+        }
     }
+}
+
+/// Resume the Ready process at `next`: make it Running, switch to its address
+/// space and kernel stack, and `sched_resume` into its saved trap frame. Never
+/// returns. Shared by the normal pick and the idle-on-input loop.
+///
+/// # Safety
+/// `next` must name a Ready slot holding a process; the caller holds no locks.
+unsafe fn resume_process(next: usize) -> ! {
+    let table = &mut *addr_of_mut!(TABLE);
+    let nproc = table[next].process.take().expect("Ready slot has no process");
+    table[next].state = State::Running;
+    let rsp = table[next].kernel_rsp;
+    let l4 = nproc.l4;
+    *process::CURRENT.lock() = Some(nproc);
+    CURRENT_SLOT = next;
+    memory::switch_to(l4);
+    gdt::set_kernel_stack(kstack_top(next));
+    sched_resume(rsp)
+}
+
+/// Idle with interrupts enabled until a device IRQ makes a reader Ready, then
+/// resume it. Entered only when a process is blocked on input and nothing else
+/// runs: the keyboard IRQ delivers a real event (waking the reader); the
+/// Stage-2 synthetic injection is delivered by the caller before we get here.
+/// Never returns.
+///
+/// # Safety
+/// The caller holds no locks; a process is blocked on input, so a wake is
+/// possible (otherwise this idles forever, which is correct -- the system is
+/// waiting for a keystroke).
+unsafe fn idle_until_runnable() -> ! {
+    loop {
+        // A delivery (synthetic, or a keyboard IRQ on a prior iteration) may have
+        // made a reader Ready -- including the one in CURRENT_SLOT, which
+        // pick_next skips, so scan for any Ready slot.
+        if let Some(next) = first_ready_slot() {
+            resume_process(next);
+        }
+        // Nothing Ready yet: enable interrupts and halt as one atomic step
+        // (sti;hlt -- no wakeup lost between them); a device IRQ wakes us, then
+        // we re-disable and re-check.
+        x86_64::instructions::interrupts::enable_and_hlt();
+        x86_64::instructions::interrupts::disable();
+    }
+}
+
+/// Index of the first Ready slot, if any. Unlike `pick_next` (round-robin, which
+/// skips the current slot), this includes the current slot -- the idle loop must
+/// resume a reader that blocked and was just woken in place.
+fn first_ready_slot() -> Option<usize> {
+    // SAFETY: scalar reads of the single-CPU table.
+    unsafe { (*addr_of!(TABLE)).iter().position(|s| s.state == State::Ready) }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-# Plinth ABI v2.1
+# Plinth ABI v2.2
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -43,6 +43,15 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   device index is part of the capability, so a holder cannot reach another
   device's blocks any more than another range's. `block_read`'s arguments are
   unchanged (the device rides in the capability, not the call).
+
+### v2.2 (additive)
+
+- **New: console input** -- an `EventSource` capability (`READ`) names an input
+  device, and `event_recv` reads the next raw event from it, blocking until one
+  arrives. Like the IPC ops it enters through the software-interrupt gate (a
+  blocking read needs the same resumable trap frame) and returns a **status**
+  (`RAX`) separate from the **event** (`RSI`). The kernel ships raw scancodes;
+  turning them into characters is library-OS policy. Purely additive.
 
 ## Syscall interface
 
@@ -158,6 +167,11 @@ convention mirrors the syscall one:
 | 1        | recv  | ep_slot                | status; msg in RSI; cap slot/`NO_CAP` RDX |
 | 2        | call  | ep_slot, req           | status; reply word in RSI                 |
 | 3        | reply | reply_slot, msg        | status                                    |
+| 4        | event_recv | source_slot       | status; packed event in RSI               |
+
+`event_recv` is not IPC -- it is the console-input read -- but it shares this
+gate because a blocking read needs the same resumable trap frame. It is
+documented under "Console input" below.
 
 Notes:
 
@@ -194,6 +208,30 @@ A program creates its own endpoints only indirectly so far: the kernel makes
 one per `spawn` (the result channel) and may grant one at launch. A
 process-facing endpoint-create call is not yet part of the ABI.
 
+## Console input
+
+Input is delivered as raw events from capability-named **event sources**. An
+`EventSource` capability (`RIGHT_READ`) names one input device; `event_recv`
+reads the next event from it. The call enters through the same `int 0x80` gate
+as IPC (a blocking read needs the resumable trap frame) under op selector 4.
+
+- **event_recv(source_slot)** requires `RIGHT_READ` on the `EventSource`
+  capability at `source_slot`. It returns the next event from that source --
+  immediately if one is queued, otherwise blocking until one arrives (the kernel
+  idles waiting for input). Returns `EVENT_OK = 0` in `RAX` with the **packed
+  event in `RSI`**, or `EVENT_ERR = 1` (bad slot, not an event source, or
+  missing read right). The status/payload split means no event word can be
+  mistaken for an error.
+- The event is **raw**: `RSI` packs the kind in bits 0..8, a device code in
+  8..24, and a value in 24..32. For the keyboard (the only source today, id 0),
+  the kind is `EVENT_KEY`, the code is the raw Set-1 scancode byte, and the
+  value is the make/break bit (1 = press). The kernel does no keymap
+  translation -- turning scancodes into characters and handling layouts,
+  modifiers, and line editing is library-OS policy.
+- One reader per source today: the process the kernel grants the source
+  capability to. Fanning input out to many consumers is itself a library OS
+  over this primitive.
+
 ## Capabilities
 
 Every grant is an unforgeable, kernel-held record that the holder may perform
@@ -207,6 +245,7 @@ index into a per-process table; the records never leave the kernel. Kinds:
 | Endpoint   | an IPC rendezvous channel        | `SEND`, `RECV`              |
 | Reply      | one-shot authority to reply once | (none -- holding it suffices) |
 | BlockRange | `count` sectors on a device      | `READ`, `WRITE`            |
+| EventSource | one input device's event stream | `READ`                     |
 
 Rights are checked at use, not at transfer. `Reply` capabilities are minted by
 the kernel (on receiving a `call`) and consumed on use; you cannot create one. A
@@ -214,7 +253,9 @@ the kernel (on receiving a `call`) and consumed on use; you cannot create one. A
 `dev`; the holder addresses them relative to `start` (offset 0 is the first
 sector of the grant), and the kernel refuses any access beyond `count` or onto
 another device -- so disjoint ranges handed to different library OSes cannot
-reach each other's blocks, and a range on one disk cannot read another.
+reach each other's blocks, and a range on one disk cannot read another. An
+`EventSource` names one input device (id 0 = keyboard); a holder reads only the
+source it was granted, never another.
 
 ### Well-known initial capabilities
 

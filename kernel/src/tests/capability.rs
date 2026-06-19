@@ -159,6 +159,30 @@ pub fn block_range_rights(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// An EventSource names an input device and gates reading by RIGHT_READ. A
+/// source minted read-only must satisfy a read lookup and refuse a write
+/// lookup, and the device id must round-trip -- the cap-level half of the input
+/// multiplexing gate (a capability to one source names only that id, so it can
+/// never reach another).
+pub fn event_source_rights(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut table = CapTable::new();
+    let obj = CapObject::EventSource { id: 0 };
+    let slot = table.mint(obj, RIGHT_READ).map_err(|_| "mint failed")?;
+
+    let cap = table.lookup(slot, RIGHT_READ).map_err(|_| "read lookup failed")?;
+    test_assert!(cap.object == obj, "EventSource did not round-trip through the table");
+    let CapObject::EventSource { id } = cap.object else {
+        return Err("looked-up capability is not an EventSource");
+    };
+    test_assert!(id == 0, "EventSource id altered");
+
+    test_assert!(
+        table.lookup(slot, RIGHT_WRITE) == Err(CapError::RightsDenied),
+        "write allowed by a read-only EventSource"
+    );
+    Ok(())
+}
+
 /// The full ownership story: a frame moves from the allocator into a
 /// capability, the capability is revoked, and the frame returns to the
 /// allocator. This is the cycle the syscall layer will drive for real

@@ -63,6 +63,7 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "capability::cpu_charge_rights_denied", run: capability::cpu_charge_rights_denied },
     TestCase { name: "capability::cpu_charge_wrong_type", run: capability::cpu_charge_wrong_type },
     TestCase { name: "capability::block_range_rights", run: capability::block_range_rights },
+    TestCase { name: "capability::event_source_rights", run: capability::event_source_rights },
     TestCase { name: "elf::valid_minimal", run: elf::valid_minimal },
     TestCase { name: "elf::valid_three_segments", run: elf::valid_three_segments },
     TestCase { name: "elf::too_small", run: elf::too_small },

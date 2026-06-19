@@ -35,7 +35,7 @@ fn main() {
 /// embedded or booted.
 const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "share", "rpc", "faultchild", "blk", "fsdemo", "diskhello", "template",
+    "share", "rpc", "faultchild", "blk", "fsdemo", "diskhello", "evt", "template",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -794,6 +794,7 @@ fn smoke(uefi_path: &Path) {
     check_endpoints_baseline(&actual, "spawn");
     check_frames_baseline(&actual, "blk");
     check_frames_baseline(&actual, "fs");
+    check_frames_baseline(&actual, "evt");
 }
 
 /// Build the kernel with the test suite compiled in. Uses a separate

@@ -1,0 +1,22 @@
+# Standalone crate -- intentionally not a workspace member.
+[workspace]
+
+[package]
+name = "evt-user"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "evt-user"
+path = "src/main.rs"
+
+[dependencies]
+libplinth = { path = "../libplinth" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true

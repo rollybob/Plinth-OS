@@ -54,6 +54,11 @@ pub const ENDPOINT_SLOT: u64 = 1;
 /// Pass it to sys_block_read.
 pub const BLOCK_SLOT: u64 = 1;
 
+/// An EventSource capability the kernel grants a scheduler-launched input
+/// process lands here too -- the same first-grant slot as the others. Pass it
+/// to sys_event_recv.
+pub const EVENT_SOURCE_SLOT: u64 = 1;
+
 /// Demand-paged window. A not-present access here, once the process has
 /// registered a fault handler (sys_fault_reg), is delivered to that handler
 /// instead of killing the process. Inside [MAP_BASE, MAP_END), so the
@@ -398,6 +403,68 @@ pub fn spawn_and_wait(child_id: u64, transfer_slot: u64) -> (u64, u64) {
         return (IPC_ERR, 0);
     }
     sys_recv(handle)
+}
+
+// ---------------------------------------------------------------------------
+// Input events
+// ---------------------------------------------------------------------------
+// event_recv shares the int 0x80 gate with IPC (a blocking read needs the same
+// resumable trap frame), under its own op selector. Status in rax, the packed
+// event in rsi -- the same status/payload split as IPC, so no event value can
+// be mistaken for an error.
+
+const EVENT_RECV: u64 = 4;
+
+/// event_recv status (rax). `EVENT_OK` means an event is in the returned word;
+/// `EVENT_ERR` a bad slot, wrong capability kind, or a missing read right.
+pub const EVENT_OK: u64 = 0;
+pub const EVENT_ERR: u64 = 1;
+
+/// Event kind (EVENT_KEY = 1, ...), the low byte of a packed event.
+pub const EVENT_KEY: u8 = 1;
+
+/// Read the next input event from the EventSource capability at `source_slot`,
+/// blocking until one arrives. Returns `(status, event)`: on `EVENT_OK` the
+/// event is the packed word, unpacked with `event_kind` / `event_code` /
+/// `event_value`. The kernel delivers raw scancodes; turning them into
+/// characters is the caller's (library OS's) job.
+#[inline]
+pub fn sys_event_recv(source_slot: u64) -> (u64, u64) {
+    let status: u64;
+    let event: u64;
+    // SAFETY: int 0x80 is the kernel's blocking-call gate; its handler saves and
+    // restores every register except the result regs (rax = status, rsi = event).
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") EVENT_RECV => status,
+            in("rdi") source_slot,
+            out("rsi") event,
+            out("rdx") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            options(nostack),
+        );
+    }
+    (status, event)
+}
+
+/// Unpack a packed event's kind. For a key event this is `EVENT_KEY`.
+#[inline]
+pub fn event_kind(ev: u64) -> u8 {
+    (ev & 0xFF) as u8
+}
+
+/// Unpack a packed event's device code. For a key event this is the raw Set-1
+/// scancode byte.
+#[inline]
+pub fn event_code(ev: u64) -> u16 {
+    ((ev >> 8) & 0xFFFF) as u16
+}
+
+/// Unpack a packed event's value. For a key event this is the make/break
+/// convenience bit (1 = press, 0 = release).
+#[inline]
+pub fn event_value(ev: u64) -> u8 {
+    ((ev >> 24) & 0xFF) as u8
 }
 
 // ---------------------------------------------------------------------------

@@ -3,13 +3,25 @@
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
 follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
-current contract is **v2.1**. v2 added IPC and revised `spawn`, breaking v1 --
-the one incompatible ABI change so far; v2.1 adds `spawn_from_buffer` (the
-load-from-disk path) without breaking v2.
+current contract is **v2.2**. v2 added IPC and revised `spawn`, breaking v1 --
+the one incompatible ABI change so far; v2.1 added `spawn_from_buffer` (the
+load-from-disk path) and v2.2 adds console input (`event_recv` + `EventSource`),
+both additive over v2.
 
 ## [Unreleased]
 
 ### Added
+- Console input, first stages (`event_recv` + an `EventSource` capability). The
+  kernel takes the i8042 keyboard's IRQ behind a new interrupt-controller seam
+  (`irq`, the one module an APIC port later swaps), queues raw scancodes in a
+  bounded per-source event ring, and multiplexes the device through an
+  **`EventSource` capability** (`READ`). A new **`event_recv`** call -- on the
+  same `int 0x80` gate as IPC, since a blocking read needs a resumable trap
+  frame -- returns the next event (raw scancode in a register), blocking until
+  one arrives; a process blocked on input is no longer mistaken for a deadlock,
+  so the kernel idles waiting for a keystroke. Events are raw: keymaps and
+  characters are library-OS policy. An `evt-user` demo reads an event through
+  its granted source and is denied reading through a non-source capability.
 - Load-from-disk (Phase 2 close, final piece). A read-only **boot archive**
   (superblock + directory of `(name, first_sector, byte_len)` + sector-aligned
   ELF blobs) is assembled by xtask and attached as a **second virtio-blk

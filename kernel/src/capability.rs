@@ -70,6 +70,17 @@ pub enum CapObject {
     /// endpoint-style refcount; the range capability itself stays inline. This
     /// is the agreed narrowing of hardening ruling D3b, 2026-06-17.)
     BlockRange { dev: u8, start: u64, count: u64 },
+    /// An input event source (`id` selects the device: 0 = keyboard). `RIGHT_READ`
+    /// gates reading its event stream via `event_recv`. The kernel multiplexes
+    /// the physical device into per-source event rings and hands a source's
+    /// capability to the library OS that owns input -- the same "secure binding
+    /// over a raw resource" move as frames and `BlockRange`. A holder reads only
+    /// the source it was granted; `id` is part of the multiplexing boundary.
+    ///
+    /// Pure inline data, like `BlockRange`: the ring is a fixed kernel static,
+    /// not a pooled resource the capability owns, so teardown just drops it --
+    /// no reference count (consistent with the D3b narrowing).
+    EventSource { id: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
