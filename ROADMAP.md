@@ -51,9 +51,13 @@ against the cost to determinism rather than taken for granted.
   messages (zero-copy frame handoff), and `call`/`reply` RPC with a one-shot
   reply capability. `spawn` is reconciled with the scheduler -- it launches an
   independent scheduled process and the parent waits with `recv` (the join).
-- [ ] **Storage and a filesystem.** A block device driver and a minimal
-  filesystem -- the path to loading programs from disk rather than
-  embedding them at build time.
+- [x] **Storage and a filesystem.** An in-kernel virtio-blk driver (PCI
+  enumeration, mapped MMIO, one virtqueue) multiplexed by a `BlockRange`
+  capability; a read-only boot archive parsed by an unprivileged `libfs`; and
+  `spawn_from_buffer`, so a program is loaded off disk and run rather than
+  embedded at build time. Block reads are interrupt-driven and blocking -- the
+  CPU runs other processes while the disk DMA is in flight, woken by the
+  completion IRQ through the same interrupt-controller seam the keyboard uses.
 - [x] **Console input.** The i8042 keyboard's IRQ feeds raw scancodes into a
   bounded event ring behind an interrupt-controller seam; an `EventSource`
   capability multiplexes the device, and a blocking `event_recv` (on the IPC

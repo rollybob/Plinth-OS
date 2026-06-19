@@ -196,6 +196,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         if virtio_blk::ready(1) {
             virtio_blk::selftest_read(&mut serial, phys_offset, 1, false);
         }
+        // The boot selftests above ran polled (no process to block yet). From
+        // here on, runtime block_read blocks and is woken by the completion IRQ:
+        // install each device's INTx handler and unmask its line (Stage 4).
+        virtio_blk::enable_completion_irqs();
 
         // The synchronous, one-at-a-time demos (run via process::run). spawn
         // is no longer synchronous, so the spawner demo now runs under the

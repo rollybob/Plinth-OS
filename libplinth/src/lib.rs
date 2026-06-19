@@ -94,31 +94,6 @@ fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     ret
 }
 
-/// Four-argument syscall stub. Adds a fourth argument in r8 -- the System V C
-/// ABI's fifth register, which the kernel's entry stub leaves untouched, so the
-/// dispatcher receives it directly. Same clobber discipline as syscall3 (r8 is
-/// an input here, so it is inlateout rather than a plain clobber).
-#[inline]
-fn syscall4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") nr => ret,
-            inlateout("rdi") a1 => _,
-            inlateout("rsi") a2 => _,
-            inlateout("rdx") a3 => _,
-            inlateout("r8") a4 => _,
-            out("rcx") _,
-            out("r9") _,
-            out("r10") _,
-            out("r11") _,
-            options(nostack, preserves_flags),
-        );
-    }
-    ret
-}
-
 /// Write bytes to the kernel console. Returns bytes written or SYS_ERR.
 #[inline]
 pub fn sys_write(buf: &[u8]) -> u64 {
@@ -228,15 +203,41 @@ pub const BLK_E_RIGHTS: u64 = 3;
 /// The device reported an error or is not initialised.
 pub const BLK_E_DEV: u64 = 4;
 
+/// block_read shares the `int 0x80` gate with IPC and event_recv (op 5): the
+/// read BLOCKS until the disk completes, and a blocking call needs the gate's
+/// resumable trap frame, not the `syscall` fast path (ABI v2.3). It is the one
+/// gate op with a FOURTH argument (`count`, in rcx).
+const BLOCK_READ: u64 = 5;
+
 /// Read `count` 512-byte sectors -- starting `sector_off` sectors into the
 /// BlockRange capability at `range_slot` -- into the frame named by
-/// `frame_slot`. The device DMAs into the frame, so map it (sys_frame_map) to
-/// read the bytes; the frame cap must carry the write right (frame_alloc grants
-/// it). Sectors are named relative to the range, never absolutely. Returns
-/// BLK_OK, or a BLK_E_* status.
+/// `frame_slot`. BLOCKS until the device completes the read (other processes run
+/// meanwhile). The device DMAs into the frame, so map it (sys_frame_map) to read
+/// the bytes; the frame cap must carry the write right (frame_alloc grants it).
+/// Sectors are named relative to the range, never absolutely. Returns BLK_OK, or
+/// a BLK_E_* status.
 #[inline]
 pub fn sys_block_read(range_slot: u64, frame_slot: u64, sector_off: u64, count: u64) -> u64 {
-    syscall4(10, range_slot, frame_slot, sector_off, count)
+    let status: u64;
+    // SAFETY: int 0x80 is the kernel's blocking-call gate; its handler saves and
+    // restores every register except the result (rax = status). The read may
+    // block until the virtio completion IRQ wakes this process. The four args go
+    // in rdi/rsi/rdx/rcx; the kernel reads them from the saved trap frame. rsi
+    // and rdx are also where the gate's wake writes its (unused-here) payload and
+    // cap slots, so they are clobbered; count in rcx is restored on resume.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") BLOCK_READ => status,
+            in("rdi") range_slot,
+            inlateout("rsi") frame_slot => _,
+            inlateout("rdx") sector_off => _,
+            inlateout("rcx") count => _,
+            out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            options(nostack),
+        );
+    }
+    status
 }
 
 // ---------------------------------------------------------------------------

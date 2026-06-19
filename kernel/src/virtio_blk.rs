@@ -16,9 +16,11 @@ use core::fmt::Write;
 use core::sync::atomic::{fence, Ordering};
 
 use spin::Mutex;
+use x86_64::structures::idt::InterruptStackFrame;
 
+use crate::capability::{CapObject, RIGHT_READ, RIGHT_WRITE};
 use crate::frame_alloc::{FRAME_ALLOC, FRAME_SIZE};
-use crate::memory;
+use crate::{interrupts, irq, memory, process, scheduler};
 use crate::pci::{self, VirtioBlkInfo};
 
 // --- virtio_pci_common_cfg field offsets (virtio 1.x, 4.1.4.3) ---
@@ -49,6 +51,12 @@ const FEATURE_VERSION_1_HI_BIT: u32 = 1;
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
+// --- virtq_avail flags (offset 0 of the avail ring) ---
+/// Set by the driver to tell the device NOT to raise an interrupt when it
+/// completes a request. The polled boot path sets it (it spins on the used
+/// ring); the blocking runtime path clears it (it wants the completion IRQ).
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
+
 // --- virtio-blk request (virtio 1.x, 5.2.6) ---
 const VIRTIO_BLK_T_IN: u32 = 0; // read: device -> memory
 const VIRTIO_BLK_S_OK: u8 = 0;
@@ -56,6 +64,20 @@ const VIRTIO_BLK_S_OK: u8 = 0;
 /// virtio block I/O is always in 512-byte units, independent of any device
 /// logical block size. This is the sector unit `BlockRange` will count (D3a).
 const SECTOR_SIZE: u64 = 512;
+
+/// `block_read` status words, returned in rax (the C1 status/payload split: the
+/// data lands in the caller's frame, so no read-back byte can be confused for an
+/// error). Mirrored in libplinth as BLK_*. `block_read` is an `int 0x80` op
+/// (Stage 4 S4a) because a blocking call needs a resumable trap frame.
+pub const BLK_OK: u64 = 0;
+/// count is zero, or count*512 would overflow the I/O frame.
+const BLK_E_BADARG: u64 = 1;
+/// The request falls outside the holder's BlockRange (multiplexing guarantee).
+const BLK_E_RANGE: u64 = 2;
+/// Bad slot, wrong object kind, or a missing right on the range or frame cap.
+const BLK_E_RIGHTS: u64 = 3;
+/// The device reported an error or is not initialised.
+pub const BLK_E_DEV: u64 = 4;
 
 /// Cap the virtqueue at a small power of two: we only ever post a 3-descriptor
 /// request at a time, so a large ring buys nothing and a smaller one keeps the
@@ -91,6 +113,18 @@ struct VirtioBlk {
     /// Device capacity in 512-byte sectors (virtio-blk device-config offset 0).
     /// The boot code grants a whole-device BlockRange of this many sectors.
     capacity: u64,
+    /// MMIO virtual address of the ISR-status register. The completion IRQ
+    /// handler reads it to ack/deassert the level-triggered INTx at the device
+    /// (a read clears it) before EOIing the controller (Stage 4 S4c).
+    isr_va: u64,
+    /// The INTx line IRQ this device is wired to (PCI config 0x3C). The handler
+    /// is installed at VECTOR_BASE+line and EOIs this line.
+    intr_line: u8,
+    /// The process slot blocked waiting for this device's I/O completion, if
+    /// any. One waiter per device (a device's Mutex serialises requests, so at
+    /// most one read is ever outstanding); woken by the completion IRQ. Named by
+    /// the existing BlockRange, so no new capability (S4d).
+    waiter: Option<usize>,
 }
 
 /// One slot per virtio-blk device the kernel tracks (pci::MAX_DEVICES). A
@@ -161,14 +195,23 @@ fn alloc_zeroed(phys_offset: u64) -> Result<(u64, u64), &'static str> {
 }
 
 impl VirtioBlk {
-    /// Read `count` 512-byte sectors starting at `sector` into the buffer at
-    /// `data_phys` (the device DMAs there; the buffer must hold count*512
-    /// bytes). Synchronous: post a 3-descriptor request and poll to completion.
-    fn read_block(&mut self, sector: u64, count: u64, data_phys: u64) -> Result<(), &'static str> {
+    /// Post a 3-descriptor read of `count` 512-byte sectors starting at `sector`
+    /// into the buffer at `data_phys` (the device DMAs there; the buffer must
+    /// hold count*512 bytes) and notify the device. Does NOT wait: the caller
+    /// either polls (`completed` + `take_completion`, the boot path) or blocks
+    /// until the completion IRQ (the runtime path). `want_interrupt` sets the
+    /// avail-ring NO_INTERRUPT flag accordingly.
+    fn post_request(&mut self, sector: u64, count: u64, data_phys: u64, want_interrupt: bool) {
         // SAFETY: all addresses below are kernel-mapped ring/MMIO/buffer
         // addresses set up in `init`; data_phys is a caller-owned frame. The
         // device touches only what these descriptors name.
         unsafe {
+            // Avail flags (offset 0): tell the device whether to raise a
+            // completion interrupt for the requests we publish. Set before the
+            // idx bump so the device sees it when it consumes this request.
+            let flags = if want_interrupt { 0 } else { VIRTQ_AVAIL_F_NO_INTERRUPT };
+            w16(self.avail_va, flags);
+
             // Request header (device reads it) and a status sentinel.
             w32(self.hdr_va, VIRTIO_BLK_T_IN);
             w32(self.hdr_va + 4, 0);
@@ -192,9 +235,9 @@ impl VirtioBlk {
             w16(d + 44, VIRTQ_DESC_F_WRITE);
             w16(d + 46, 0);
 
-            // Publish into the available ring (flags@0, idx@2, ring@4), then
-            // bump idx. Fence so the descriptors are visible before the index,
-            // and the index before the notify.
+            // Publish into the available ring (idx@2, ring@4), then bump idx.
+            // Fence so the descriptors are visible before the index, and the
+            // index before the notify.
             let avail_idx = r16(self.avail_va + 2);
             let ring_slot = (avail_idx % self.qsize) as u64;
             w16(self.avail_va + 4 + ring_slot * 2, 0); // head descriptor = 0
@@ -206,24 +249,49 @@ impl VirtioBlk {
             let notify_addr =
                 self.notify + (self.queue_notify_off as u64) * (self.notify_mult as u64);
             w16(notify_addr, 0);
+        }
+    }
 
-            // Poll the used ring (idx@2) for completion, bounded.
-            let mut spins = 0u64;
-            while r16(self.used_va + 2) == self.last_used {
-                spins += 1;
-                if spins >= POLL_MAX {
-                    return Err("virtio-blk read timed out");
-                }
-                core::hint::spin_loop();
-            }
-            fence(Ordering::SeqCst);
-            self.last_used = self.last_used.wrapping_add(1);
+    /// True once the device has completed the outstanding request (its used-ring
+    /// index moved past the one we last consumed). Side-effect free.
+    fn completed(&self) -> bool {
+        // SAFETY: used_va is the mapped used ring; reading its idx@2 is a read.
+        unsafe { r16(self.used_va + 2) != self.last_used }
+    }
 
-            if r8(self.status_va) != VIRTIO_BLK_S_OK {
-                return Err("virtio-blk read failed (device status)");
-            }
+    /// Consume one completion: advance our used-ring cursor and check the status
+    /// byte the device wrote. Call exactly once per request the device finished
+    /// (after `completed` is true, or from the completion IRQ handler).
+    fn take_completion(&mut self) -> Result<(), &'static str> {
+        fence(Ordering::SeqCst);
+        self.last_used = self.last_used.wrapping_add(1);
+        // SAFETY: status_va is the mapped status byte; the device wrote it before
+        // advancing the used ring, and the fence orders our read after that.
+        if unsafe { r8(self.status_va) } != VIRTIO_BLK_S_OK {
+            return Err("virtio-blk read failed (device status)");
         }
         Ok(())
+    }
+
+    /// Synchronous polled read for the boot path: there is no scheduler yet, so
+    /// nothing can be blocked. Post with the completion interrupt suppressed,
+    /// spin (bounded, faulting on timeout per D6) on the used ring, and consume.
+    fn read_block_polled(
+        &mut self,
+        sector: u64,
+        count: u64,
+        data_phys: u64,
+    ) -> Result<(), &'static str> {
+        self.post_request(sector, count, data_phys, false);
+        let mut spins = 0u64;
+        while !self.completed() {
+            spins += 1;
+            if spins >= POLL_MAX {
+                return Err("virtio-blk read timed out");
+            }
+            core::hint::spin_loop();
+        }
+        self.take_completion()
     }
 }
 
@@ -264,6 +332,7 @@ pub fn init<W: Write>(
     let common = base + info.common.offset as u64;
     let notify = base + info.notify.offset as u64;
     let device_cfg = base + info.device.offset as u64;
+    let isr = base + info.isr.offset as u64;
 
     // SAFETY: `common` is the mapped common-config MMIO; the status handshake
     // and feature reads/writes below are the defined modern bring-up sequence.
@@ -351,6 +420,9 @@ pub fn init<W: Write>(
         status_phys: buf_phys + 16,
         last_used: 0,
         capacity,
+        isr_va: isr,
+        intr_line: info.intr_line,
+        waiter: None,
     });
 
     let _ = writeln!(
@@ -381,8 +453,170 @@ pub fn capacity(dev: usize) -> Option<u64> {
 pub fn read(dev: usize, sector: u64, count: u64, data_phys: u64) -> Result<(), &'static str> {
     let mut guard = DEVICES.get(dev).ok_or("invalid block device")?.lock();
     match guard.as_mut() {
-        Some(d) => d.read_block(sector, count, data_phys),
+        Some(d) => d.read_block_polled(sector, count, data_phys),
         None => Err("virtio-blk not initialised"),
+    }
+}
+
+/// block_read(range_slot, frame_slot, sector_off, count): read `count` 512-byte
+/// sectors -- starting `sector_off` sectors into the BlockRange capability at
+/// `range_slot` -- into the frame named by `frame_slot`, BLOCKING until the
+/// device completes. Reached from the `int 0x80` dispatch (op 5): a process that
+/// must wait for I/O is parked and resumed by the completion IRQ, exactly like a
+/// blocked IPC receiver -- which is why this needs the gate's resumable trap
+/// frame, not the `syscall` fast path (Stage 4 S4a). `frame_ptr` is this call's
+/// saved trap frame. Returns a status word (BLK_OK or a BLK_E_* code), never a
+/// data value (the data DMAs into the caller's frame).
+///
+/// Two checks make this the exokernel multiplexing surface: the request must
+/// fall inside the holder's range (so a BlockRange cannot read another libOS's
+/// blocks), and the frame must be the holder's with RIGHT_WRITE (so the device
+/// DMAs only into a frame the caller owns). The range start is added by the
+/// kernel -- the holder names sectors relative to its range, never absolute.
+pub fn block_read(
+    range_slot: u64,
+    frame_slot: u64,
+    sector_off: u64,
+    count: u64,
+    frame_ptr: u64,
+) -> u64 {
+    // Bound the transfer: at least one sector, and it must fit the I/O frame.
+    if count == 0 || count.saturating_mul(SECTOR_SIZE) > FRAME_SIZE {
+        return BLK_E_BADARG;
+    }
+
+    // Resolve both capabilities under the CURRENT lock, then drop it before
+    // touching the device or blocking -- nothing below needs CURRENT.
+    let (dev, abs_sector, frame_phys) = {
+        let cur = process::CURRENT.lock();
+        let Some(proc) = cur.as_ref() else {
+            return BLK_E_RIGHTS;
+        };
+
+        // The BlockRange: RIGHT_READ to read from the disk.
+        let Ok(range) = proc.caps.lookup(range_slot as usize, RIGHT_READ) else {
+            return BLK_E_RIGHTS;
+        };
+        let CapObject::BlockRange { dev, start, count: range_count } = range.object else {
+            return BLK_E_RIGHTS;
+        };
+        // Multiplexing guarantee: [sector_off, sector_off+count) must lie inside
+        // [0, range_count). Checked-add so a huge sector_off cannot wrap past it.
+        let Some(end) = sector_off.checked_add(count) else {
+            return BLK_E_RANGE;
+        };
+        if end > range_count {
+            return BLK_E_RANGE;
+        }
+
+        // The I/O frame: RIGHT_WRITE, since the device DMAs into it.
+        let Ok(frame) = proc.caps.lookup(frame_slot as usize, RIGHT_WRITE) else {
+            return BLK_E_RIGHTS;
+        };
+        let CapObject::Frame { addr } = frame.object else {
+            return BLK_E_RIGHTS;
+        };
+
+        (dev as usize, start + sector_off, addr)
+    };
+
+    // Post the request with completion interrupts enabled and record this
+    // process as the device's waiter, then block. We are IF=0 from the int 0x80
+    // entry, so the completion INTx cannot be delivered between recording the
+    // waiter and blocking -- it stays latched at the PIC until the idle path's
+    // `sti`, by which point this process is already Blocked. No lost wakeup, the
+    // same IF=0 discipline IPC and event_recv rely on. The completion handler
+    // (`complete_irq`) wakes us with BLK_OK / BLK_E_DEV in rax.
+    {
+        let mut guard = match DEVICES.get(dev) {
+            Some(g) => g.lock(),
+            None => return BLK_E_DEV,
+        };
+        let Some(d) = guard.as_mut() else {
+            return BLK_E_DEV;
+        };
+        d.waiter = Some(scheduler::current_slot());
+        d.post_request(abs_sector, count, frame_phys, true);
+    } // drop the device lock BEFORE blocking -- block_current never returns here.
+    scheduler::block_current(frame_ptr)
+}
+
+/// True if any device has a process blocked waiting for I/O completion. The
+/// scheduler reads this (alongside `input::any_waiter`) to treat a process
+/// blocked on disk as a legitimate idle -- the completion IRQ can still wake it
+/// -- rather than an IPC deadlock (S4e).
+pub fn any_waiter() -> bool {
+    (0..pci::MAX_DEVICES).any(|dev| DEVICES[dev].lock().as_ref().is_some_and(|d| d.waiter.is_some()))
+}
+
+/// Service device `dev`'s completion interrupt: ack at the device (read ISR to
+/// deassert the level-triggered INTx -- a read clears it, without which the line
+/// re-fires after EOI), consume the completion, wake the blocked reader with the
+/// status, and EOI the line. Shared by the per-device IRQ stubs.
+fn complete_irq(dev: usize) {
+    let (woken, line) = {
+        let Some(g) = DEVICES.get(dev) else {
+            return;
+        };
+        let mut guard = g.lock();
+        let Some(d) = guard.as_mut() else {
+            return;
+        };
+        // SAFETY: isr_va is the device's mapped ISR-status MMIO; reading it acks
+        // and deasserts the device's INTx.
+        let _isr = unsafe { r8(d.isr_va) };
+        let line = d.intr_line;
+        let woken = if d.completed() {
+            let status = match d.take_completion() {
+                Ok(()) => BLK_OK,
+                Err(_) => BLK_E_DEV,
+            };
+            d.waiter.take().map(|w| (w, status))
+        } else {
+            None
+        };
+        (woken, line)
+    };
+    // Wake outside the device lock (wake_with touches the scheduler table, not
+    // the device). NO_CAP in rdx -- block_read returns a status word only.
+    if let Some((waiter, status)) = woken {
+        scheduler::wake_with(waiter, status, 0, u64::MAX);
+    }
+    irq::eoi(line);
+}
+
+// The completion-IRQ stubs: one per device, because the two devices sit on
+// distinct INTx lines (QEMU q35), so each vector maps to a known device and EOIs
+// its own line. Raising pci::MAX_DEVICES means adding a stub here.
+extern "x86-interrupt" fn blk_interrupt_dev0(_frame: InterruptStackFrame) {
+    complete_irq(0);
+}
+extern "x86-interrupt" fn blk_interrupt_dev1(_frame: InterruptStackFrame) {
+    complete_irq(1);
+}
+
+/// Install each present device's completion-IRQ handler at its line's vector and
+/// unmask the line. Call once at boot AFTER the devices are brought up (their
+/// INTx lines are known) and AFTER the polled selftests (which suppress
+/// completion interrupts): from here on, runtime `block_read` blocks and is woken
+/// by these handlers. The IDT is already loaded, so the handler is installed live
+/// into it (interrupts::set_irq_handler); the IDTR points at the same table.
+pub fn enable_completion_irqs() {
+    for dev in 0..pci::MAX_DEVICES {
+        let line = {
+            let guard = DEVICES[dev].lock();
+            match guard.as_ref() {
+                Some(d) => d.intr_line,
+                None => continue,
+            }
+        };
+        let handler: extern "x86-interrupt" fn(InterruptStackFrame) = match dev {
+            0 => blk_interrupt_dev0,
+            1 => blk_interrupt_dev1,
+            _ => continue, // add a stub if MAX_DEVICES grows
+        };
+        interrupts::set_irq_handler(irq::VECTOR_BASE + line, handler);
+        irq::unmask(line);
     }
 }
 

@@ -1,4 +1,4 @@
-//! The syscall surface -- all five of it.
+//! The syscall surface.
 //!
 //! | Nr | Name        | Args (RDI, RSI)     | Returns                  |
 //! |----|-------------|---------------------|--------------------------|
@@ -11,15 +11,12 @@
 //! |  7 | fault_reg   | entry, stack_top    | 0, or ERR                |
 //! |  8 | fault_return| --                  | (resumes), or ERR        |
 //! |  9 | spawn       | child_id, slot      | child exit code, or ERR  |
-//! | 10 | block_read  | rng, frm, sec, count| BLK_OK, or a BLK_E_* code |
 //! | 11 | spawn_buf   | buf_va, len, slot   | wait handle, or ERR      |
 //!
-//! block_read is the first syscall to take a fourth argument: it arrives in r8
-//! (the System V C ABI's fifth register, after nr+three args), which the entry
-//! stub never touches, so the dispatcher reads it directly -- no asm change.
-//! Its result is a *status* word (the C1 status/payload split applied to block
-//! I/O): the data lands in the caller's frame, so no data value can be mistaken
-//! for an error.
+//! Nr 10 (block_read) was retired in ABI v2.3: a blocking read must suspend and
+//! resume with a return value, which needs the full resumable trap frame only an
+//! interrupt entry saves -- so block_read moved to the `int 0x80` gate (op 5),
+//! alongside the blocking IPC ops and event_recv. See ipc.rs / virtio_blk.rs.
 //!
 //! This is the whole kernel interface, and that is the point: memory
 //! arrives as raw frames through capabilities, and everything resembling
@@ -66,25 +63,8 @@ use crate::process::{self, FaultReg, USER_MAP_BASE, USER_MAP_END};
 use crate::scheduler;
 use crate::serial;
 use crate::usermode;
-use crate::virtio_blk;
 
 pub const ERR: u64 = u64::MAX;
-
-/// block_read status words, returned in rax. The data lands in the caller's
-/// frame, so status is its own word (the C1 split): no read-back byte can be
-/// confused for an error. Mirrored in libplinth as BLK_*.
-const BLK_OK: u64 = 0;
-/// count is zero, or count*512 would overflow the I/O frame.
-const BLK_E_BADARG: u64 = 1;
-/// The request falls outside the holder's BlockRange (multiplexing guarantee).
-const BLK_E_RANGE: u64 = 2;
-/// Bad slot, wrong object kind, or a missing right on the range or frame cap.
-const BLK_E_RIGHTS: u64 = 3;
-/// The device reported an error or is not initialised.
-const BLK_E_DEV: u64 = 4;
-
-/// 512-byte virtio sector -- the unit a BlockRange counts and block_read reads.
-const SECTOR_SIZE: u64 = 512;
 
 const MAX_WRITE: u64 = 4096;
 
@@ -168,11 +148,12 @@ fn syscall_stack_top() -> u64 {
     addr_of!(SYSCALL_STACK) as u64 + STACK_SIZE as u64
 }
 
-// a3/a4 arrive in rcx/r8 (the 4th/5th C-ABI registers); the entry stub places
-// the user's first three args in rsi/rdx/rcx and leaves r8 untouched, so a4 is
-// the user's r8. Only block_read uses a4 today.
+// Three args suffice for every syscall (the four-arg block_read moved to the
+// `int 0x80` gate in v2.3). a3 arrives in rcx, the 4th C-ABI register; the entry
+// stub shuffles the user's first three args into rsi/rdx/rcx. spawn_from_buffer
+// is the only remaining three-arg syscall.
 #[no_mangle]
-extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     match nr {
         1 => sys_write(a1, a2),
         2 => sys_exit(a1),
@@ -183,7 +164,9 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         7 => sys_fault_reg(a1, a2),
         8 => sys_fault_return(),
         9 => sys_spawn(a1, a2),
-        10 => sys_block_read(a1, a2, a3, a4),
+        // nr 10 (block_read) was retired in ABI v2.3: a blocking read needs a
+        // resumable trap frame, so block_read moved to the `int 0x80` gate (op
+        // 5, see ipc.rs / virtio_blk.rs). The number is left unused.
         11 => sys_spawn_from_buffer(a1, a2, a3),
         _ => ERR,
     }
@@ -576,60 +559,3 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
     }
 }
 
-/// block_read(range_slot, frame_slot, sector_off, count): read `count` 512-byte
-/// sectors -- starting `sector_off` sectors into the BlockRange capability at
-/// `range_slot` -- into the frame named by `frame_slot`. The device DMAs the
-/// data into the frame; the holder maps that frame to read it. Returns a status
-/// word (BLK_OK or a BLK_E_* code), never a data value.
-///
-/// Two checks make this the exokernel multiplexing surface: the request must
-/// fall inside the holder's range (so a BlockRange cannot read another libOS's
-/// blocks), and the frame must be the holder's with RIGHT_WRITE (so the device
-/// DMAs only into a frame the caller owns). The range start is added by the
-/// kernel -- the holder names sectors relative to its range, never absolute.
-fn sys_block_read(range_slot: u64, frame_slot: u64, sector_off: u64, count: u64) -> u64 {
-    // Bound the transfer: at least one sector, and it must fit the I/O frame.
-    if count == 0 || count.saturating_mul(SECTOR_SIZE) > FRAME_SIZE {
-        return BLK_E_BADARG;
-    }
-
-    // Resolve both capabilities under the CURRENT lock, then drop it before the
-    // (polled) device I/O -- nothing the read touches needs CURRENT.
-    let (dev, abs_sector, frame_phys) = {
-        let cur = process::CURRENT.lock();
-        let Some(proc) = cur.as_ref() else {
-            return BLK_E_RIGHTS;
-        };
-
-        // The BlockRange: RIGHT_READ to read from the disk.
-        let Ok(range) = proc.caps.lookup(range_slot as usize, RIGHT_READ) else {
-            return BLK_E_RIGHTS;
-        };
-        let CapObject::BlockRange { dev, start, count: range_count } = range.object else {
-            return BLK_E_RIGHTS;
-        };
-        // Multiplexing guarantee: [sector_off, sector_off+count) must lie inside
-        // [0, range_count). Checked-add so a huge sector_off cannot wrap past it.
-        let Some(end) = sector_off.checked_add(count) else {
-            return BLK_E_RANGE;
-        };
-        if end > range_count {
-            return BLK_E_RANGE;
-        }
-
-        // The I/O frame: RIGHT_WRITE, since the device DMAs into it.
-        let Ok(frame) = proc.caps.lookup(frame_slot as usize, RIGHT_WRITE) else {
-            return BLK_E_RIGHTS;
-        };
-        let CapObject::Frame { addr } = frame.object else {
-            return BLK_E_RIGHTS;
-        };
-
-        (dev, start + sector_off, addr)
-    };
-
-    match virtio_blk::read(dev as usize, abs_sector, count, frame_phys) {
-        Ok(()) => BLK_OK,
-        Err(_) => BLK_E_DEV,
-    }
-}

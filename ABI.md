@@ -1,4 +1,4 @@
-# Plinth ABI v2.2
+# Plinth ABI v2.3
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -53,13 +53,26 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   (`RAX`) separate from the **event** (`RSI`). The kernel ships raw scancodes;
   turning them into characters is library-OS policy. Purely additive.
 
+### v2.3 (block_read moves to the gate)
+
+- **`block_read` is now a blocking call on the `int 0x80` gate (op 5), not
+  syscall nr 10.** It always returned a status word and named the same
+  capabilities; what changed is that the read now BLOCKS until the device
+  completes the I/O, and the issuing process is suspended so others run
+  meanwhile (the disk completion interrupt wakes it). A blocking call needs the
+  resumable trap frame the gate saves, so `block_read` joined the IPC ops and
+  `event_recv` there -- exactly the same move, for exactly the same reason.
+  Syscall nr 10 is retired (unused). The arguments, the relative-sector
+  addressing, and the `BLK_OK`/`BLK_E_*` status are all unchanged; only the
+  entry mechanism (and the now-asynchronous wait) differ. A caller that used
+  `libplinth::sys_block_read` is unaffected -- the wrapper hides the change.
+
 ## Syscall interface
 
 The non-blocking calls use the `syscall`/`sysretq` instructions:
 
-- The syscall number goes in `RAX`; arguments in `RDI`, `RSI`, `RDX`, and -- for
-  the one call that takes a fourth, `block_read` -- `R8`; the return value comes
-  back in `RAX`.
+- The syscall number goes in `RAX`; arguments in `RDI`, `RSI`, `RDX` (every
+  syscall takes at most three); the return value comes back in `RAX`.
 - The `syscall` instruction clobbers `RCX` and `R11`; the kernel's
   dispatcher may clobber the caller-saved registers `R8`-`R10` and the
   argument registers. A caller must treat all of `RDI`, `RSI`, `RDX`,
@@ -77,8 +90,10 @@ The non-blocking calls use the `syscall`/`sysretq` instructions:
 | 7  | fault_reg    | entry, stack_top      | 0, or `SYS_ERR`                  |
 | 8  | fault_return | --                    | resumes the faulting instruction |
 | 9  | spawn        | child_id, transfer    | wait handle, or `SYS_ERR`        |
-| 10 | block_read   | range, frame, sec, cnt| `BLK_OK`, or a `BLK_E_*` status  |
 | 11 | spawn_from_buffer | buf_va, len, transfer | wait handle, or `SYS_ERR`   |
+
+(Nr 10, `block_read`, was retired in v2.3: it is now a blocking op on the
+`int 0x80` gate -- see the IPC interface table below.)
 
 Notes:
 
@@ -115,20 +130,6 @@ Notes:
   `spawn` does not block -- the child runs alongside the caller. To wait for
   and collect the child's result, `recv` the handle (see IPC); that recv is
   the join. Returns `SYS_ERR` if the child could not be created.
-- **block_read(range, frame, sector_off, count)** reads `count` 512-byte
-  sectors -- starting `sector_off` sectors into the `BlockRange` capability at
-  slot `range` -- into the frame named by slot `frame`. The fourth argument
-  (`count`) is passed in `R8`. The device DMAs the data into the frame, so map
-  that frame (`frame_map`) to read the bytes; the frame capability must carry
-  `RIGHT_WRITE` (`frame_alloc` grants it). Sectors are named **relative** to the
-  range -- the kernel adds the range's start -- so a holder can never address
-  blocks outside its grant. The result is a *status* word in `RAX`, not a data
-  value (the data is in the frame): `BLK_OK = 0` on success, or
-  `BLK_E_BADARG = 1` (zero count or a count larger than one frame),
-  `BLK_E_RANGE = 2` (the request falls outside the range -- the multiplexing
-  guarantee), `BLK_E_RIGHTS = 3` (bad slot, wrong kind, or missing right), or
-  `BLK_E_DEV = 4` (device error). A `block_write` counterpart is not yet part of
-  the ABI -- the first filesystem is read-only.
 - **spawn_from_buffer(buf_va, len, transfer)** is `spawn` for a binary the
   caller already holds: `len` bytes at `buf_va` in the caller's address space
   are the child's ELF image, instead of an embedded `child_id`. This is how a
@@ -161,17 +162,19 @@ convention mirrors the syscall one:
   `RDX` where it is not a documented result) as clobbered.
 - `NO_CAP = u64::MAX` is the `RDX` "no capability was transferred" sentinel.
 
-| Op (RAX) | Name  | Args (RDI, RSI, RDX)   | Returns (RAX status, RSI, RDX)            |
-|----------|-------|------------------------|-------------------------------------------|
-| 0        | send  | ep_slot, msg, cap_slot | status                                    |
-| 1        | recv  | ep_slot                | status; msg in RSI; cap slot/`NO_CAP` RDX |
-| 2        | call  | ep_slot, req           | status; reply word in RSI                 |
-| 3        | reply | reply_slot, msg        | status                                    |
-| 4        | event_recv | source_slot       | status; packed event in RSI               |
+| Op (RAX) | Name  | Args (RDI, RSI, RDX, RCX) | Returns (RAX status, RSI, RDX)         |
+|----------|-------|---------------------------|----------------------------------------|
+| 0        | send  | ep_slot, msg, cap_slot    | status                                 |
+| 1        | recv  | ep_slot                   | status; msg in RSI; cap slot/`NO_CAP` RDX |
+| 2        | call  | ep_slot, req              | status; reply word in RSI              |
+| 3        | reply | reply_slot, msg           | status                                 |
+| 4        | event_recv | source_slot          | status; packed event in RSI            |
+| 5        | block_read | range, frame, sec, count | status (`BLK_OK` / `BLK_E_*`)     |
 
-`event_recv` is not IPC -- it is the console-input read -- but it shares this
-gate because a blocking read needs the same resumable trap frame. It is
-documented under "Console input" below.
+`event_recv` (console input) and `block_read` (block storage) are not IPC, but
+they share this gate because a blocking read needs the same resumable trap frame
+the IPC ops do. `block_read` is the one gate op with a fourth argument, `count`
+in `RCX`. They are documented under "Console input" and "Block storage" below.
 
 Notes:
 
@@ -231,6 +234,29 @@ as IPC (a blocking read needs the resumable trap frame) under op selector 4.
 - One reader per source today: the process the kernel grants the source
   capability to. Fanning input out to many consumers is itself a library OS
   over this primitive.
+
+## Block storage
+
+A `BlockRange` capability (`RIGHT_READ`) names a run of `(dev, start, count)`
+512-byte sectors on a block device; `block_read` reads from it into a frame the
+device DMAs into. The call enters through the same `int 0x80` gate as IPC under
+op selector 5 (a blocking read needs the resumable trap frame), with the one
+fourth argument the gate ever takes, `count`, in `RCX`.
+
+- **block_read(range, frame, sector_off, count)** reads `count` 512-byte sectors
+  -- starting `sector_off` sectors into the `BlockRange` capability at slot
+  `range` -- into the frame named by slot `frame`. It **blocks** until the device
+  completes the I/O (other processes run meanwhile; the disk completion interrupt
+  wakes the caller). The device DMAs the data into the frame, so map that frame
+  (`frame_map`) to read the bytes; the frame capability must carry `RIGHT_WRITE`
+  (`frame_alloc` grants it). Sectors are named **relative** to the range -- the
+  kernel adds the range's start -- so a holder can never address blocks outside
+  its grant. The result is a *status* word in `RAX`, not a data value (the data
+  is in the frame): `BLK_OK = 0` on success, or `BLK_E_BADARG = 1` (zero count or
+  a count larger than one frame), `BLK_E_RANGE = 2` (the request falls outside
+  the range -- the multiplexing guarantee), `BLK_E_RIGHTS = 3` (bad slot, wrong
+  kind, or missing right), or `BLK_E_DEV = 4` (device error). A `block_write`
+  counterpart is not yet part of the ABI -- the first filesystem is read-only.
 
 ## Capabilities
 

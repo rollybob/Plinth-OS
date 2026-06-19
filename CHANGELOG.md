@@ -3,14 +3,34 @@
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
 follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
-current contract is **v2.2**. v2 added IPC and revised `spawn`, breaking v1 --
+current contract is **v2.3**. v2 added IPC and revised `spawn`, breaking v1 --
 the one incompatible ABI change so far; v2.1 added `spawn_from_buffer` (the
-load-from-disk path) and v2.2 adds console input (`event_recv` + `EventSource`),
-both additive over v2.
+load-from-disk path), v2.2 added console input (`event_recv` + `EventSource`),
+both additive over v2; v2.3 moves `block_read` to the `int 0x80` gate so it can
+block (hidden behind the `libplinth` wrapper).
 
 ## [Unreleased]
 
 ### Added
+- Interrupt-driven blocking block I/O (storage Stage 4). `block_read` no longer
+  busy-polls the device with interrupts off: the issuing process now goes
+  **Blocked** and the CPU runs other processes (or idles) until the disk's
+  completion interrupt wakes it -- the kernel-internal twin of the input wake
+  primitive, reusing `block_current`/`wake_with`. Each virtio-blk device's INTx
+  line (read from PCI config space) is routed through the same `irq` seam the
+  keyboard uses, and its `ISR` register is read to ack the level-triggered line.
+  Boot-time selftests stay polled (no process exists to block yet); the scheduler
+  treats a process blocked on disk as a legitimate idle, not a deadlock. Output
+  is byte-identical and verified under the `PLINTH_ICOUNT` determinism tripwire.
+
+### Changed
+- **`block_read` moved from syscall nr 10 to the `int 0x80` gate (op 5), ABI
+  v2.3.** A blocking call needs the resumable trap frame the gate saves (the same
+  reason the IPC ops and `event_recv` live there); the `syscall` fast path cannot
+  suspend and resume a call. The arguments, relative-sector addressing, and
+  `BLK_OK`/`BLK_E_*` status are unchanged, and the `libplinth::sys_block_read`
+  wrapper hides the move -- only the entry mechanism and the now-asynchronous
+  wait differ. Syscall nr 10 is retired.
 - Console input, first stages (`event_recv` + an `EventSource` capability). The
   kernel takes the i8042 keyboard's IRQ behind a new interrupt-controller seam
   (`irq`, the one module an APIC port later swaps), queues raw scancodes in a

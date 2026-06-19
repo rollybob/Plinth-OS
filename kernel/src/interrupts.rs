@@ -57,6 +57,23 @@ pub fn init() {
     }
 }
 
+/// Install a handler at a runtime-determined IRQ `vector`, after the IDT is
+/// already built and loaded. Used for device line IRQs whose vector is only
+/// known after PCI discovery (the virtio-blk completion lines, Stage 4). The
+/// IDTR still points at the same static table, so writing the entry takes effect
+/// on the next interrupt -- no reload needed.
+pub fn set_irq_handler(vector: u8, handler: extern "x86-interrupt" fn(InterruptStackFrame)) {
+    // SAFETY: single CPU; the IDT lives in IDT_STORAGE (built in `init`) and the
+    // CPU only reads an entry while dispatching an interrupt, never concurrently
+    // with this write (IF=0 here).
+    unsafe {
+        let idt = (*addr_of_mut!(IDT_STORAGE))
+            .as_mut()
+            .expect("IDT not initialised before set_irq_handler");
+        idt[vector as usize].set_handler_fn(handler);
+    }
+}
+
 /// Shared fault path. Diverges (via kernel_resume) for ring-3 faults;
 /// panics for kernel faults.
 fn handle_fault(name: &str, frame: &InterruptStackFrame, err: Option<u64>, addr: Option<u64>) {

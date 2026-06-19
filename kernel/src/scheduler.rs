@@ -177,6 +177,7 @@ pub struct TrapFrame {
 /// let the IPC layer read syscall-style args from a trap frame and write the
 /// result back (ipc.rs).
 pub const GP_RAX: usize = 0;
+pub const GP_RCX: usize = 2;
 pub const GP_RDX: usize = 3;
 pub const GP_RSI: usize = 4;
 pub const GP_RDI: usize = 5;
@@ -592,17 +593,21 @@ unsafe fn switch_to_next(on_idle: LauncherOnIdle) -> ! {
     match pick_next(&states(), cur) {
         Some(next) => resume_process(next),
         None => {
-            // Nothing runnable. A process blocked on EXTERNAL input is not a
-            // deadlock -- a keystroke can still arrive -- so idle and wait for it
-            // rather than treat it as a stuck system. (An IPC block with no
-            // possible peer is the genuine deadlock the block-time liveness check
-            // already guards; the panic below is reached only when nobody is
-            // waiting on input either.)
-            if crate::input::any_waiter() {
-                // Deterministic delivery for headless smoke: if a synthetic event
-                // is armed, deliver it now (it wakes the blocked reader). Real
-                // keystrokes arrive via the keyboard IRQ during the idle below.
-                crate::input::deliver_synthetic();
+            // Nothing runnable. A process blocked on EXTERNAL input or on disk
+            // I/O is not a deadlock -- a keystroke or a virtio completion IRQ can
+            // still arrive -- so idle and wait for it rather than treat it as a
+            // stuck system. (An IPC block with no possible peer is the genuine
+            // deadlock the block-time liveness check already guards; the panic
+            // below is reached only when nothing external can ever wake anyone.)
+            let input_waiter = crate::input::any_waiter();
+            if input_waiter || crate::virtio_blk::any_waiter() {
+                // Deterministic delivery for headless smoke: if a synthetic
+                // keyboard event is armed, deliver it now (it wakes the blocked
+                // reader). Real keystrokes -- and every disk completion -- arrive
+                // via their device IRQ during the idle below.
+                if input_waiter {
+                    crate::input::deliver_synthetic();
+                }
                 idle_until_runnable()
             } else {
                 match on_idle {
@@ -637,11 +642,12 @@ unsafe fn resume_process(next: usize) -> ! {
     sched_resume(rsp)
 }
 
-/// Idle with interrupts enabled until a device IRQ makes a reader Ready, then
-/// resume it. Entered only when a process is blocked on input and nothing else
-/// runs: the keyboard IRQ delivers a real event (waking the reader); the
-/// Stage-2 synthetic injection is delivered by the caller before we get here.
-/// Never returns.
+/// Idle with interrupts enabled until a device IRQ makes a blocked process
+/// Ready, then resume it. Entered only when a process is blocked on input or
+/// disk I/O and nothing else runs: the keyboard IRQ delivers a real event
+/// (waking a reader), or the virtio completion IRQ wakes a process blocked on
+/// `block_read`; the Stage-2 synthetic keyboard injection is delivered by the
+/// caller before we get here. Never returns.
 ///
 /// # Safety
 /// The caller holds no locks; a process is blocked on input, so a wake is

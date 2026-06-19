@@ -72,6 +72,10 @@ pub struct VirtioBlkInfo {
     pub notify_mult: u32,
     pub isr: VirtioCfg,
     pub device: VirtioCfg,
+    /// The INTx# line IRQ the firmware routed this device to (config space
+    /// byte 0x3C). The virtio-blk driver installs its completion handler at
+    /// VECTOR_BASE+line and unmasks it through the `irq` seam (Stage 4).
+    pub intr_line: u8,
 }
 
 /// Read a BAR's base address, decoding I/O vs 32/64-bit memory BARs. `index`
@@ -271,6 +275,7 @@ pub fn discover_all() -> ([Option<VirtioBlkInfo>; MAX_DEVICES], usize) {
             notify_mult: 0,
             isr: VirtioCfg::default(),
             device: VirtioCfg::default(),
+            intr_line: read8(loc.bus, loc.slot, loc.func, 0x3C),
         };
         fill_caps(&mut info);
         infos[i] = Some(info);
@@ -305,6 +310,7 @@ fn report<W: Write>(out: &mut W, info: &VirtioBlkInfo) {
         );
     }
     let _ = writeln!(out, "plinth:   notify multiplier 0x{:x}", info.notify_mult);
+    let _ = writeln!(out, "plinth:   interrupt line {}", info.intr_line);
 }
 
 /// Storage discovery entry point: find every virtio-blk device and report what
