@@ -1,32 +1,52 @@
 # Plinth
 
 A toy exokernel in Rust -- the exokernel idea reduced to the smallest
-codebase that can demonstrate it. The whole kernel reads in one sitting.
+codebase that can demonstrate it. The whole kernel still reads in a sitting.
 
 A plinth is the bare slab a column stands on: it carries the load and
 imposes nothing about what is built above it. That is the contract here.
-The kernel owns physical memory and multiplexes it securely through
-capabilities, but refuses to define what memory management *is*. Two
-applications on the same kernel answer that question differently, in
-unprivileged code, and the boot log shows the difference.
+The kernel owns physical memory, CPU time, and a handful of devices and
+multiplexes them securely through capabilities, but refuses to define what
+memory management, scheduling, a filesystem, or a keymap *is*. Applications
+on the same kernel answer those questions differently, in unprivileged code,
+and the boot log shows the difference.
+
+It began as one boot proving a single contrast -- the same workload over two
+allocators -- and has grown a preemptive scheduler, IPC, a disk, and a
+keyboard, without giving up the property that makes it worth reading: a
+kernel that is mechanism, with policy in unprivileged library OSes, whose
+every boot is checked line-by-line in CI.
 
 ## The demo
 
-This is one boot, verified line-by-line in CI:
+This is one boot, verified line-by-line in CI against
+[expected_boot_log.txt](expected_boot_log.txt). It runs in two acts: the
+core exokernel moves, then the system machinery -- a scheduler, IPC, storage,
+and input -- that turns the kernel into something you could build on. The
+machinery was added without giving up the determinism that makes the boot
+checkable.
 
 ```text
 plinth: kernel entry
-plinth: frame allocator ready (61583 frames free)
+plinth: frame allocator ready
 plinth: GDT + TSS loaded
 plinth: IDT loaded
 plinth: syscall interface ready
-plinth: running hello (635 bytes)
+plinth: timer armed
+plinth: keyboard ready (i8042, IRQ1)
+plinth: keyboard selftest ok
+plinth: scanning PCI bus
+plinth: virtio-blk found at 00:03.0
+plinth: virtio-blk found at 00:04.0
+plinth: virtio-blk[0] ready (queue 0, size 64, capacity 2048 sectors)
+plinth: virtio-blk[0] sector 0 read ok (ramp verified)
+plinth: virtio-blk[1] sector 0 read ok (distinct disk)
+plinth: running hello
 hello: ring 3
 hello: frame mapped and writable
 hello: done
 plinth: hello exited (code 0)
-plinth: 61583 frames free
-plinth: running bump-demo (4061 bytes)
+plinth: running bump-demo
 demo: policy = bump
 demo: a = 0x10000000
 demo: b = 0x10000600
@@ -35,14 +55,12 @@ demo: c = 0x10000c00
 demo: c got a new address
 demo: kernel frames used: 2
 plinth: bump-demo exited (code 0)
-plinth: 61583 frames free
-plinth: running crash-demo (147 bytes)
+plinth: running crash-demo
 crash: about to dereference null
-plinth: [user fault] #PF page fault rip=0x40001a err=0x6 addr=0x0
+plinth: [user fault] #PF
 plinth: terminating user process
 plinth: crash-demo faulted
-plinth: 61583 frames free
-plinth: running list-demo (5822 bytes)
+plinth: running list-demo
 demo: policy = freelist
 demo: a = 0x10000000
 demo: b = 0x10000600
@@ -51,8 +69,7 @@ demo: c = 0x10000000
 demo: c reused a freed block
 demo: kernel frames used: 1
 plinth: list-demo exited (code 0)
-plinth: 61583 frames free
-plinth: running greedy-demo (1593 bytes)
+plinth: running greedy-demo
 greedy: spending CPU budget
 greedy: charged 256, remaining = 768
 greedy: charged 256, remaining = 512
@@ -60,8 +77,7 @@ greedy: charged 256, remaining = 256
 greedy: charged 256, remaining = 0
 plinth: [out of budget] terminating user process
 plinth: greedy-demo out of budget
-plinth: 61583 frames free
-plinth: running lazy-demo (5469 bytes)
+plinth: running lazy-demo
 lazy: registering fault handler
 lazy: serviced fault at 0x18000000
 lazy: serviced fault at 0x18001000
@@ -69,210 +85,304 @@ lazy: serviced fault at 0x18002000
 lazy: serviced fault at 0x18003000
 lazy: all pages materialized on demand
 plinth: lazy-demo exited (code 0)
-plinth: 61583 frames free
-plinth: running spawner-demo (1646 bytes)
-spawner: allocated a frame, granting it to a child
-grantee: used granted frame at 0x10004000
-spawner: child returned 42
-plinth: spawner-demo exited (code 0)
-plinth: 61583 frames free
+plinth: scheduler demo: 3 processes
+plinth: scheduler demo: all done
+plinth: ipc demo: 2 processes
+plinth: ipc demo: all done
+plinth: share demo: 2 processes
+plinth: share demo: all done
+plinth: rpc demo: 2 processes
+plinth: rpc demo: all done
+plinth: spawn demo: 1 processes
+plinth: spawn demo: all done
+plinth: blk demo: 1 processes
+blk: read ok b0=1 b1=2 b5=6
+blk: out-of-range rejected
+plinth: blk demo: all done
+plinth: fs demo: 1 processes
+fsdemo: loading 'diskhello' from the boot archive
+diskhello: running from disk
+fsdemo: diskhello returned 777
+plinth: fs demo: all done
+plinth: evt demo: 1 processes
+evt: non-source rejected
+evt: got scancode 0x1e
+plinth: evt demo: all done
+plinth: kbd demo: 1 processes
+kbd: type a line
+kbd: read 'Hi'
+plinth: kbd demo: all done
 plinth: boot ok
 ```
 
-Six things are happening:
+The single-process demos print verbatim, in order. The Phase 2 demos that run
+several processes under the scheduler print only their bracketing lines here,
+because the interleaving between processes is deliberately nondeterministic;
+CI checks each process's *own* lines stay in program order
+(`check_per_process_order`), and that the free-frame count returns to its
+baseline around every demo (`check_frames_baseline`) -- the no-leak invariant,
+asserted across the whole boot rather than printed.
+
+### Act one -- the core exokernel moves
 
 **Same app, different OS.** bump-demo and list-demo are the *identical*
-workload (`demo-app/`) -- allocate three 1536-byte blocks, free the
-first, allocate again -- linked against two different library OSes
-(`libos/`). The bump policy never reuses memory: the third allocation
-lands at a new address and costs a second kernel frame. The free-list
-policy recycles: the third allocation comes back at the freed block's
-address on a single kernel frame. Same kernel, same syscalls, different
-memory management -- because memory management is application code here,
-not kernel code.
+workload (`demo-app/`) -- allocate three 1536-byte blocks, free the first,
+allocate again -- linked against two different library OSes (`libos/`). The
+bump policy never reuses memory: the third allocation lands at a new address
+and costs a second kernel frame. The free-list policy recycles: the third
+allocation comes back at the freed block's address on a single kernel frame.
+Same kernel, same syscalls, different memory management -- because memory
+management is application code here, not kernel code.
 
-**A crash is an event, not a catastrophe.** crash-demo dereferences
-null between the two demos. The kernel logs the ring-3 page fault,
-terminates the process, and runs the next one.
+**A crash is an event, not a catastrophe.** crash-demo dereferences null. The
+kernel logs the ring-3 page fault, terminates the process, reclaims it
+without a leak, and the boot continues.
 
-**Nothing leaks.** The free-frame count after every teardown is
-identical -- including after the crash, and including bump-demo, whose
-allocator never frees anything. (The absolute number tracks the kernel's
-own footprint and shifts as the kernel grows; only its flatness across the
-boot is the point.) Policies can be lazy; the kernel's capability
-accounting is not.
+**CPU time is a capability too.** greedy-demo is minted a fixed CPU budget at
+spawn and spends it with `cpu_charge`, watching the balance fall to zero.
+When it charges past zero it has tried to consume a resource it no longer
+holds, so the kernel terminates it exactly as it did the crash. The kernel
+enforces the bound; *how* to spend the budget is the library OS's call.
 
-**CPU time is a capability too.** greedy-demo is minted a fixed CPU
-budget at spawn and spends it with `cpu_charge`, watching the balance
-fall to zero. When it charges past zero it has tried to consume a
-resource it no longer holds, so the kernel terminates it exactly as it
-did the crash -- same teardown, no leak. The kernel enforces the bound;
-*how* to spend the budget is the library OS's call.
+**Userspace handles its own page faults.** lazy-demo registers a ring-3 fault
+handler and then touches unmapped pages. Each first touch faults -- the *same*
+`#PF` that kills crash-demo -- but here the kernel hands the fault back to the
+process, which maps a frame with the ordinary `frame_alloc`/`frame_map`
+syscalls and returns; the faulting instruction is retried and succeeds.
+Demand paging where the *application*, not the kernel, decides what backs an
+address: the opposite outcome to crash-demo from the identical hardware event,
+chosen entirely in unprivileged code.
 
-**Userspace handles its own page faults.** lazy-demo registers a ring-3
-fault handler and then touches unmapped pages. Each first touch faults --
-the *same* `#PF` that kills crash-demo -- but here the kernel hands the
-fault back to the process, which maps a frame with the ordinary
-`frame_alloc`/`frame_map` syscalls and returns; the faulting instruction
-is retried and succeeds. Demand paging where the *application*, not the
-kernel, decides what backs an address. The opposite outcome to crash-demo
-from the identical hardware event, chosen entirely in unprivileged code.
+### Act two -- the system machinery
 
-**Capabilities cross isolated address spaces.** spawner-demo allocates a
-frame and spawns a child in a *separate* address space, transferring it the
-frame capability. The child runs in its own page tables, maps the frame at
-an address of its choosing, uses it, and returns a result the parent
-collects. The child never allocated that frame and was never handed its
-contents -- it can touch the frame only because the capability was moved
-into its table. Delegation of authority between mutually isolated
-protection domains, which is what makes a capability more than a handle.
+**The CPU is multiplexed, preemptively.** scheduler-demo launches three
+independent CPU-bound processes; a 100 Hz timer preempts them and the kernel
+round-robins between them, so their lines interleave in the log. The kernel
+saves the full interrupted context, switches address space and per-process
+kernel stack, and resumes the next process. The single-process determinism of
+act one is gone here on purpose -- and the testing strategy changed with it,
+from an exact trace to per-process ordering plus no-leak invariants.
+
+**Capabilities are transferable authority, across isolation boundaries.** The
+IPC demos rendezvous over synchronous endpoints: ping/pong exchange messages
+(ipc-demo); a producer fills a frame and hands its *capability* to a consumer,
+which maps the same physical frame and reads the data back, with no copy
+(share-demo); a client and server do request/response RPC over a one-shot
+reply capability, the server needing no send right of its own (rpc-demo). A
+capability is not a local handle -- it is authority that moves between mutually
+isolated address spaces, which is what makes it more than an access-control
+entry. `spawn` is reconciled with all this (spawn-demo): it launches a child
+as an independent scheduled process and returns a handle the parent `recv`s --
+the join -- rather than nesting synchronously.
+
+**The disk is multiplexed like memory.** blk-demo is granted a `BlockRange`
+capability naming a run of disk sectors; it reads a sector through it and is
+*denied* a read one sector past the range -- the same secure-binding guarantee
+frames get, now over storage. The read is interrupt-driven and blocking: the
+process suspends, the CPU runs other work while the DMA is in flight, and the
+disk's completion interrupt wakes it. fs-demo goes further: an unprivileged
+filesystem library OS (`libfs`) parses a read-only boot archive, finds
+`diskhello` by name, reads its ELF off the disk, and launches it with
+`spawn_from_buffer`. diskhello exists *only* on the disk -- it is not embedded
+in the kernel -- so its "running from disk" line proves the load path end to
+end.
+
+**Input is raw events; the keymap is policy.** evt-demo is granted an
+`EventSource` capability on the keyboard, is denied reading through a
+non-source capability, and blocks on `event_recv` until a keystroke wakes it
+(the kernel idles on input rather than treating the block as a deadlock). The
+kernel ships raw Set-1 scancodes and nothing more. kbd-demo turns those
+scancodes into a line with `libinput`, an unprivileged library OS holding the
+keymap, shift handling, and line editor -- so the echoed `Hi` is policy the
+kernel never sees.
 
 ## Why exokernels
 
-A conventional kernel bundles mechanism (multiplexing hardware safely)
-with policy (what a process, file, or heap is). The exokernel argument
--- Engler, Kaashoek, and O'Toole, SOSP '95 -- is that the bundle is the
-problem: the kernel should securely expose raw resources, and every
-abstraction should live in unprivileged *library OSes* that applications
-choose, replace, or rewrite.
+A conventional kernel bundles mechanism (multiplexing hardware safely) with
+policy (what a process, file, or heap is). The exokernel argument -- Engler,
+Kaashoek, and O'Toole, SOSP '95 -- is that the bundle is the problem: the
+kernel should securely expose raw resources, and every abstraction should
+live in unprivileged *library OSes* that applications choose, replace, or
+rewrite.
 
-Plinth implements the minimum machinery that makes the argument
-concrete:
+Plinth implements the minimum machinery that makes the argument concrete:
 
-- **Secure bindings**: physical frames are granted as capabilities --
-  kernel-held records of (resource, rights), referred to by slot index.
-  Userspace names a frame only through a capability it actually holds.
-- **Application-level resource management**: `frame_map` takes a
-  *user-chosen* virtual address. The kernel validates the capability,
-  the alignment, and the window -- placement policy belongs to the
-  process.
-- **Visible cost model**: each library OS reports how many frames it
-  pulled from the kernel. Policy differences show up as numbers.
-- **More than one resource type**: CPU time is also a capability -- a
-  budget the holder spends down rather than a thing it owns. It shows
-  that "secure bindings" is a general mechanism, not a frame-only trick,
-  and that some resources (you cannot enforce a CPU bound from
-  userspace) genuinely earn a place in the kernel's small interface.
+- **Secure bindings**: physical frames, disk sectors, and input devices are
+  all granted as capabilities -- kernel-held records of (resource, rights),
+  referred to by slot index. Userspace names a resource only through a
+  capability it actually holds, and the kernel checks the right at every use.
+- **Application-level resource management**: `frame_map` takes a *user-chosen*
+  virtual address. The kernel validates the capability, the alignment, and the
+  window -- placement policy belongs to the process.
+- **Visible cost model**: each library OS reports how many frames it pulled
+  from the kernel. Policy differences show up as numbers.
+- **One mechanism, many resource types**: CPU time is a capability (a budget
+  the holder spends down), an endpoint is a capability (an IPC channel), a
+  `BlockRange` is a capability (a bounded run of disk sectors), an
+  `EventSource` is a capability (one input device). "Secure bindings" is a
+  general mechanism, not a frame-only trick -- and some resources (you cannot
+  enforce a CPU bound, or deliver a device interrupt, from userspace)
+  genuinely earn a place in the kernel's small interface.
 - **Application-level fault handling**: a process can register a ring-3
-  page-fault handler. A fault in its lazy region is delivered to that
-  handler, which resolves it with ordinary syscalls and resumes the
-  faulting instruction -- self-paging, the exokernel's signature move.
-  The kernel's mechanism is delivery and resume; the policy (what backs
-  the address) is the application's.
-- **Capabilities are transferable authority**: each process runs in its
-  own address space, and `spawn` launches a child with a capability moved
-  out of the parent's table into the child's. A capability is not just a
-  local handle -- it is authority that can be delegated across an isolation
-  boundary, which is the property that makes capability systems more than
-  access-control lists.
+  page-fault handler. A fault in its lazy region is delivered to that handler,
+  which resolves it with ordinary syscalls and resumes the faulting
+  instruction -- self-paging, the exokernel's signature move. The kernel's
+  mechanism is delivery and resume; the policy is the application's.
+- **Policy lives in library OSes, not the kernel**: allocation (`libos`), the
+  on-disk filesystem format (`libfs`), and the keyboard keymap and line editor
+  (`libinput`) are all unprivileged code linked into the programs that want
+  them. The kernel ships frames, sectors, and raw scancodes; what those *mean*
+  is decided above the kernel.
 
 ## Architecture
 
 ```text
-              ring 3 -- each in its own address space
-  +--------------+   +--------------+   +--------------+
-  |  bump-user   |   |  crash-user  |   |  list-user   |
-  |  demo-app    |   |              |   |  demo-app    |
-  |  BumpAlloc   |   |  (no libOS)  |   | FreeListAlloc|
-  +------+-------+   +------+-------+   +------+-------+
-         |       libplinth: syscall shim       |
-  =======+=================+===================+=======  syscall/sysret
-         | write exit frame_alloc frame_map frame_free
-         | cpu_charge fault_reg fault_return spawn
-  +----------------------------------------------------+
-  |                   plinth kernel                     |
-  |  capabilities | frames | fault upcall | per-proc AS |
-  +----------------------------------------------------+
-                            ring 0
+       several processes, scheduled, each in its own address space
+  +-----------+ +-----------+ +-----------+ +-----------+ +-----------+
+  | bump-user | | list-user | | producer  | | fsdemo    | | kbd-user  |
+  | demo-app  | | demo-app  | | consumer  | | libfs     | | libinput  |
+  | BumpAlloc | | FreeList  | | (IPC)     | | (disk FS) | | (keymap)  |
+  +-----+-----+ +-----+-----+ +-----+-----+ +-----+-----+ +-----+-----+
+        |    libplinth: syscall shim + int 0x80 gate shim    |
+  ======+======+============+=============+============+======+======
+  syscall/sysret  |              int 0x80 gate              |
+   write exit      | send recv call reply event_recv block_read
+   frame_alloc/map/free cpu_charge fault_reg/return spawn spawn_from_buffer
+  +----------------------------------------------------------------+
+  |                        plinth kernel                           |
+  |  capabilities | frames | CPU budgets | endpoints | block ranges|
+  |  event sources | scheduler + timer | per-process address spaces|
+  |  fault upcall  | virtio-blk | i8042 keyboard | irq seam        |
+  +----------------------------------------------------------------+
+                              ring 0
 ```
+
+Two entry mechanisms: the non-blocking calls use `syscall`/`sysretq`; the
+blocking ones (IPC, `event_recv`, `block_read`) enter through an `int 0x80`
+gate, because suspending and resuming a call needs the full resumable trap
+frame the fast path does not save.
 
 ```text
 kernel/      the exokernel (no_std, x86_64-unknown-none)
   frame_alloc.rs   bitmap physical frame allocator
-  capability.rs    fixed-size capability tables (frames + CPU budgets)
-  syscall.rs       the nine syscalls, syscall/sysret entry, spawn nesting
-  process.rs       synchronous process lifecycle + teardown
-  usermode.rs      ring transition: iretq in, longjmp out
-  interrupts.rs    ring-3-surviving exception handlers
+  capability.rs    fixed-size capability tables (frames, CPU budgets,
+                   endpoints, reply caps, block ranges, event sources)
+  syscall.rs       the non-blocking calls, syscall/sysret entry
+  ipc.rs           the int 0x80 gate: endpoints, send/recv/call/reply,
+                   plus event_recv and block_read (blocking ops share it)
+  scheduler.rs     preemptive round-robin, per-process kernel stacks
+  timer.rs         100 Hz PIT, the preemption source
+  irq.rs           interrupt-controller seam (8259 PIC today; the one
+                   module an APIC port swaps)
+  interrupts.rs    IDT, ring-3-surviving exception handlers
+  process.rs       process lifecycle + teardown
+  usermode.rs      ring transition: iretq in, context switch out
   fault.rs         self-paging: #PF upcall to a ring-3 handler + resume
-  gdt.rs           GDT/TSS, sysret-compatible selector layout
   memory.rs        per-process address spaces: clone, map, switch, destroy
   elf.rs           ELF loader: validate a static ET_EXEC, map PT_LOAD W^X
-  tests/           in-kernel test suite (32 tests, run in QEMU)
-libplinth/   user-side syscall shim -- deliberately NOT a library OS
-libos/       two library OSes: BumpAlloc and FreeListAlloc
-demo-app/    the shared workload, generic over the memory policy
-hello-user/  syscall-surface integration test (runs first at boot)
-crash-user/  deliberate null dereference
-greedy-user/ deliberate CPU-budget overdraw
-lazy-user/   self-paging: a ring-3 fault handler maps pages on demand
-spawner-user/ allocates a frame and spawns a child, granting the cap
-grantee-user/ spawned child: uses a frame it only holds by transfer
-template-user/ minimal skeleton to copy for a new program (see GUIDE.md)
-xtask/       build orchestration: user binaries, disk image, QEMU,
+  pci.rs           legacy PCI config-space (0xCF8/0xCFC) enumeration
+  virtio_blk.rs    virtio-blk (virtio-pci) driver: one virtqueue, DMA,
+                   interrupt-driven completion
+  keyboard.rs      i8042 keyboard: IRQ1 -> raw scancodes
+  input.rs         event sources + bounded per-source event ring
+  gdt.rs           GDT/TSS, sysret-compatible selector layout
+  serial.rs        serial console
+  tests/           in-kernel test suite (65 tests, run in QEMU)
+
+libplinth/   user-side syscall + gate shim -- deliberately NOT a library OS
+libos/       two allocator library OSes: BumpAlloc and FreeListAlloc
+libfs/       a read-only boot-archive parser -- the filesystem as a libOS
+libinput/    a Set-1 keymap (with shift) and line reader -- input as a libOS
+demo-app/    the shared allocator workload, generic over the memory policy
+
+user programs (ring 3, each its own crate):
+  hello-user/    syscall-surface integration test (runs first at boot)
+  bump-user/ list-user/   demo-app over the two allocators
+  crash-user/    deliberate null dereference (fault isolation)
+  greedy-user/   deliberate CPU-budget overdraw
+  lazy-user/     self-paging: a ring-3 fault handler maps pages on demand
+  spin-user/     CPU-bound process for the preemptive-scheduler demo
+  pingpong-user/ share-user/ rpc-user/   the IPC demos (rendezvous, frame
+                 transfer, call/reply RPC)
+  spawner-user/ grantee-user/   spawn a child and transfer it a capability
+  blk-user/      read disk sectors through a bounded BlockRange
+  fsdemo-user/   load a program off disk with libfs + spawn_from_buffer
+  diskhello-user/   lives only in the boot archive, never embedded
+  evt-user/      read a raw keyboard event through an EventSource
+  kbd-user/      read a line through libinput
+  faultchild-user/  a child that faults, for liveness testing
+  template-user/    minimal skeleton to copy for a new program (see GUIDE.md)
+xtask/       build orchestration: user binaries, disk images, QEMU,
              smoke + test harnesses, asm clobber lint
 ```
 
 ## Design decisions
 
-- **No kernel heap.** Capability tables and process state are fixed-size
-  arrays. A toy kernel that needs malloc to express ownership has
-  already smuggled in a policy.
-- **Synchronous processes.** One process runs at a time, to completion.
-  `enter_user` saves kernel context and iretq's to ring 3; the exit
-  syscall or a fault longjmps back. No scheduler, no timer, no APIC --
-  and fully deterministic serial output, which is what makes the
-  line-by-line smoke test possible. `spawn` nests this model (a parent
-  blocks while its child runs) without breaking determinism.
+- **No kernel heap.** Capability tables, process state, endpoints, and event
+  rings are fixed-size arrays. A toy kernel that needs malloc to express
+  ownership has already smuggled in a policy.
+- **Preemptive multitasking, but a non-preemptible kernel.** A 100 Hz PIT
+  preempts ring-3 code; the kernel saves the full interrupted context,
+  switches address space and per-process kernel stack, and round-robins
+  independent processes. But the kernel reschedules only on the way *out* to
+  ring 3 -- it never preempts itself -- so kernel data structures are never
+  reentered and need no locks on a single CPU. This is the line the whole
+  design rests on, and it is exactly what a second CPU would end (see the
+  roadmap). Preemption cost the exact-trace smoke test; per-process ordering
+  and no-leak invariants replaced it.
 - **Per-process address spaces.** Each process gets its own page tables: a
-  private L4 whose user half (PML4[0]) is its own and whose kernel half is
-  copied from the bootloader's L4, so the kernel runs correctly under any
-  process's CR3. Creating a process clones the kernel half; destroying it
-  frees the user half's page-table frames and the L4, so an address space
-  leaks nothing -- the free-frame count is flat across the whole boot,
-  including the spawn, which builds and tears down two. Isolation is what
-  lets `spawn` transfer a capability into a genuinely separate domain.
-- **Programs are real ELF images, loaded with W^X.** The kernel parses a
-  static `ET_EXEC` ELF and maps each `PT_LOAD` segment at its own address
-  with exactly the access it asks for: code executable and read-only, data
-  writable and non-executable, never both on one page. Parsing is strict
-  and allocation-free -- every field is bounds-checked against the file and
-  rejected if it is malformed or would place a segment outside the image
-  window, so a bad binary fails to load rather than corrupting anything.
-  This is the same code path an on-disk program would take; today the
-  images are still embedded at build time. (Earlier versions mapped a flat
-  blob writable-and-executable; real per-segment protection replaced that.)
-- **Uniprocessor, on purpose.** SMP would triple the kernel and teach
-  nothing about exokernels.
-- **Nine syscalls, and each one past the core five had to earn it.** The
-  bar for adding to the interface is high: if a feature can live in
-  userspace, it does. Frame management is five calls of pure mechanism.
-  The other four are cases where the *mechanism itself* cannot live in
-  userspace: `cpu_charge` (a process cannot enforce a CPU bound against
-  itself), `fault_reg`/`fault_return` (a process cannot deliver a hardware
-  fault to itself, or return from ring 0 to a faulting instruction), and
-  `spawn` (a process cannot create an isolated address space or move a
-  capability into another protection domain). Everything those calls *do*
-  with the mechanism -- spend policy, paging policy, what to run and what
-  to delegate -- is still application code.
-- **Spawn is synchronous nesting, with the kernel-stack discipline made
-  real.** A child runs one level down, in its own address space, on its
-  own kernel syscall stack -- because the parent's syscall is suspended
-  mid-flight while the child runs, and a shared kernel stack would let the
-  child's syscalls clobber the parent's frame. That "every suspendable
-  context needs its own kernel stack" is the foundational truth a single-
-  process kernel gets to ignore; `spawn` stops ignoring it. Nesting is
-  depth-bounded by a fixed array (no heap), and there is no scheduler --
-  just depth-first call and return.
-- **Self-paging is signal delivery, kept honest.** A #PF in a registered
+  private L4 whose user half is its own and whose kernel half is copied from
+  the bootloader's L4, so the kernel runs correctly under any process's CR3.
+  Creating a process clones the kernel half; destroying it frees the user
+  half's page-table frames and the L4, so an address space leaks nothing --
+  the free-frame count is flat across the whole boot. Isolation is what lets a
+  capability be *transferred* into a genuinely separate domain over IPC or
+  `spawn`.
+- **Programs are real ELF images, loaded with W^X -- from memory or disk.**
+  The kernel parses a static `ET_EXEC` ELF and maps each `PT_LOAD` segment at
+  its own address with exactly the access it asks for: code executable and
+  read-only, data writable and non-executable, never both on one page.
+  Parsing is strict and allocation-free -- every field is bounds-checked
+  against the file and rejected if malformed or out of the image window, so a
+  bad binary fails to load rather than corrupting anything. The same validator
+  runs whether the image is embedded at build time or read off the disk by a
+  filesystem library OS and handed to `spawn_from_buffer` as untrusted bytes.
+- **Two entry mechanisms, and each call past the core had to earn it.** The
+  bar for the interface is high: if a feature can live in userspace, it does.
+  Frame management is pure mechanism on the `syscall` fast path. Everything
+  added since is either a case the mechanism itself cannot live in userspace --
+  `cpu_charge` (a process cannot enforce a CPU bound against itself),
+  `fault_reg`/`fault_return` (a process cannot deliver a hardware fault to
+  itself), `spawn`/`spawn_from_buffer` (a process cannot create an isolated
+  address space) -- or a blocking operation that needs the kernel to suspend
+  and resume it, which is why IPC, `event_recv`, and `block_read` enter
+  through the `int 0x80` gate rather than the fast path. Everything those calls
+  *do* with the mechanism -- spend policy, paging policy, the filesystem
+  format, the keymap -- is still application code.
+- **Status is split from payload on every blocking call.** IPC, `event_recv`,
+  and `block_read` return a *status* word in `RAX` separate from their payload
+  (the message/event in `RSI`, the disk data in the DMA'd frame). A
+  peer-controlled or device-controlled value can never be mistaken for an
+  error -- not even `u64::MAX` -- including the `IPC_PEER_DIED` status that
+  frees a process blocked on a counterpart that died.
+- **One interrupt-controller seam.** The keyboard IRQ and the virtio-blk
+  completion IRQ both route through a single `irq` module that today drives the
+  8259 PIC. It is deliberately the one place an APIC port has to touch -- the
+  rest of the kernel asks for "the IRQ for this line" and "EOI this line"
+  without knowing which controller answers.
+- **Uniprocessor today, by scope not by dogma.** Plinth runs on one CPU, which
+  is what makes the no-lock, non-preemptible-kernel discipline above sound. SMP
+  is the next roadmap item, taken on its own merits -- it is a concurrency
+  redesign, not a feature toggle, precisely because it ends the single-CPU
+  invariant -- not something bolted on to pad the feature list.
+- **Self-paging is signal delivery, kept honest.** A `#PF` in a registered
   lazy region is delivered to a ring-3 handler by saving the full faulting
   register context, `iretq`-ing into the handler on its own stack, and a
   sigreturn-style `fault_return` that restores the context and retries the
-  instruction. One fault is in flight at a time (synchronous, single
-  process), so one saved trap frame suffices; a fault *inside* a handler
-  is unhandleable and terminates the process. The handler entry and stack
-  are user-supplied but only ever entered at CPL 3 -- a bad value faults
-  in ring 3, it never reaches into the kernel.
+  instruction. One fault is in flight per process at a time, so one saved trap
+  frame suffices; a fault *inside* a handler is unhandleable and terminates the
+  process. The handler entry and stack are user-supplied but only ever entered
+  at CPL 3 -- a bad value faults in ring 3, it never reaches into the kernel.
 
 ## Build and run
 
@@ -287,102 +397,117 @@ cargo xtask check   # lint libplinth asm blocks for syscall clobbers
 cargo xtask run-gdb # boot paused, GDB server on :1234
 ```
 
-First build downloads OVMF firmware (cached in `target/ovmf/`) and
-compiles the bootloader; expect a few minutes. Slow machine or CI?
-`PLINTH_QEMU_TIMEOUT=180` extends the QEMU watchdog.
+First build downloads OVMF firmware (cached in `target/ovmf/`) and compiles
+the bootloader; expect a few minutes. Slow machine or CI?
+`PLINTH_QEMU_TIMEOUT=180` extends the QEMU watchdog. `cargo xtask run` then
+boots into the live system -- type into the QEMU window and kbd-demo echoes
+your line through `libinput`.
 
 ## Writing your own programs
 
 Plinth runs your code in ring 3 over a stable syscall interface.
-[ABI.md](ABI.md) is the contract -- syscalls, executable format, and entry
-state, frozen as v1 -- and [GUIDE.md](GUIDE.md) is the walkthrough: copy
-`template-user/` to start a program, and see how memory policy goes in a
-library OS rather than the kernel. Where the project is headed is in
-[ROADMAP.md](ROADMAP.md); how to contribute is in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[ABI.md](ABI.md) is the contract -- syscalls, the IPC and device gate, the
+executable format, and entry state, versioned as **v2.3** -- and
+[GUIDE.md](GUIDE.md) is the walkthrough: copy `template-user/` to start a
+program, and see how memory policy goes in a library OS rather than the
+kernel. Where the project is headed is in [ROADMAP.md](ROADMAP.md); how to
+contribute is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Testing
 
 Three layers, all in CI on every push:
 
-1. `cargo xtask test` -- 32 in-kernel unit tests (frame allocator,
-   capability table, CPU-budget charging, and the ELF loader/validator,
-   whose parser is a pure function over a byte slice) executed inside QEMU,
-   reported
-   over a serial protocol (`[PASS]`/`[FAIL]`/`[SUITE]`) that xtask parses.
-2. `cargo xtask smoke` -- full boot with captured serial output,
-   asserting every line of the demo narrative above, in order.
-3. `cargo xtask check` -- static lint: every syscall `asm!` block in
-   libplinth must declare the full clobber set the kernel ABI implies.
+1. `cargo xtask test` -- 65 in-kernel unit tests (frame allocator, capability
+   table, CPU-budget charging, the ELF loader/validator, the scheduler's
+   `pick_next` policy, the IPC wait queue, and the input event ring) executed
+   inside QEMU, reported over a serial protocol (`[PASS]`/`[FAIL]`/`[SUITE]`)
+   that xtask parses. Pure library-OS logic that does not need the kernel --
+   the `libfs` archive parser and the `libinput` keymap -- is host-unit-tested
+   as well.
+2. `cargo xtask smoke` -- full boot with captured serial output. The
+   single-process demos are asserted line-by-line in order
+   (`expected_boot_log.txt`); the multi-process Phase 2 demos are checked for
+   per-process ordering (interleaving-robust) and that free frames return to
+   baseline around each demo, since the cross-process interleaving is
+   deliberately nondeterministic. `PLINTH_ICOUNT` can pin the interleaving
+   reproducibly for debugging; the kernel never depends on it.
+3. `cargo xtask check` -- static lint: every syscall `asm!` block in libplinth
+   must declare the full clobber set the kernel ABI implies.
 
 ## Current limitations
 
-Single CPU, single process at a time, no preemption, no disk, no
-network, frames and CPU budgets are the only resource types, and `write`
-is uncapability-gated console output for demo legibility. Programs are
-real ELF binaries, but they are still embedded at build time -- there is
-no disk to load them from yet.
+These are where Plinth is today, not where it stops. The syscall interface is
+a documented, versioned contract ([ABI.md](ABI.md), v2.3), so you can write
+your own programs and library OSes against it; growing Plinth toward a
+genuinely usable general-purpose exokernel is the ongoing direction
+([ROADMAP.md](ROADMAP.md)).
 
-These are where Plinth is today, not where it stops. The syscall
-interface is now a documented, versioned contract (see [ABI.md](ABI.md)),
-so you can write your own programs and library OSes against it; growing
-Plinth toward a genuinely usable general-purpose exokernel is the ongoing
-direction.
-
-CPU-budget enforcement is **cooperative**: `cpu_charge` debits the
-budget at points the process chooses, and a process that spins without
-ever charging is never billed and never stopped. Preemptive enforcement
-is exactly what a timer interrupt is for, and the timer is deliberately
-out of scope (it would end the deterministic serial output the whole
-test harness rests on). What the kernel demonstrates is the *capability
-model* for CPU time -- mint, spend, enforce-at-charge, reclaim -- not a
-preemptive scheduler.
-
-Self-paging is scoped to match: one fault in flight at a time, a single
-fixed lazy window, and demand-zero backing only (the handler maps fresh
-frames -- there is no disk to page from). It demonstrates the upcall and
-the resume, not a full virtual-memory system.
-
-`spawn` is synchronous and depth-bounded: a parent blocks while its child
-runs, nesting is capped by a fixed array of kernel stacks, and a child is
-launched from an embedded set by id (not from arbitrary user-supplied
-bytes). It demonstrates isolated process creation, capability transfer,
-and protected call/return -- not a general process model (no concurrency,
-no scheduling, no wait/reap or signals; those belong to a library OS).
-
-Known engineering gap, documented in the code: a kernel-mode #PF on a
-user pointer would take the fatal path (mitigated -- syscalls validate
-user pointers against the page tables before dereferencing). Address
-spaces, by contrast, are now fully reclaimed: a process's page-table
-frames are freed when it exits, so nothing leaks across the boot.
+- **One CPU.** The kernel is uniprocessor; SMP and real-machine device support
+  are the next roadmap item. The non-preemptible-kernel, no-lock discipline
+  the design rests on assumes a single core, so SMP is a concurrency redesign,
+  not a flag.
+- **`write` is uncapability-gated console output** for demo legibility -- the
+  one call that is not behind a capability. A single `write` is atomic with
+  respect to other processes, so interleaved demos never tear a line.
+- **CPU budgets are still spent cooperatively.** The scheduler preempts for
+  *fairness* (time-slicing under the timer), but the CPU-time *capability* is
+  debited by `cpu_charge` at points the process chooses; a process that spins
+  without charging is time-sliced like any other but never billed. The demo is
+  the capability model for CPU time -- mint, spend, enforce-at-charge, reclaim
+  -- layered over preemptive scheduling, not a deadline or priority system.
+- **Self-paging is demand-zero only.** One fault in flight per process, a
+  single fixed lazy window, and the handler maps fresh zeroed frames. It does
+  not page from disk -- the disk has its own explicit, blocking `block_read`
+  path -- so it demonstrates the upcall and the resume, not a full unified
+  virtual-memory system.
+- **Storage is read-only, one filesystem.** A virtio-blk driver and a
+  read-only boot archive parsed by `libfs`; there is no `block_write` in the
+  ABI yet, and the archive format is the only filesystem. No network.
+- **Input is one keyboard, raw events only.** The kernel ships raw Set-1
+  scancodes from the i8042 device; one reader per source. Keymaps, layouts,
+  and line editing are library-OS policy (`libinput`); fanning input out to
+  many consumers would itself be a library OS over the primitive.
+- **IPC endpoints are kernel-granted.** A process does not yet create its own
+  endpoints: the kernel mints one per `spawn` (the result channel) and may
+  grant one at launch. A process-facing endpoint-create call is not part of
+  the ABI yet.
+- **Known engineering gap, documented in the code:** a kernel-mode `#PF` on a
+  user pointer would take the fatal path (mitigated -- syscalls validate user
+  pointers against the page tables before dereferencing). Address spaces, by
+  contrast, are fully reclaimed: a process's page-table frames are freed when
+  it exits, so nothing leaks across the boot.
 
 ## Field notes
 
 Hard-won, possibly useful to other no_std kernel people:
 
-- **LLVM's loop-to-memcpy pass vs. your memcpy.** Defining `memcpy` as a
-  naive byte loop at opt-level 3 + LTO lets LLVM recognise the loop and
-  replace it with a call to `memcpy` -- itself. The resulting recursion
-  overflows the user stack. The fix (libplinth/src/lib.rs) is volatile
-  accesses, which cannot be folded into a library call. Relatedly: `==`
-  on `&[u8]` in a no_std binary lowers to a `memcmp` that can resolve to
-  a null weak symbol -- an instruction-fetch fault at RIP=0 -- unless
-  strong intrinsics are linked.
-- **ovmf-prebuilt is pinned to =0.2.8.** The 0.2.9-bundled edk2 build
-  hangs with zero serial output (not even BdsDxe lines) under
-  qemu-system-x86_64 with q35 + pflash. If you bump the pin, re-test
-  boot before trusting anything else.
+- **LLVM's loop-to-memcpy pass vs. your memcpy.** Defining `memcpy` as a naive
+  byte loop at opt-level 3 + LTO lets LLVM recognise the loop and replace it
+  with a call to `memcpy` -- itself. The resulting recursion overflows the user
+  stack. The fix (libplinth/src/lib.rs) is volatile accesses, which cannot be
+  folded into a library call. Relatedly: `==` on `&[u8]` in a no_std binary
+  lowers to a `memcmp` that can resolve to a null weak symbol -- an
+  instruction-fetch fault at RIP=0 -- unless strong intrinsics are linked.
+- **ovmf-prebuilt is pinned to =0.2.8.** The 0.2.9-bundled edk2 build hangs
+  with zero serial output (not even BdsDxe lines) under qemu-system-x86_64
+  with q35 + pflash. If you bump the pin, re-test boot before trusting anything
+  else.
 - **Pin your nightly by date.** `channel = "nightly"` means a different
-  compiler on every fresh machine. This repo built green locally for
-  days while CI failed instantly: the runner pulled that morning's
-  nightly, on which bootloader 0.11's BIOS-stage builds die with E0463.
-  `rust-toolchain.toml` now names the exact dated nightly the suite is
-  verified against.
-- **syscall asm clobbers are a lint, not a comment.** The kernel's C
-  dispatcher may clobber every caller-saved register; one missing
-  declaration means the compiler caches a value in a register the
-  kernel destroys, and the failure appears far from the cause.
-  `cargo xtask check` machine-checks the contract.
+  compiler on every fresh machine. This repo built green locally for days
+  while CI failed instantly: the runner pulled that morning's nightly, on
+  which bootloader 0.11's BIOS-stage builds die with E0463.
+  `rust-toolchain.toml` now names the exact dated nightly the suite is verified
+  against.
+- **syscall asm clobbers are a lint, not a comment.** The kernel's dispatcher
+  may clobber every caller-saved register; one missing declaration means the
+  compiler caches a value in a register the kernel destroys, and the failure
+  appears far from the cause. `cargo xtask check` machine-checks the contract.
+- **A blocking call needs a different door than a fast one.** The `syscall`
+  fast path saves only `rcx`/`r11`; it cannot suspend a caller and resume it
+  later with its registers intact. Every Plinth call that blocks -- IPC,
+  `event_recv`, `block_read` -- goes through the `int 0x80` gate instead,
+  whose interrupt entry saves the full resumable trap frame. Several arrived as
+  `syscall` calls and had to move once they learned to block.
 
 ## License
 

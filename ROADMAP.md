@@ -13,12 +13,16 @@ the machinery a usable system needs. Phase 1 comes first.
 ## Where Plinth is today
 
 A uniprocessor exokernel that boots under QEMU and runs unprivileged
-programs over nine syscalls: physical frames and CPU time as capabilities,
-per-process address spaces, application-level page-fault handling
-(self-paging), and `spawn` with capability transfer into an isolated
-child. A 100 Hz timer preemptively multiplexes the CPU across several
-processes (round-robin); there is no disk or network yet. See the
-[README](README.md) for the full demo.
+programs over a `syscall` fast path and an `int 0x80` gate for blocking
+calls: physical frames and CPU time as capabilities, per-process address
+spaces, application-level page-fault handling (self-paging), and `spawn`
+with capability transfer into an isolated child. A 100 Hz timer
+preemptively multiplexes the CPU across several processes (round-robin);
+synchronous IPC connects them; a virtio-blk disk multiplexed by a
+`BlockRange` capability backs a read-only filesystem and load-from-disk;
+and the i8042 keyboard delivers raw events behind an `EventSource`
+capability. No network or SMP yet. See the [README](README.md) for the
+full demo.
 
 ## Phase 1 -- an adoptable reference
 
@@ -69,8 +73,10 @@ against the cost to determinism rather than taken for granted.
 
 ## Stability
 
-The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2**.
+The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.3**.
 v2 added IPC and revised `spawn`, the one incompatible change from v1 (made
-while Phase 2 is still pre-release). Within a major series, new capabilities
-are added without breaking existing programs. Anything not in ABI.md is an
-implementation detail and may move.
+while Phase 2 is still pre-release); v2.1 (`spawn_from_buffer`), v2.2
+(console input), and v2.3 (`block_read` moved to the blocking gate) are all
+additive over v2. Within a major series, new capabilities are added without
+breaking existing programs. Anything not in ABI.md is an implementation
+detail and may move.
