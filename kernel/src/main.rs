@@ -13,6 +13,11 @@
 // boot path; the test build stops before it, so silence dead-code noise there.
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod acpi;
+// The single big kernel lock (Stage B2, D4) is acquired/released only from
+// the userspace-driving dispatch bodies; the test build stops before any
+// of those run.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod bkl;
 mod capability;
 // The ELF loader's parser is exercised by the test suite, but its mapping
 // helpers are only reached from the userspace boot path; silence their
@@ -45,6 +50,10 @@ mod input;
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod keyboard;
 mod memory;
+// Per-CPU data (Stage B2, D6) is set up and read only from the userspace
+// boot path (BSP) and AP bring-up; the test build never reaches either.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod percpu;
 // PCI discovery runs only on the userspace boot path (Stage 1 storage
 // bring-up); the test build stops before it.
 #[cfg_attr(feature = "tests", allow(dead_code))]
@@ -125,12 +134,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     memory::init(phys_offset);
 
-    let selectors = gdt::init();
+    let selectors = gdt::init(percpu::BSP_CORE_ID);
     let _ = writeln!(serial, "plinth: GDT + TSS loaded");
 
     interrupts::init();
     let _ = writeln!(serial, "plinth: IDT loaded");
 
+    // Per-CPU data (Stage B2.2, D6): point this core's GS_BASE at its own
+    // slot before arming syscall_entry, which is gs:-relative.
+    percpu::init(percpu::BSP_CORE_ID, syscall::stack_top(percpu::BSP_CORE_ID));
     syscall::init(&selectors);
     let _ = writeln!(serial, "plinth: syscall interface ready");
 

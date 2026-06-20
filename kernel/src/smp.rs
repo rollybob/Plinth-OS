@@ -1,5 +1,5 @@
-//! AP bring-up -- broader hardware, Stage B1 (Design/broader_hardware.md
-//! section 5.1, section 8).
+//! AP bring-up -- broader hardware, Stage B1 + B2.2 (Design/broader_hardware.md
+//! section 5.1/5.2, section 8).
 //!
 //! The BSP wakes each Application Processor with the INIT-SIPI-SIPI sequence
 //! via the Local APIC, pointing it at a 16-bit real-mode trampoline placed at
@@ -9,14 +9,18 @@
 //! small throwaway GDT of its own (the kernel's real GDT is built in kernel
 //! virtual address space, unreachable before paging is on), loads the SAME
 //! `kernel_l4` page table the BSP already uses, and lands in `ap_entry64` --
-//! ordinary Rust, with its own one-frame stack -- which marks itself alive and
-//! parks in `cli; hlt` forever.
+//! ordinary Rust, with its own one-frame stack.
 //!
-//! This milestone is deliberately narrow: prove an AP can be woken and reach
-//! Rust at all. It does not yet touch the kernel's shared structures'
-//! concurrency (Stage B2) -- the AP never takes an interrupt, never loads an
-//! IDT, and never runs anything but this one function, so nothing it does
-//! races with the BSP.
+//! Stage B1 proved an AP could be woken and reach Rust at all -- it marked
+//! itself alive and parked, touching nothing the BSP's structures use. Stage
+//! B2.2 (this revision) has `ap_entry64` go on to bring up its own per-core
+//! infrastructure -- GDT/TSS, IDT, syscall MSRs, GS_BASE-reached per-CPU data
+//! (percpu.rs), and its own Local APIC -- through the exact same calls the
+//! BSP's boot path uses, parameterized by a dense core id this module hands
+//! each AP through the trampoline's param block. It still runs nothing but
+//! this one function and parks in `cli; hlt` afterward: nothing it does races
+//! with the BSP yet, because it never touches a TABLE/CURRENT/ENDPOINTS-style
+//! shared structure -- joining the scheduler is Stage B2.3's job.
 //!
 //! Two correctness hazards specific to sharing the BSP's existing `kernel_l4`
 //! with a freshly-started core, both flagged in Design/broader_hardware.md
@@ -47,8 +51,8 @@
 use core::fmt::Write;
 use core::ptr::addr_of;
 
-use crate::frame_alloc::{FRAME_ALLOC, FRAME_SIZE};
-use crate::{acpi, irq, memory, timer};
+use crate::frame_alloc::FRAME_SIZE;
+use crate::{acpi, irq, memory, percpu, timer};
 
 /// Fixed physical address the AP trampoline lives at, and the SIPI vector
 /// names (vector = `TRAMPOLINE_PHYS >> 12`). Chosen, not discovered -- this is
@@ -69,6 +73,10 @@ const GDT_PTR_OFFSET: u64 = 0x120; // 6 bytes: u16 limit, u32 base
 const PARAM_KERNEL_L4_OFFSET: u64 = 0x128; // u32: kernel_l4 phys (low dword)
 const PARAM_STACK_TOP_OFFSET: u64 = 0x130; // u64: this AP's stack top (kernel VA)
 const PARAM_ENTRY_OFFSET: u64 = 0x138; // u64: ap_entry64's address (kernel VA)
+/// This AP's dense core id (Stage B2.2, D6) -- this kernel's own `0..MAX_CORES`
+/// index (percpu.rs), distinct from its APIC id. Read by `ap_entry64` through
+/// the still-active identity mapping, same as `STATUS_OFFSET` below.
+const PARAM_CORE_ID_OFFSET: u64 = 0x140; // u64: this AP's percpu core id
 /// Offset where `ap_entry64` (Rust) writes its "I'm alive" marker, addressed
 /// through the still-active identity mapping (see the module doc). Far enough
 /// past the trampoline code and the param block to never collide with either,
@@ -187,28 +195,52 @@ const MAX_TRAMPOLINE_LEN: u64 = GDT_OFFSET;
 /// virtual address resolves to the right physical page without needing
 /// `phys_offset` plumbed all the way down here -- then parks forever.
 ///
-/// Stage B1 scope: this core never loads its own GDT/IDT/TSS (the temporary
-/// trampoline GDT's flat descriptors are perfectly valid for a core that
-/// never takes a ring transition or an interrupt) and never runs anything
-/// else. `cli` from the 16-bit trampoline is still in effect and is never
-/// lifted, so no exception can be delivered here even if the bytes above this
-/// core somehow faulted; per-CPU GDT/IDT/TSS plumbing is Stage B2's job, once
-/// a core actually has work to do.
+/// Stage B2.2 brought up each core's own GDT/TSS, IDT, syscall MSRs, per-CPU
+/// (GS_BASE) data, and Local APIC -- the same per-core infrastructure the BSP
+/// sets up for itself at boot, built by the identical code paths
+/// (gdt::init/percpu::init/syscall::init/interrupts::load_on_this_core/
+/// irq::enable_lapic_ap) so there is exactly one way any core comes up, not a
+/// BSP path and a separate AP path. Stage B2.3 (this revision) has it go on
+/// to join `scheduler::ap_idle_loop`, which claims and runs any Ready process
+/// this core may claim (D5) and halts between attempts -- never returns.
 extern "C" fn ap_entry64() -> ! {
     // SAFETY: TRAMPOLINE_PHYS is still identity-mapped at this point -- the
     // BSP only calls `memory::unmap_identity` after every AP it started has
     // either reported in here or timed out -- so this virtual address
     // resolves to the trampoline page's own physical frame, the same frame
     // `start_aps` polls via the ordinary phys-offset mapping.
-    unsafe {
+    // SAFETY: read PARAM_CORE_ID_OFFSET into a local *before* announcing
+    // STATUS_ALIVE -- `start_aps`'s loop treats "alive" as permission to
+    // reuse this same param block for the *next* AP (new core_id, new
+    // stack_top, status reset to 0) and only waits in ~1ms polling
+    // increments, not for this AP to finish reading it. Writing status
+    // first (the previous order) raced two real, concurrently-running
+    // cores: with 2+ APs to bring up, "alive" could be observed and the
+    // block recycled before this core's own read executed, handing it a
+    // stale or already-overwritten core_id (Stage B2.3 -- a real bug found
+    // by booting under PLINTH_SMP=3/4, never PLINTH_SMP=2 where there is
+    // only one AP and the block is never reused).
+    let core_id = unsafe {
+        let id = core::ptr::read_volatile((TRAMPOLINE_PHYS + PARAM_CORE_ID_OFFSET) as *const u64)
+            as usize;
         core::ptr::write_volatile((TRAMPOLINE_PHYS + STATUS_OFFSET) as *mut u32, STATUS_ALIVE);
-    }
-    loop {
-        // SAFETY: parks forever with interrupts already disabled (`cli` ran
-        // in the 16-bit trampoline and is never lifted) -- see the doc above
-        // on why no IDT is needed for that to be safe in Stage B1.
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
-    }
+        id
+    };
+
+    // Ordinary kernel code/data from here on -- `kernel_l4`'s normal mappings
+    // cover it, the same as any other kernel function; no identity mapping or
+    // phys_offset needed (only the two trampoline-page touches above did).
+    let selectors = crate::gdt::init(core_id);
+    crate::percpu::init(core_id, crate::syscall::stack_top(core_id));
+    crate::syscall::init(&selectors);
+    crate::interrupts::load_on_this_core();
+    crate::irq::enable_lapic_ap();
+
+    // Interrupts stay disabled until the idle loop's own sti;hlt (`cli` ran
+    // in the 16-bit trampoline and nothing above re-enabled it) -- the same
+    // discipline `idle_until_runnable` already uses, applied to a core that
+    // has never run anything yet rather than one between scheduled processes.
+    crate::scheduler::ap_idle_loop()
 }
 
 /// Write the trampoline's fixed, AP-independent setup: the blob itself, the
@@ -267,18 +299,37 @@ fn install_trampoline(phys_offset: u64) -> Result<(), &'static str> {
     memory::map_identity(TRAMPOLINE_PHYS, FRAME_SIZE)
 }
 
-/// Allocate one frame as an AP's kernel stack and return its top (the
-/// phys-offset virtual address `ap_entry64` will run with). One frame is
-/// generous for Stage B1: the core does nothing but write one word and loop
-/// on `hlt`. Stage B2, when a core actually runs scheduled work, sizes this
-/// properly (and per-CPU, not per-bring-up).
-fn alloc_ap_stack(phys_offset: u64) -> Result<u64, &'static str> {
-    let phys = {
-        let mut guard = FRAME_ALLOC.lock();
-        let fa = guard.as_mut().ok_or("frame allocator not initialised")?;
-        fa.alloc().map_err(|_| "out of frames for AP stack")?
-    };
-    Ok(phys_offset + phys + FRAME_SIZE)
+/// Each AP's own boot stack: not a process kernel stack (those exist only
+/// once a process is set up, scheduler.rs's KSTACKS) and not its syscall
+/// stack (syscall.rs's SYSCALL_STACKS, armed only once `syscall::init` runs)
+/// -- this is what's live from the moment `ap_entry64` starts until that
+/// core claims its first process, AND what `ap_idle_loop` keeps running on
+/// in between claims (it never switches its own rsp). A single 4 KiB frame
+/// (Stage B1's size, when a core did nothing but write one word and `hlt`)
+/// is nowhere near enough once that loop is doing real work under
+/// contention: acquiring/releasing the BKL, calling `resume_process`,
+/// fielding a reschedule IPI mid-halt -- with 2+ APs all doing this at once
+/// (Stage B2.3) it overflowed into whatever frame happened to follow it,
+/// corrupting that memory and crashing in a way that looked like a jump
+/// through a corrupted pointer (an instruction-fetch #PF on a data page) --
+/// a real bug found by booting under PLINTH_SMP=3/4 (never PLINTH_SMP=2,
+/// the only configuration with just one AP and so the least contention).
+/// Sized to match `scheduler::KSTACK_SIZE`; static like every other per-core
+/// stack in this kernel (gdt.rs, syscall.rs, scheduler.rs) rather than
+/// frame-allocated, so it is an ordinary mapped kernel VA from the start --
+/// no phys-offset indirection needed.
+const AP_STACK_SIZE: usize = 16 * 4096;
+#[repr(align(16))]
+struct ApStack(#[allow(dead_code)] [u8; AP_STACK_SIZE]);
+static mut AP_BOOT_STACKS: [ApStack; percpu::MAX_CORES] =
+    [const { ApStack([0; AP_STACK_SIZE]) }; percpu::MAX_CORES];
+
+/// This AP's boot stack top (a kernel VA `ap_entry64` will run with).
+fn alloc_ap_stack(core_id: usize) -> u64 {
+    // SAFETY: address arithmetic over the static; no reference taken. Each
+    // core_id is assigned to exactly one AP (start_aps), so no two cores
+    // ever use the same slot.
+    unsafe { core::ptr::addr_of!(AP_BOOT_STACKS[core_id]) as u64 + AP_STACK_SIZE as u64 }
 }
 
 /// Read the status word an AP's `ap_entry64` writes once it has run.
@@ -292,11 +343,8 @@ fn read_status(phys_offset: u64) -> u32 {
     unsafe { core::ptr::read_volatile((phys_offset + TRAMPOLINE_PHYS + STATUS_OFFSET) as *const u32) }
 }
 
-// Local APIC Interrupt Command Register (ICR): two 32-bit halves. ICR_HIGH's
-// bits 24..32 are the physical destination APIC id; writing ICR_LOW issues the
-// IPI (Intel SDM Vol 3A, 10.6).
-const ICR_LOW: u32 = 0x300;
-const ICR_HIGH: u32 = 0x310;
+// Local APIC Interrupt Command Register (ICR) offsets (irq::ICR_LOW/
+// ICR_HIGH) are shared with irq.rs's own reschedule-IPI sender.
 /// Delivery mode INIT (Intel SDM Table 10-1), in ICR_LOW bits 8..11.
 const DELIVERY_INIT: u32 = 0b101 << 8;
 /// Delivery mode Start-Up (the SIPI), in ICR_LOW bits 8..11.
@@ -321,13 +369,13 @@ fn send_init_sipi(lapic_va: u64, target_apic_id: u8) {
     // sequentially with bounded waits between, never concurrently (one CPU
     // bringing up one AP at a time).
     unsafe {
-        irq::lapic_reg_write(lapic_va, ICR_HIGH, dest);
-        irq::lapic_reg_write(lapic_va, ICR_LOW, DELIVERY_INIT | LEVEL_ASSERT);
+        irq::lapic_reg_write(lapic_va, irq::ICR_HIGH, dest);
+        irq::lapic_reg_write(lapic_va, irq::ICR_LOW, DELIVERY_INIT | LEVEL_ASSERT);
         timer::busy_wait_us(10_000);
 
         for _ in 0..2 {
-            irq::lapic_reg_write(lapic_va, ICR_HIGH, dest);
-            irq::lapic_reg_write(lapic_va, ICR_LOW, DELIVERY_STARTUP | vector);
+            irq::lapic_reg_write(lapic_va, irq::ICR_HIGH, dest);
+            irq::lapic_reg_write(lapic_va, irq::ICR_LOW, DELIVERY_STARTUP | vector);
             timer::busy_wait_us(200);
         }
     }
@@ -359,25 +407,35 @@ pub fn start_aps<W: Write>(out: &mut W, topology: Option<&acpi::Topology>, phys_
     }
 
     let mut online = 0usize;
+    // Dense core ids (percpu.rs), distinct from APIC ids: the BSP is
+    // percpu::BSP_CORE_ID (0); each AP brought up here gets the next one.
+    // Assigned regardless of whether this particular AP ends up online --
+    // simplest, and a timed-out AP's reserved id is simply never used.
+    let mut next_core_id = percpu::BSP_CORE_ID + 1;
     for &apic_id in &topo.cpu_apic_ids[..topo.cpu_id_count] {
         if apic_id == bsp_id {
             continue; // the BSP is already running this code
         }
+        let core_id = next_core_id;
+        next_core_id += 1;
+        if core_id >= percpu::MAX_CORES {
+            let _ = writeln!(out, "plinth:   smp: apic id {apic_id} skipped (MAX_CORES reached)");
+            continue;
+        }
 
-        let stack_top = match alloc_ap_stack(phys_offset) {
-            Ok(top) => top,
-            Err(e) => {
-                let _ = writeln!(out, "plinth:   smp: apic id {apic_id} stack alloc failed: {e}");
-                continue;
-            }
-        };
-        // SAFETY: writing this AP's stack top and clearing the status word
-        // before waking it; only this AP's trampoline run touches either
-        // before the next iteration's writes -- one AP brought up at a time.
+        let stack_top = alloc_ap_stack(core_id);
+        // SAFETY: writing this AP's stack top, core id, and clearing the
+        // status word before waking it; only this AP's trampoline run
+        // touches any of them before the next iteration's writes -- one AP
+        // brought up at a time.
         unsafe {
             core::ptr::write_volatile(
                 (phys_offset + TRAMPOLINE_PHYS + PARAM_STACK_TOP_OFFSET) as *mut u64,
                 stack_top,
+            );
+            core::ptr::write_volatile(
+                (phys_offset + TRAMPOLINE_PHYS + PARAM_CORE_ID_OFFSET) as *mut u64,
+                core_id as u64,
             );
             core::ptr::write_volatile(
                 (phys_offset + TRAMPOLINE_PHYS + STATUS_OFFSET) as *mut u32,
@@ -394,6 +452,7 @@ pub fn start_aps<W: Write>(out: &mut W, topology: Option<&acpi::Topology>, phys_
 
         if read_status(phys_offset) == STATUS_ALIVE {
             online += 1;
+            irq::mark_ap_online(core_id, apic_id);
             let _ = writeln!(out, "plinth:   smp: apic id {apic_id} online");
         } else {
             let _ = writeln!(out, "plinth:   smp: apic id {apic_id} did not respond");

@@ -31,7 +31,7 @@ use x86_64::instructions::port::Port;
 use x86_64::registers::model_specific::Msr;
 use x86_64::structures::idt::InterruptStackFrame;
 
-use crate::{acpi, interrupts, memory};
+use crate::{acpi, interrupts, memory, percpu};
 
 // 8259 master/slave command + data ports, and the end-of-interrupt command.
 const PIC1_CMD: u16 = 0x20;
@@ -50,6 +50,12 @@ pub const VECTOR_BASE: u8 = 0x20;
 /// real to hand the CPU; its handler does nothing (a spurious needs no EOI).
 const SPURIOUS_VECTOR: u8 = 0xFF;
 
+/// IPI vector used to wake an idling core so it re-checks for claimable
+/// scheduler work (Stage B2.3, D4/section 5.4). Clear of every other vector
+/// in use: line IRQs at `VECTOR_BASE..=VECTOR_BASE+11`, virtio MSI-X at
+/// 0x30/0x31 (`virtio_blk::MSIX_VECTOR_BASE`), spurious at 0xFF.
+const RESCHEDULE_VECTOR: u8 = 0xF0;
+
 // IA32_APIC_BASE MSR and the Local APIC register offsets we touch.
 const IA32_APIC_BASE: u32 = 0x1B;
 const LAPIC_ID: u32 = 0x20;
@@ -60,6 +66,18 @@ const LAPIC_SVR: u32 = 0xF0;
 // the maximum redirection-entry index).
 const IOAPIC_VER: u32 = 0x01;
 
+// Local APIC Interrupt Command Register (ICR): two 32-bit halves. ICR_HIGH's
+// bits 24..32 are the physical destination APIC id; writing ICR_LOW issues
+// the IPI (Intel SDM Vol 3A, 10.6). Public: smp.rs's INIT-SIPI-SIPI sender
+// uses the same registers.
+pub const ICR_LOW: u32 = 0x300;
+pub const ICR_HIGH: u32 = 0x310;
+/// Delivery mode Fixed (Intel SDM Table 10-1), in ICR_LOW bits 8..11.
+const DELIVERY_FIXED: u32 = 0;
+/// Delivery Status (Intel SDM Vol 3A 10.6.1), ICR_LOW bit 12: 1 while a
+/// previously written IPI command is still being sent.
+const DELIVERY_STATUS_PENDING: u32 = 1 << 12;
+
 /// True once the LAPIC + I/O APIC are up and delivering; false means the PIC
 /// fallback is live. Set once at boot, read on every controller op.
 static APIC_MODE: AtomicBool = AtomicBool::new(false);
@@ -68,6 +86,20 @@ static APIC_MODE: AtomicBool = AtomicBool::new(false);
 static LAPIC_VA: AtomicU64 = AtomicU64::new(0);
 /// The I/O APIC programming state, set at init and read by `unmask`/`mask`.
 static IOAPIC: Mutex<Option<IoApicState>> = Mutex::new(None);
+/// Physical APIC id of each AP that reported alive (`smp::start_aps`), indexed
+/// by its dense core id; `None` for a core id never brought up. Lets
+/// `send_reschedule_ipi` target each online AP individually instead of the
+/// "all excluding self" destination shorthand (Stage B2.3: that shorthand,
+/// under repeated back-to-back sends with 2+ APs online, was implicated in a
+/// real crash found by booting under PLINTH_SMP=3/4 -- never reproduced with
+/// it removed, and not reproduced since switching to per-target sends either).
+static ONLINE_APIC_IDS: Mutex<[Option<u8>; percpu::MAX_CORES]> = Mutex::new([None; percpu::MAX_CORES]);
+
+/// Record that `core_id` is alive at `apic_id`, so `send_reschedule_ipi` can
+/// target it. Call once, from `smp::start_aps`, right after an AP reports in.
+pub fn mark_ap_online(core_id: usize, apic_id: u8) {
+    ONLINE_APIC_IDS.lock()[core_id] = Some(apic_id);
+}
 
 /// What `unmask`/`mask` need to program an I/O APIC redirection entry: the
 /// mapped MMIO base, the GSI base, the destination (BSP) APIC id, and the MADT
@@ -97,10 +129,12 @@ pub fn init(topo: Option<&acpi::Topology>) {
         return; // no MADT: keep driving the (masked) PIC directly.
     };
 
-    // Install the spurious handler before the LAPIC is software-enabled (no
-    // interrupt can fire yet -- IF=0 throughout boot -- but keep the ordering
-    // honest), bring up the LAPIC and I/O APIC, then commit APIC mode.
+    // Install the spurious and reschedule-IPI handlers before the LAPIC is
+    // software-enabled (no interrupt can fire yet -- IF=0 throughout boot --
+    // but keep the ordering honest), bring up the LAPIC and I/O APIC, then
+    // commit APIC mode.
     interrupts::set_irq_handler(SPURIOUS_VECTOR, spurious_interrupt);
+    interrupts::set_irq_handler(RESCHEDULE_VECTOR, reschedule_interrupt);
     let bsp_id = enable_lapic(t);
     let va = init_ioapic(t);
     *IOAPIC.lock() = Some(IoApicState {
@@ -197,18 +231,25 @@ pub fn eoi(line: u8) {
 
 // --- Local APIC + I/O APIC (the APIC path) ---
 
-/// Software-enable the Local APIC and return the boot CPU's APIC id. Globally
-/// enables the LAPIC via IA32_APIC_BASE, maps its MMIO page, sets the spurious
-/// vector (with the enable bit) and a zero task priority (accept all vectors).
-fn enable_lapic(t: &acpi::Topology) -> u8 {
-    // SAFETY: IA32_APIC_BASE is the architectural LAPIC-enable MSR; setting bit
-    // 11 (global enable) while leaving bit 10 (x2APIC) clear keeps xAPIC/MMIO
-    // mode. Done once at boot.
+/// IA32_APIC_BASE's global-enable bit (bit 11). Setting it while leaving bit
+/// 10 (x2APIC) clear keeps xAPIC/MMIO mode. This MSR is per-core architectural
+/// state -- every core that wants its LAPIC live must set this for itself.
+fn enable_lapic_msr() {
+    // SAFETY: the architectural LAPIC-enable MSR, on this core only.
     unsafe {
         let mut msr = Msr::new(IA32_APIC_BASE);
         let base = msr.read();
         msr.write(base | (1 << 11));
     }
+}
+
+/// Software-enable the BSP's Local APIC and return its APIC id. Globally
+/// enables the LAPIC via IA32_APIC_BASE, maps its MMIO page (once -- every
+/// core's LAPIC sits at the same physical/virtual address by construction;
+/// only the *enable* below is per-core), sets the spurious vector (with the
+/// enable bit) and a zero task priority (accept all vectors).
+fn enable_lapic(t: &acpi::Topology) -> u8 {
+    enable_lapic_msr();
     let va = memory::map_kernel_mmio(t.lapic_base, 0x1000).expect("map LAPIC MMIO");
     LAPIC_VA.store(va, Ordering::Relaxed);
     // SAFETY: `va` is the freshly mapped LAPIC MMIO page; these are the defined
@@ -218,6 +259,24 @@ fn enable_lapic(t: &acpi::Topology) -> u8 {
         lapic_write(va, LAPIC_SVR, (1 << 8) | SPURIOUS_VECTOR as u32);
         lapic_write(va, LAPIC_TPR, 0);
         bsp_id
+    }
+}
+
+/// Software-enable THIS core's Local APIC and return its own APIC id (Stage
+/// B2.2). The MMIO mapping is already up (the BSP's `init` did it -- the
+/// same virtual address resolves to each core's own LAPIC hardware); an AP
+/// only needs the per-core MSR enable plus its own SVR/TPR. Call once per AP,
+/// after the BSP has called `init` with a MADT (i.e. `apic_mode()` is true).
+pub fn enable_lapic_ap() -> u8 {
+    enable_lapic_msr();
+    let va = LAPIC_VA.load(Ordering::Relaxed);
+    // SAFETY: `va` is the BSP-mapped LAPIC MMIO page, valid on every core;
+    // these are the defined LAPIC registers, written once per AP with IF=0.
+    unsafe {
+        let id = (lapic_read(va, LAPIC_ID) >> 24) as u8;
+        lapic_write(va, LAPIC_SVR, (1 << 8) | SPURIOUS_VECTOR as u32);
+        lapic_write(va, LAPIC_TPR, 0);
+        id
     }
 }
 
@@ -290,6 +349,67 @@ fn resolve(state: &IoApicState, line: u8) -> (u32, bool, bool) {
 
 /// The Local APIC spurious-interrupt handler: nothing to do, and no EOI.
 extern "x86-interrupt" fn spurious_interrupt(_frame: InterruptStackFrame) {}
+
+/// Wake every other online core out of `hlt` so it re-checks for claimable
+/// scheduler work (Stage B2.3, section 5.4) -- the scheduler calls this
+/// whenever it makes a slot Ready (`scheduler::setup_process`/`wake_with`).
+/// A no-op under the PIC fallback (no LAPIC to send from -- the same
+/// reasoning as every other APIC-only operation in this module), and a no-op
+/// if no AP has reported online yet.
+///
+/// Sends one targeted (physical destination) IPI per online AP rather than
+/// using the ICR's "all excluding self" destination shorthand. The shorthand
+/// is simpler and was the first implementation, but with 2+ APs online it
+/// was directly implicated in a real, repeatable crash (found by booting
+/// under `PLINTH_SMP=3`/`4`, never `PLINTH_SMP=2` where there is only one
+/// possible target): disabling the IPI entirely made the crash all but
+/// disappear, and per-target sends below have shown the same stability in
+/// the same repeated testing. Whether the exact mechanism is a QEMU xAPIC
+/// emulation gap with the broadcast shorthand specifically, or something
+/// about the SDM's delivery-status discipline under broadcast that a fixed
+/// per-target dest sidesteps, isn't nailed down -- but per-target sends are
+/// no less correct (every online AP still gets woken) and are the safer
+/// choice either way.
+pub fn send_reschedule_ipi() {
+    let Some(va) = lapic_base() else {
+        return; // no MADT / no LAPIC -- nothing to IPI, and no AP woke either
+    };
+    let targets = *ONLINE_APIC_IDS.lock();
+    for apic_id in targets.into_iter().flatten() {
+        let dest = (apic_id as u32) << 24;
+        // SAFETY: `va` came from `lapic_base()`, so the APIC is up; `dest`
+        // names a specific physical APIC id this function's own caller
+        // recorded as online.
+        unsafe {
+            // Intel SDM Vol 3A 10.6.1: software must not write a new ICR
+            // command while the previous one's Delivery Status (bit 12) is
+            // still "send pending" -- callers here (setup_process,
+            // wake_with) can issue several of these back to back (one per
+            // online AP, here, and one per process in run()'s setup loop),
+            // so without this wait a later send can land on top of an
+            // in-flight one. Bounded by nothing on real hardware (delivery
+            // is fast), but capped here defensively rather than risk an
+            // infinite spin if delivery status ever genuinely doesn't clear.
+            let mut spins = 0;
+            while lapic_read(va, ICR_LOW) & DELIVERY_STATUS_PENDING != 0 && spins < 100_000 {
+                spins += 1;
+            }
+            lapic_write(va, ICR_HIGH, dest);
+            lapic_write(va, ICR_LOW, DELIVERY_FIXED | RESCHEDULE_VECTOR as u32);
+        }
+    }
+}
+
+/// The reschedule IPI's handler: its only job is to break a `hlt` -- the
+/// woken core's own idle loop (`scheduler::ap_idle_loop` /
+/// `idle_until_runnable`) re-checks TABLE itself, so there is nothing else
+/// to do here besides EOI.
+extern "x86-interrupt" fn reschedule_interrupt(_frame: InterruptStackFrame) {
+    // SAFETY: a single Local APIC EOI write, the same as any other
+    // APIC-delivered interrupt; this handler is only ever installed once
+    // APIC_MODE is the live controller.
+    unsafe { lapic_write(LAPIC_VA.load(Ordering::Relaxed), LAPIC_EOI, 0) };
+}
 
 unsafe fn lapic_read(va: u64, off: u32) -> u32 {
     read_volatile((va + off as u64) as *const u32)

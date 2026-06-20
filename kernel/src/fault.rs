@@ -40,6 +40,7 @@ use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, PageFaultErrorCode};
 use x86_64::VirtAddr;
 
+use crate::bkl;
 use crate::process::{self, FaultReg, USER_LAZY_BASE, USER_LAZY_END};
 use crate::serial;
 use crate::usermode;
@@ -190,14 +191,30 @@ fn save_trap(raw: &RawTrap) {
 /// Restore the saved faulting context and resume it. Called from
 /// sys_fault_return once the handler has mapped the page.
 pub fn resume() -> ! {
+    // BKL (D4): about to iretq back into the faulting instruction via
+    // resume_user_trap, which never returns and never runs Drop -- release
+    // here, the chokepoint for the self-paging resume path (reached from
+    // sys_fault_return, itself called with the lock held from
+    // syscall_dispatch).
+    //
     // SAFETY: a matching save_trap ran when this fault was delivered (the
     // caller checked in_fault), so SAVED_TRAP holds a valid ring-3 frame.
-    unsafe { resume_user_trap(addr_of!(SAVED_TRAP)) }
+    unsafe {
+        bkl::release();
+        resume_user_trap(addr_of!(SAVED_TRAP))
+    }
 }
 
 /// The #PF dispatcher. Reached only from `page_fault_entry`.
 #[no_mangle]
 extern "C" fn page_fault_dispatch(raw: *const RawTrap) -> ! {
+    // BKL (D4): acquired here (this is its own kernel-entry dispatch surface,
+    // separate from interrupts::handle_fault's naked-stub-free exceptions).
+    // Every path below diverges -- into deliver_fault_handler (released right
+    // before that call), into process::exit_current (released at ITS
+    // chokepoint), or into `panic!` (halts, no release needed).
+    bkl::acquire();
+
     // SAFETY: the stub passes a pointer to the RawTrap it built on the
     // kernel stack; it is valid for the duration of this call.
     let raw = unsafe { &*raw };
@@ -210,7 +227,7 @@ extern "C" fn page_fault_dispatch(raw: *const RawTrap) -> ! {
         // Decide whether to upcall, under the lock, then release it before
         // leaving CPL 0 (deliver/terminate both abandon this stack frame).
         let deliver = {
-            let mut cur = process::CURRENT.lock();
+            let mut cur = process::current().lock();
             match cur.as_mut() {
                 Some(proc) => match proc.fault {
                     Some(FaultReg { entry, stack_top })
@@ -230,8 +247,13 @@ extern "C" fn page_fault_dispatch(raw: *const RawTrap) -> ! {
         if let Some((entry, stack_top)) = deliver {
             save_trap(raw);
             // SAFETY: faulted at CPL 3 so no kernel lock is held; this jumps
-            // to ring 3 and returns control only via fault_return.
-            unsafe { deliver_fault_handler(entry, stack_top, cr2) }
+            // to ring 3 and returns control only via fault_return. BKL (D4):
+            // release before this iretq -- the kernel is handing off to ring
+            // 3, same as any other dispatch exit.
+            unsafe {
+                bkl::release();
+                deliver_fault_handler(entry, stack_top, cr2)
+            }
         }
 
         // Unhandled user fault: log and terminate, identical to any fault.

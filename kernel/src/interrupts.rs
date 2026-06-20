@@ -21,6 +21,7 @@ use core::ptr::{addr_of, addr_of_mut};
 
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
+use crate::bkl;
 use crate::fault;
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 use crate::process;
@@ -57,6 +58,20 @@ pub fn init() {
     }
 }
 
+/// Point this core's IDTR at the already-built IDT (Stage B2.2). The table is
+/// shared, read-only-after-boot data -- every core just `lidt`s the same
+/// table, no per-core copy needed. Call once per AP, after the BSP's `init`
+/// has built it.
+pub fn load_on_this_core() {
+    // SAFETY: IDT_STORAGE was already built by the BSP's `init` and is never
+    // mutated again except by `set_irq_handler` (which only writes existing
+    // entries, not the table's identity/address) -- `lidt`-ing it from
+    // another core is just pointing that core's own IDTR at the same table.
+    unsafe {
+        (*addr_of!(IDT_STORAGE)).as_ref().expect("IDT not initialised before AP bring-up").load();
+    }
+}
+
 /// Install a handler at a runtime-determined IRQ `vector`, after the IDT is
 /// already built and loaded. Used for device line IRQs whose vector is only
 /// known after PCI discovery (the virtio-blk completion lines, Stage 4). The
@@ -77,6 +92,13 @@ pub fn set_irq_handler(vector: u8, handler: extern "x86-interrupt" fn(InterruptS
 /// Shared fault path. Diverges (via kernel_resume) for ring-3 faults;
 /// panics for kernel faults.
 fn handle_fault(name: &str, frame: &InterruptStackFrame, err: Option<u64>, addr: Option<u64>) {
+    // BKL (D4): this function always diverges -- either into
+    // process::exit_current (which releases the lock at its own chokepoint,
+    // scheduler::resume_process / switch_to_next / process::exit_current's
+    // kernel_resume arm) or into `panic!` (which halts, needing no release).
+    // No explicit release here covers either path correctly.
+    bkl::acquire();
+
     // The low two bits of the saved CS are the CPL at the time of the
     // fault; 3 means the fault came from user code.
     let from_user = frame.code_segment & 3 == 3;

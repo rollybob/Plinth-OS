@@ -50,6 +50,7 @@ use x86_64::registers::rflags::RFlags;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
+use crate::bkl;
 use crate::capability::{
     CapError, CapObject, Capability, RIGHT_CONSUME, RIGHT_MAP, RIGHT_READ, RIGHT_RECV, RIGHT_SEND,
     RIGHT_WRITE,
@@ -59,6 +60,7 @@ use crate::frame_alloc::{FRAME_ALLOC, FRAME_SIZE};
 use crate::gdt::Selectors;
 use crate::ipc;
 use crate::memory;
+use crate::percpu;
 use crate::process::{self, FaultReg, USER_MAP_BASE, USER_MAP_END};
 use crate::scheduler;
 use crate::serial;
@@ -74,22 +76,15 @@ const STACK_SIZE: usize = 16 * 4096;
 #[repr(align(16))]
 struct Stack(#[allow(dead_code)] [u8; STACK_SIZE]);
 
-/// The single kernel stack syscalls run on. One suffices: a syscall always
-/// runs to completion before any context switch -- the kernel is
-/// non-preemptible, and the blocking IPC operations enter through their own
-/// interrupt gate (per-process kernel stacks), not `syscall` -- so this stack
-/// is empty whenever another process is scheduled. (Synchronous nested spawn,
-/// which needed a stack per depth, is gone: spawn now launches a scheduled
-/// process instead.)
-static mut SYSCALL_STACK: Stack = Stack([0; STACK_SIZE]);
-
-/// Top of the syscall stack; loaded into rsp by the entry stub.
-#[no_mangle]
-static mut SYSCALL_STACK_PTR: u64 = 0;
-
-/// User rsp across the syscall. Single CPU; a syscall never yields.
-#[no_mangle]
-static mut USER_RSP_SAVE: u64 = 0;
+/// One kernel stack per core (Stage B2.2, D6): a syscall always runs to
+/// completion before any context switch -- the kernel is non-preemptible,
+/// and the blocking IPC operations enter through their own interrupt gate
+/// (per-process kernel stacks), not `syscall` -- so each core's own stack
+/// here is empty whenever that core is running scheduled (or another
+/// core's) work. (Synchronous nested spawn, which needed a stack per depth,
+/// is gone: spawn now launches a scheduled process instead.)
+static mut SYSCALL_STACKS: [Stack; percpu::MAX_CORES] =
+    [const { Stack([0; STACK_SIZE]) }; percpu::MAX_CORES];
 
 global_asm!(
     r#"
@@ -97,8 +92,14 @@ global_asm!(
 syscall_entry:
     // syscall left: rcx = user rip, r11 = user rflags. rsp is still the
     // user's -- switch to the kernel syscall stack before touching memory.
-    mov [rip + USER_RSP_SAVE], rsp
-    mov rsp, [rip + SYSCALL_STACK_PTR]
+    // gs:[USER_RSP_SAVE]/gs:[STACK_TOP] are PerCpu::user_rsp_save/
+    // syscall_stack_top (percpu.rs); GS_BASE points at THIS core's slot
+    // (percpu::init), set up before syscall is ever armed on that core, so
+    // this is correct even with multiple cores running syscall_entry
+    // concurrently (Stage B2.2 -- no swapgs needed, see percpu.rs's module
+    // doc).
+    mov gs:[{user_rsp_save}], rsp
+    mov rsp, gs:[{stack_top}]
     push rcx
     push r11
 
@@ -113,20 +114,26 @@ syscall_entry:
     // rax carries the return value through sysretq untouched.
     pop r11
     pop rcx
-    mov rsp, [rip + USER_RSP_SAVE]
+    mov rsp, gs:[{user_rsp_save}]
     sysretq
-"#
+"#,
+    user_rsp_save = const percpu::USER_RSP_SAVE_OFFSET,
+    stack_top = const percpu::SYSCALL_STACK_PTR_OFFSET,
 );
 
 extern "C" {
     fn syscall_entry();
 }
 
+/// Configure this core's syscall/sysret MSRs: EFER.SCE, STAR (selectors,
+/// shared across cores by construction -- gdt::init builds an identical
+/// layout on every core), the entry point, and the flag mask. Call once per
+/// core (BSP at boot, each AP at bring-up) -- these are per-core MSRs, not
+/// shared state. Must run AFTER `percpu::init` has pointed this core's
+/// GS_BASE at its own slot, since `syscall_entry` is now `gs:`-relative.
 pub fn init(sel: &Selectors) {
-    // SAFETY: single-threaded boot; MSR writes configure syscall entry
-    // exactly once, with selectors asserted by gdt::init.
+    // SAFETY: called once per core, after that core's percpu::init.
     unsafe {
-        SYSCALL_STACK_PTR = syscall_stack_top();
         Efer::update(|f| f.insert(EferFlags::SYSTEM_CALL_EXTENSIONS));
         Star::write(sel.ucode, sel.udata, sel.kcode, sel.kdata)
             .expect("GDT selector layout incompatible with STAR");
@@ -142,10 +149,11 @@ pub fn init(sel: &Selectors) {
     }
 }
 
-/// Top of the syscall stack.
-fn syscall_stack_top() -> u64 {
+/// Top of core `core_id`'s syscall stack, for `percpu::init` to record before
+/// `init` (above) arms `syscall_entry` on that core.
+pub fn stack_top(core_id: usize) -> u64 {
     // SAFETY: address arithmetic over the static; no reference taken.
-    addr_of!(SYSCALL_STACK) as u64 + STACK_SIZE as u64
+    unsafe { addr_of!(SYSCALL_STACKS[core_id]) as u64 + STACK_SIZE as u64 }
 }
 
 // Three args suffice for every syscall (the four-arg block_read moved to the
@@ -154,7 +162,14 @@ fn syscall_stack_top() -> u64 {
 // is the only remaining three-arg syscall.
 #[no_mangle]
 extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    match nr {
+    // BKL (D4): some arms below (sys_exit, sys_cpu_charge's overdraw path,
+    // sys_fault_return's success path) diverge several frames deep
+    // (process::exit_current / fault::resume) and never reach the release
+    // below -- they release the lock themselves at their actual longjmp
+    // point (see those functions). Every other arm returns normally here,
+    // where the release below covers it.
+    bkl::acquire();
+    let result = match nr {
         1 => sys_write(a1, a2),
         2 => sys_exit(a1),
         3 => sys_frame_alloc(),
@@ -169,7 +184,9 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         // 5, see ipc.rs / virtio_blk.rs). The number is left unused.
         11 => sys_spawn_from_buffer(a1, a2, a3),
         _ => ERR,
-    }
+    };
+    unsafe { bkl::release() };
+    result
 }
 
 /// write(ptr, len): copy bytes from validated user memory to the serial
@@ -189,7 +206,7 @@ fn sys_write(ptr: u64, len: u64) -> u64 {
 
     {
         let l4 = {
-            let cur = process::CURRENT.lock();
+            let cur = process::current().lock();
             match cur.as_ref() {
                 Some(proc) => proc.l4,
                 None => return ERR,
@@ -230,7 +247,7 @@ fn sys_exit(code: u64) -> u64 {
 /// frame_alloc(): allocate one physical frame and mint a capability for
 /// it in the calling process's table. Returns the slot index.
 fn sys_frame_alloc() -> u64 {
-    let mut cur = process::CURRENT.lock();
+    let mut cur = process::current().lock();
     let Some(proc) = cur.as_mut() else {
         return ERR;
     };
@@ -259,7 +276,7 @@ fn sys_frame_map(slot: u64, va: u64) -> u64 {
         return ERR;
     }
 
-    let mut cur = process::CURRENT.lock();
+    let mut cur = process::current().lock();
     let Some(proc) = cur.as_mut() else {
         return ERR;
     };
@@ -300,7 +317,7 @@ fn sys_frame_map(slot: u64, va: u64) -> u64 {
 /// frame_free(slot): revoke the capability, unmap any mapping made
 /// through it, and return the frame to the allocator.
 fn sys_frame_free(slot: u64) -> u64 {
-    let mut cur = process::CURRENT.lock();
+    let mut cur = process::current().lock();
     let Some(proc) = cur.as_mut() else {
         return ERR;
     };
@@ -354,7 +371,7 @@ fn sys_cpu_charge(slot: u64, amount: u64) -> u64 {
     // the overdraw path longjmps out via kernel_resume, which never runs
     // Drop, so no lock may be held when we reach it.
     let result = {
-        let mut cur = process::CURRENT.lock();
+        let mut cur = process::current().lock();
         let Some(proc) = cur.as_mut() else {
             return ERR;
         };
@@ -386,7 +403,7 @@ fn sys_fault_reg(entry: u64, stack_top: u64) -> u64 {
     if entry == 0 || stack_top == 0 {
         return ERR;
     }
-    let mut cur = process::CURRENT.lock();
+    let mut cur = process::current().lock();
     let Some(proc) = cur.as_mut() else {
         return ERR;
     };
@@ -399,7 +416,7 @@ fn sys_fault_reg(entry: u64, stack_top: u64) -> u64 {
 /// does not return to the handler -- control resumes in the faulting code.
 fn sys_fault_return() -> u64 {
     {
-        let mut cur = process::CURRENT.lock();
+        let mut cur = process::current().lock();
         match cur.as_mut() {
             Some(proc) if proc.in_fault => proc.in_fault = false,
             _ => return ERR,
@@ -466,7 +483,7 @@ fn sys_spawn_from_buffer(buf_va: u64, len: u64, transfer_slot: u64) -> u64 {
     // Every page of the buffer must be mapped and user-accessible in the
     // caller's address space (the active one) before the kernel reads it.
     let l4 = {
-        let cur = process::CURRENT.lock();
+        let cur = process::current().lock();
         match cur.as_ref() {
             Some(proc) => proc.l4,
             None => return ERR,
@@ -509,7 +526,7 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
 
     // Optionally move one capability out of the caller into the child.
     let transferred = if transfer_slot != ERR {
-        let mut cur = process::CURRENT.lock();
+        let mut cur = process::current().lock();
         match cur.as_mut() {
             Some(p) => process::revoke_and_unmap(p, transfer_slot as usize),
             None => None,
@@ -535,7 +552,7 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
         // move by re-minting it back to the caller (re-accounting it).
         ipc::release_endpoint(ep);
         if let Some(cap) = transferred {
-            let mut cur = process::CURRENT.lock();
+            let mut cur = process::current().lock();
             if let Some(p) = cur.as_mut() {
                 let _ = p.caps.mint(cap.object, cap.rights);
             }
@@ -547,7 +564,7 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
     // The caller's RECV handle on the result channel; recv on it = wait.
     let recv_cap = Capability { object: CapObject::Endpoint { id: ep }, rights: RIGHT_RECV };
     let handle = {
-        let mut cur = process::CURRENT.lock();
+        let mut cur = process::current().lock();
         cur.as_mut().and_then(|p| p.caps.mint(recv_cap.object, recv_cap.rights).ok())
     };
     match handle {

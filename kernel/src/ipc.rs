@@ -33,6 +33,7 @@ use core::ptr::{addr_of, addr_of_mut};
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::{PrivilegeLevel, VirtAddr};
 
+use crate::bkl;
 use crate::capability::{CapObject, CapTable, Capability, RIGHT_RECV, RIGHT_SEND};
 use crate::process;
 use crate::scheduler::{self, TrapFrame, GP_RAX, GP_RCX, GP_RDI, GP_RDX, GP_RSI};
@@ -425,6 +426,14 @@ fn wake_all_stranded(id: usize) {
 /// op blocked and switched to another process).
 #[no_mangle]
 extern "C" fn ipc_dispatch(frame: *mut TrapFrame) -> u64 {
+    // BKL (D4): every blocking arm below (a send/recv/call with no ready
+    // peer, event_recv, block_read) ends in scheduler::block_current, which
+    // diverges through switch_to_next without ever returning here -- the
+    // lock stays held across that whole chain and is released at its actual
+    // chokepoints (resume_process / idle_until_runnable, scheduler.rs). Every
+    // non-blocking arm returns normally, where the release below covers it.
+    bkl::acquire();
+
     // SAFETY: the stub passes a pointer to the trap frame it built on the
     // current process's kernel stack; valid for this call. rax = op, rdi/rsi =
     // args, rdx = the optional cap slot to transfer (send only) or block_read's
@@ -433,7 +442,7 @@ extern "C" fn ipc_dispatch(frame: *mut TrapFrame) -> u64 {
         let f = &*frame;
         (f.gp[GP_RAX], f.gp[GP_RDI], f.gp[GP_RSI], f.gp[GP_RDX], f.gp[GP_RCX])
     };
-    match op {
+    let result = match op {
         IPC_SEND => ipc_send(a1, a2, a3, frame as u64),
         IPC_RECV => ipc_recv(a1, frame as u64),
         IPC_CALL => ipc_call(a1, a2, frame as u64),
@@ -445,7 +454,9 @@ extern "C" fn ipc_dispatch(frame: *mut TrapFrame) -> u64 {
         // range slot, frame slot, sector offset, count (rdi/rsi/rdx/rcx).
         BLOCK_READ => crate::virtio_blk::block_read(a1, a2, a3, a4, frame as u64),
         _ => IPC_ERR,
-    }
+    };
+    unsafe { bkl::release() };
+    result
 }
 
 /// send(ep_slot, msg, cap_slot): deliver `msg` (and, if `cap_slot != NO_CAP`,
@@ -565,7 +576,7 @@ fn ipc_call(ep_slot: u64, req: u64, frame_ptr: u64) -> u64 {
 /// cap or its caller is no longer awaiting.
 fn ipc_reply(reply_slot: u64, msg: u64) -> u64 {
     let caller = {
-        let guard = process::CURRENT.lock();
+        let guard = process::current().lock();
         match guard
             .as_ref()
             .and_then(|p| p.caps.lookup(reply_slot as usize, 0).ok())
@@ -585,7 +596,7 @@ fn ipc_reply(reply_slot: u64, msg: u64) -> u64 {
     // The caller's `call` resumes with OK + the reply word in rsi.
     scheduler::wake_with(caller, IPC_OK, msg, NO_CAP);
     // One-shot: consume the reply capability.
-    let mut guard = process::CURRENT.lock();
+    let mut guard = process::current().lock();
     if let Some(p) = guard.as_mut() {
         let _ = p.caps.revoke(reply_slot as usize);
     }
@@ -597,7 +608,7 @@ fn ipc_reply(reply_slot: u64, msg: u64) -> u64 {
 fn mint_reply_cap_into_current(caller: usize) -> u64 {
     let cap = Capability { object: CapObject::Reply { caller }, rights: 0 };
     let landing = {
-        let mut guard = process::CURRENT.lock();
+        let mut guard = process::current().lock();
         guard
             .as_mut()
             .and_then(|p| p.caps.mint(cap.object, cap.rights).ok())
@@ -620,7 +631,7 @@ fn mint_reply_cap_into_blocked(server: usize, caller: usize) -> u64 {
 /// lock around the sender side so none is held across the mint.
 fn transfer_current_to_blocked(receiver: usize, cap_slot: u64) -> u64 {
     let cap = {
-        let mut guard = process::CURRENT.lock();
+        let mut guard = process::current().lock();
         match guard.as_mut() {
             Some(p) => process::revoke_and_unmap(p, cap_slot as usize),
             None => None,
@@ -639,7 +650,7 @@ fn transfer_current_to_blocked(receiver: usize, cap_slot: u64) -> u64 {
         }
         None => {
             // Receiver's table is full: hand the capability back to the sender.
-            let mut guard = process::CURRENT.lock();
+            let mut guard = process::current().lock();
             if let Some(p) = guard.as_mut() {
                 let _ = p.caps.mint(cap.object, cap.rights);
             }
@@ -659,7 +670,7 @@ fn transfer_blocked_to_current(sender: usize, cap_slot: u64) -> u64 {
     // Give half of the move; account it (no free -- the mint below re-refs).
     note_cap_removed(&cap, false);
     let landing = {
-        let mut guard = process::CURRENT.lock();
+        let mut guard = process::current().lock();
         guard
             .as_mut()
             .and_then(|p| p.caps.mint(cap.object, cap.rights).ok())
@@ -703,7 +714,7 @@ fn write_rdx(frame_ptr: u64, val: u64) {
 /// requiring `right` (RIGHT_SEND or RIGHT_RECV). Takes and releases the
 /// CURRENT lock entirely here so no lock is held across a later block.
 fn endpoint_id_for(slot: u64, right: u8) -> Option<usize> {
-    let guard = process::CURRENT.lock();
+    let guard = process::current().lock();
     let cap = guard.as_ref()?.caps.lookup(slot as usize, right).ok()?;
     match cap.object {
         CapObject::Endpoint { id } if id < MAX_ENDPOINTS && endpoint_in_use(id) => Some(id),

@@ -18,6 +18,7 @@ use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 use x86_64::structures::idt::InterruptStackFrame;
 
+use crate::bkl;
 use crate::capability::{CapObject, RIGHT_READ, RIGHT_WRITE};
 use crate::frame_alloc::{FRAME_ALLOC, FRAME_SIZE};
 use crate::{interrupts, irq, memory, process, scheduler};
@@ -581,7 +582,7 @@ pub fn block_read(
     // Resolve both capabilities under the CURRENT lock, then drop it before
     // touching the device or blocking -- nothing below needs CURRENT.
     let (dev, abs_sector, frame_phys) = {
-        let cur = process::CURRENT.lock();
+        let cur = process::current().lock();
         let Some(proc) = cur.as_ref() else {
             return BLK_E_RIGHTS;
         };
@@ -694,12 +695,18 @@ fn complete_irq(dev: usize) {
 
 // The completion-IRQ stubs: one per device, because the two devices sit on
 // distinct INTx lines (QEMU q35), so each vector maps to a known device and EOIs
-// its own line. Raising pci::MAX_DEVICES means adding a stub here.
+// its own line. Raising pci::MAX_DEVICES means adding a stub here. BKL (D4):
+// acquired/released around complete_irq -- it calls scheduler::wake_with,
+// which touches the scheduler table.
 extern "x86-interrupt" fn blk_interrupt_dev0(_frame: InterruptStackFrame) {
+    bkl::acquire();
     complete_irq(0);
+    unsafe { bkl::release() };
 }
 extern "x86-interrupt" fn blk_interrupt_dev1(_frame: InterruptStackFrame) {
+    bkl::acquire();
     complete_irq(1);
+    unsafe { bkl::release() };
 }
 
 /// Install each present device's completion-IRQ handler and (on the INTx

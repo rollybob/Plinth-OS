@@ -8,7 +8,7 @@
 //!
 //! ## Model
 //!
-//! - `process::CURRENT` keeps its meaning -- the process on the CPU right now
+//! - `process::current()` keeps its meaning -- the process on the CPU right now
 //!   -- so the syscall and fault surfaces are unchanged. The processes that
 //!   are *not* running live in `TABLE` (Ready), with the running one's slot
 //!   holding `None` (its `Process` is in `CURRENT`). A switch moves the
@@ -45,10 +45,12 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::VirtAddr;
 
+use crate::bkl;
 use crate::capability::Capability;
 use crate::gdt;
 use crate::ipc;
 use crate::memory;
+use crate::percpu;
 use crate::process::{self, Process, MAX_BOOT_FRAMES, USER_STACK_TOP};
 use crate::serial;
 use crate::timer;
@@ -74,7 +76,7 @@ pub enum State {
     /// Runnable but not on the CPU; its `Process` and saved context live in
     /// the slot.
     Ready,
-    /// On the CPU right now; its `Process` is in `process::CURRENT` and its
+    /// On the CPU right now; its `Process` is in `process::current()` and its
     /// saved context does not exist yet (it is live in registers).
     Running,
     /// Waiting on an IPC endpoint; out of the round-robin rotation until a
@@ -104,6 +106,13 @@ struct Slot {
     /// plain `send` (which a receiver wakes). Set when blocking, read by the
     /// receiver to decide whether to wake the sender or mint it a reply cap.
     pending_call: bool,
+    /// The core this process is pinned to (Stage B2.3, D5), once claimed.
+    /// `None` while Ready and never yet run -- any core may claim it, which
+    /// sets this exactly once; from then on only that core's claim loop ever
+    /// picks it again (no cross-core migration). Cleared back to `None` when
+    /// the slot is reclaimed at death (`Slot::empty()`), so the next process
+    /// that lands in this slot starts unowned again.
+    owner: Option<u32>,
 }
 
 impl Slot {
@@ -116,6 +125,7 @@ impl Slot {
             pending_msg: 0,
             pending_cap: u64::MAX,
             pending_call: false,
+            owner: None,
         }
     }
 }
@@ -138,11 +148,14 @@ static mut TABLE: [Slot; MAX_PROCESSES] = [const { Slot::empty() }; MAX_PROCESSE
 /// single-CPU + IF=0 discipline as `TABLE`.
 static mut WAIT_LINKS: [Option<usize>; MAX_PROCESSES] = [None; MAX_PROCESSES];
 
-/// Index in TABLE of the process currently on the CPU.
-static mut CURRENT_SLOT: usize = 0;
+/// Index in TABLE of the process currently on each core (Stage B2.3, D6) --
+/// `CURRENT_SLOT[percpu::core_id()]` is the slot for THIS core. Plain Rust
+/// reads/writes only (no naked-asm stub touches this), so an ordinary
+/// per-core array suffices -- no need to live in `percpu::PerCpu`.
+static mut CURRENT_SLOT: [usize; percpu::MAX_CORES] = [0; percpu::MAX_CORES];
 
-/// Ticks accumulated toward the current quantum.
-static mut TICKS_IN_QUANTUM: u64 = 0;
+/// Ticks accumulated toward the current quantum, per core.
+static mut TICKS_IN_QUANTUM: [u64; percpu::MAX_CORES] = [0; percpu::MAX_CORES];
 
 /// True while `run` is driving processes. The death path (process::exit_current)
 /// reads it to choose between scheduling the next process and the synchronous
@@ -181,11 +194,6 @@ pub const GP_RCX: usize = 2;
 pub const GP_RDX: usize = 3;
 pub const GP_RSI: usize = 4;
 pub const GP_RDI: usize = 5;
-
-/// Kernel rsp captured by `sched_start`, restored by `sched_return_to_kernel`
-/// when the last process exits. Single CPU, no nesting.
-#[no_mangle]
-static mut SCHED_ANCHOR: u64 = 0;
 
 global_asm!(
     r#"
@@ -261,13 +269,17 @@ sched_start:
     // rdi = first process's kernel rsp. Save the kernel anchor (callee-saved
     // + rsp) so sched_return_to_kernel can come back here, then enter the
     // first process via the shared restore. Mirrors enter_user_asm.
+    // gs:[{sched_anchor}] is PerCpu::sched_anchor (percpu.rs) -- per-core
+    // (Stage B2.3, D6) so two cores each driving their own claim loop don't
+    // share an anchor; GS_BASE points at THIS core's slot (percpu::init),
+    // set up before either of these is ever reached.
     push rbx
     push rbp
     push r12
     push r13
     push r14
     push r15
-    mov [rip + SCHED_ANCHOR], rsp
+    mov gs:[{sched_anchor}], rsp
     jmp sched_resume    // rdi already holds the first kernel rsp
 
 .global sched_return_to_kernel
@@ -275,7 +287,7 @@ sched_return_to_kernel:
     // rdi = value sched_start returns. Restore the anchor saved above and
     // return to sched_start's caller as if it returned normally. Mirrors
     // kernel_resume.
-    mov rsp, [rip + SCHED_ANCHOR]
+    mov rsp, gs:[{sched_anchor}]
     mov rax, rdi
     pop r15
     pop r14
@@ -284,7 +296,8 @@ sched_return_to_kernel:
     pop rbp
     pop rbx
     ret
-"#
+"#,
+    sched_anchor = const percpu::SCHED_ANCHOR_OFFSET,
 );
 
 extern "C" {
@@ -330,6 +343,28 @@ fn states() -> [State; MAX_PROCESSES] {
     s
 }
 
+/// `states()`, but as seen by core `me` (Stage B2.3, D5): a Ready slot
+/// already pinned to a DIFFERENT core is hidden from `pick_next`'s pure
+/// round-robin -- presented as `Running` (in use, just not by `me`) rather
+/// than a new `State` variant, since `pick_next` only ever branches on
+/// `== State::Ready`. An unowned slot, or one already `me`'s own, is left
+/// genuinely `Ready`. Keeps `pick_next` itself untouched and still pure/
+/// tested against plain `[State; N]` arrays.
+fn states_for(me: u32) -> [State; MAX_PROCESSES] {
+    let mut s = states();
+    // SAFETY: scalar reads of the single-CPU-per-core table; the BKL is held
+    // by every caller.
+    unsafe {
+        let table = &*addr_of!(TABLE);
+        for i in 0..MAX_PROCESSES {
+            if s[i] == State::Ready && table[i].owner.is_some_and(|o| o != me) {
+                s[i] = State::Running;
+            }
+        }
+    }
+    s
+}
+
 /// Round-robin policy: the next `Ready` slot strictly after `current`
 /// (wrapping), or `None` if no other process is runnable. Pure -- unit-tested
 /// without any hardware (see tests/scheduler.rs).
@@ -349,12 +384,13 @@ pub fn pick_next(slots: &[State; MAX_PROCESSES], current: usize) -> Option<usize
 /// Account one tick against the quantum; return whether it expired (and reset
 /// it if so).
 fn quantum_expired() -> bool {
-    // SAFETY: scalar RMW of a single-CPU static, reached only from the timer
-    // handler (IF=0).
+    // SAFETY: this core's own slot (percpu::core_id); reached only from its
+    // own timer handler (IF=0), never aliased by another core.
     unsafe {
-        TICKS_IN_QUANTUM += 1;
-        if TICKS_IN_QUANTUM >= QUANTUM {
-            TICKS_IN_QUANTUM = 0;
+        let slot = &mut (*addr_of_mut!(TICKS_IN_QUANTUM))[percpu::core_id()];
+        *slot += 1;
+        if *slot >= QUANTUM {
+            *slot = 0;
             true
         } else {
             false
@@ -367,6 +403,12 @@ fn quantum_expired() -> bool {
 /// or the next process's saved frame (switch).
 #[no_mangle]
 extern "C" fn timer_tick(frame: *const TrapFrame) -> u64 {
+    // BKL (D4): this function never diverges -- every path below is a
+    // normal Rust return, and the stub's iretq runs only after we return --
+    // so acquiring once at the top and releasing before each return
+    // correctly brackets the whole body (see bkl.rs).
+    bkl::acquire();
+
     timer::note_tick();
     crate::irq::eoi(0); // acknowledge IRQ0 at the interrupt controller
 
@@ -378,22 +420,28 @@ extern "C" fn timer_tick(frame: *const TrapFrame) -> u64 {
     // quantum is up. (Counting the quantum regardless of CPL is fine; kernel
     // ticks are rare and never switch.)
     if !from_user || !quantum_expired() {
+        unsafe { bkl::release() };
         return frame as u64;
     }
 
-    let cur = unsafe { CURRENT_SLOT };
-    let Some(next) = pick_next(&states(), cur) else {
+    let me = unsafe { percpu::core_id() as u32 };
+    let cur = unsafe { (*addr_of!(CURRENT_SLOT))[me as usize] };
+    // Filtered by ownership (Stage B2.3, D5): never preempt onto a process
+    // pinned to a different core.
+    let Some(next) = pick_next(&states_for(me), cur) else {
         // Nobody else is runnable (e.g. the synchronous demos, where the
         // table is empty): keep running this process. This is exactly the
         // Stage-1 "count and return" behavior.
+        unsafe { bkl::release() };
         return frame as u64;
     };
 
     // Suspend the running process into its slot, with its saved context.
-    // SAFETY: single CPU, IF=0; CURRENT holds the running process and no lock
-    // is held across the return (the stub does the iretq after we return).
+    // SAFETY: the BKL (D4) is held; CURRENT holds the running process and no
+    // other lock is held across the return (the stub does the iretq after we
+    // return).
     unsafe {
-        let running = process::CURRENT
+        let running = process::current()
             .lock()
             .take()
             .expect("CURRENT vanished under the scheduler");
@@ -401,6 +449,11 @@ extern "C" fn timer_tick(frame: *const TrapFrame) -> u64 {
         table[cur].kernel_rsp = frame as u64;
         table[cur].process = Some(running);
         table[cur].state = State::Ready;
+        // D5: claim `next` for this core the first time anyone runs it; once
+        // owned, it never moves to a different core.
+        if table[next].owner.is_none() {
+            table[next].owner = Some(me);
+        }
 
         // Resume the next process.
         let nproc = table[next]
@@ -410,10 +463,11 @@ extern "C" fn timer_tick(frame: *const TrapFrame) -> u64 {
         table[next].state = State::Running;
         let next_rsp = table[next].kernel_rsp;
         let next_l4 = nproc.l4;
-        *process::CURRENT.lock() = Some(nproc);
-        CURRENT_SLOT = next;
+        *process::current().lock() = Some(nproc);
+        (*addr_of_mut!(CURRENT_SLOT))[me as usize] = next;
         memory::switch_to(next_l4);
         gdt::set_kernel_stack(kstack_top(next));
+        bkl::release();
         next_rsp
     }
 }
@@ -427,6 +481,7 @@ fn setup_process(
     binary: &[u8],
     phys_offset: u64,
     caps: &[Option<Capability>],
+    notify: bool,
 ) -> Result<(), &'static str> {
     let l4 = memory::create_address_space()?;
     let mut boot_frames: [Option<(u64, u64)>; MAX_BOOT_FRAMES] = [None; MAX_BOOT_FRAMES];
@@ -464,6 +519,17 @@ fn setup_process(
         table[id].kernel_rsp = kernel_rsp;
         table[id].state = State::Ready;
     }
+    // New Ready work is unowned (Stage B2.3, D5) until some core's claim
+    // loop picks it up, so wake every other online core out of `hlt` to go
+    // look -- it may otherwise sleep forever never noticing. The caller
+    // (run(), spawn()) holds the BKL across this whole function, same as
+    // every other TABLE write. `run()` sets up several processes per call;
+    // its caller sends one IPI after the whole batch instead of one per
+    // process (notify=false here) to avoid issuing several ICR sends back
+    // to back with no gap.
+    if notify {
+        crate::irq::send_reschedule_ipi();
+    }
     Ok(())
 }
 
@@ -496,31 +562,52 @@ pub fn run(label: &str, binaries: &[&[u8]], phys_offset: u64, extra: &[Option<Ca
     let count = binaries.len().min(MAX_PROCESSES);
     let _ = writeln!(serial, "plinth: {label}: {count} processes");
 
+    // BKL (D4): `run` is boot-driving code, not a dispatch body, so nothing
+    // holds the lock when it is called -- it acquires its own, covering the
+    // setup loop and the inline slot-0 claim below (both touch TABLE, which
+    // an AP's claim loop may be reading/writing concurrently, Stage B2.3),
+    // and releases it right before sched_start hands off to ring 3.
+    bkl::acquire();
+
     for (id, binary) in binaries.iter().take(count).enumerate() {
         let grant = extra.get(id).copied().flatten();
-        if let Err(e) = setup_process(id, binary, phys_offset, &[grant]) {
+        if let Err(e) = setup_process(id, binary, phys_offset, &[grant], false) {
             let _ = writeln!(serial, "plinth: {label}: setup of process {id} failed: {e}");
             // Reclaim whatever was set up before aborting the demo.
             teardown_all();
+            unsafe { bkl::release() };
             return;
         }
+    }
+    // One IPI for the whole batch (not one per process, Stage B2.3): slots
+    // 1..count are unowned Ready work an idle AP may claim; slot 0 is about
+    // to be claimed inline below, so it needs no IPI of its own.
+    if count > 1 {
+        crate::irq::send_reschedule_ipi();
     }
 
     SCHEDULER_ACTIVE.store(true, Ordering::Relaxed);
 
     // Install the first process as CURRENT and enter it. sched_start returns
     // only once every process has exited (via on_exit -> sched_return_to_kernel).
-    // SAFETY: slot 0 was just set up Ready; single CPU, IF=0 here.
+    // SAFETY: slot 0 was just set up Ready; the BKL is held, IF=0 here.
     unsafe {
+        let me = percpu::core_id() as u32;
         let table = &mut *addr_of_mut!(TABLE);
         let proc = table[0].process.take().expect("first slot has no process");
         table[0].state = State::Running;
+        table[0].owner = Some(me); // D5: this core claims slot 0 outright
         let rsp = table[0].kernel_rsp;
         let l4 = proc.l4;
-        *process::CURRENT.lock() = Some(proc);
-        CURRENT_SLOT = 0;
+        *process::current().lock() = Some(proc);
+        (*addr_of_mut!(CURRENT_SLOT))[me as usize] = 0;
+        // This core now has a valid sched_anchor (sched_start sets it next) --
+        // record it once, so on_exit/switch_to_next can tell this core apart
+        // from an AP that has none to longjmp back through.
+        (*addr_of_mut!(IS_LAUNCHER))[me as usize] = true;
         memory::switch_to(l4);
         gdt::set_kernel_stack(kstack_top(0));
+        bkl::release();
         sched_start(rsp);
     }
 
@@ -536,12 +623,12 @@ pub fn run(label: &str, binaries: &[&[u8]], phys_offset: u64, extra: &[Option<Ca
 /// `process::exit_current` for every scheduled-process death (exit, fault,
 /// budget overdraw). Never returns to its caller.
 pub fn on_exit() -> ! {
-    let cur = unsafe { CURRENT_SLOT };
+    let cur = unsafe { (*addr_of!(CURRENT_SLOT))[percpu::core_id()] };
 
     // Take the dying process out of CURRENT and reclaim it. Move to the kernel
     // address space first so destroy_address_space tears down tables that are
     // no longer the active CR3.
-    let proc = process::CURRENT
+    let proc = process::current()
         .lock()
         .take()
         .expect("no CURRENT process at exit");
@@ -566,60 +653,139 @@ pub fn on_exit() -> ! {
         (*addr_of_mut!(WAIT_LINKS))[cur] = None;
     }
 
-    // The current process is gone, so when nothing else is runnable it means
-    // every process has exited -> return to the launcher.
-    unsafe { switch_to_next(LauncherOnIdle::Return) }
+    // The current process is gone; switch_to_next decides what "nothing else
+    // claimable" means from here (launcher vs. AP, table empty vs. other
+    // cores' work still live -- see NoWorkAction's doc).
+    unsafe { switch_to_next(NoWorkAction::ExitedReturnIfDone) }
 }
 
-/// What to do when no process is runnable after the current one leaves the CPU.
-enum LauncherOnIdle {
-    /// Every process has exited -> return from `run` (used by `on_exit`).
-    Return,
-    /// The current process blocked but is still live -> nobody can run, which
-    /// for a CPU-bound IPC system means a genuine deadlock (used by
-    /// `block_current`).
-    Deadlock,
+/// True once `run` has called `sched_start` on this core, i.e. this core has
+/// a valid `sched_anchor` to longjmp back to via `sched_return_to_kernel`
+/// (Stage B2.3). Only ever the BSP today -- `run` is BSP-only -- but tracked
+/// per-core, set once and never cleared, rather than hardcoded: this is what
+/// `switch_to_next` checks to tell "the core driving `run`, with everything
+/// now exited" apart from "an AP whose own current process just exited, with
+/// nothing else for it to claim right now" -- the latter has no anchor to
+/// return to and must keep idling instead (a real bug found by booting this:
+/// an AP that wrongly took the `Return` path longjmped through its unset
+/// (zero) anchor and corrupted its stack).
+static mut IS_LAUNCHER: [bool; percpu::MAX_CORES] = [false; percpu::MAX_CORES];
+
+/// What "nothing left for THIS core to claim" should do once `switch_to_next`
+/// confirms it (no Ready/claimable slot, no input/disk waiter to justify
+/// `idle_until_runnable`). Resolved against two further facts at the point of
+/// idling, both of which can change between when the caller decided which
+/// variant to pass and when this is actually evaluated (Stage B2.3 is
+/// genuinely concurrent): whether THIS core is the launcher
+/// (`IS_LAUNCHER`), and whether the table is truly empty everywhere
+/// (`table_entirely_empty`) -- another core's still-live process might yet
+/// wake this one.
+enum NoWorkAction {
+    /// Reached from `on_exit`. If the table is now empty everywhere, every
+    /// process has truly exited: the launcher returns to `run`'s caller; any
+    /// other core (an AP) has nothing to return to and just keeps idling --
+    /// it may pick up the next demo's work later.
+    ExitedReturnIfDone,
+    /// Reached from `block_current`. If the table is empty everywhere, this
+    /// process's block can never be satisfied: a genuine deadlock. Otherwise
+    /// some other core's live process might still wake it via `wake_with` --
+    /// not (yet) a deadlock, keep idling.
+    BlockedDeadlockIfNoOtherWork,
 }
 
-/// Pick the next Ready process and resume it, or handle the no-runnable case
-/// per `on_idle`. Shared by `on_exit` and `block_current`; never returns.
+/// True if every slot is Empty -- nothing alive anywhere, on any core, used
+/// to tell a genuine system-wide deadlock/completion apart from "just
+/// nothing claimable by ME right now" (Stage B2.3: another core's live
+/// process may still resolve the situation).
+fn table_entirely_empty() -> bool {
+    // SAFETY: scalar reads of the table; the BKL is held by every caller.
+    unsafe { (*addr_of!(TABLE)).iter().all(|s| s.state == State::Empty) }
+}
+
+/// Pick the next Ready process this core may claim and resume it, or handle
+/// the no-work case per `on_idle` (see `NoWorkAction`). Shared by `on_exit`
+/// and `block_current`; never returns.
 ///
 /// # Safety
 /// Caller must have already removed the leaving process from `CURRENT` (taken
-/// it for teardown, or parked it in its slot as Blocked) and must hold no
-/// locks.
-unsafe fn switch_to_next(on_idle: LauncherOnIdle) -> ! {
-    let cur = CURRENT_SLOT;
-    match pick_next(&states(), cur) {
-        Some(next) => resume_process(next),
-        None => {
-            // Nothing runnable. A process blocked on EXTERNAL input or on disk
-            // I/O is not a deadlock -- a keystroke or a virtio completion IRQ can
-            // still arrive -- so idle and wait for it rather than treat it as a
-            // stuck system. (An IPC block with no possible peer is the genuine
-            // deadlock the block-time liveness check already guards; the panic
-            // below is reached only when nothing external can ever wake anyone.)
-            let input_waiter = crate::input::any_waiter();
-            if input_waiter || crate::virtio_blk::any_waiter() {
-                // Deterministic delivery for headless smoke: if a synthetic
-                // keyboard event is armed, deliver it now (it wakes the blocked
-                // reader). Real keystrokes -- and every disk completion -- arrive
-                // via their device IRQ during the idle below.
-                if input_waiter {
-                    crate::input::deliver_synthetic();
+/// it for teardown, or parked it in its slot as Blocked), must hold the BKL
+/// (D4), and must hold no other locks.
+unsafe fn switch_to_next(on_idle: NoWorkAction) -> ! {
+    let me = percpu::core_id() as u32;
+    loop {
+        let cur = CURRENT_SLOT[me as usize];
+        // Filtered by ownership (D5): never pick up a process pinned elsewhere.
+        let states = states_for(me);
+        if let Some(next) = pick_next(&states, cur) {
+            resume_process(next); // never returns
+        }
+
+        // pick_next deliberately never returns `cur` itself (round-robin
+        // fairness when there IS other Ready work). But the process that
+        // just left `cur` -- blocked, not exited -- can be woken right back
+        // to Ready by a peer's `wake_with` before we even reach here, or
+        // while we wait below, and on a different core that peer may be the
+        // only thing that will ever wake us (Stage B2.3: a bug found by
+        // booting this -- a process blocked on a peer owned by another core
+        // hung forever, because this case fell through to the generic wait
+        // below and every later retry kept asking pick_next, which kept
+        // skipping `cur`). `on_exit` already emptied `cur`'s slot before
+        // calling here, so this is harmless (always false) on that path.
+        if states[cur] == State::Ready {
+            resume_process(cur); // never returns
+        }
+
+        // Nothing claimable BY ME. A process blocked on EXTERNAL input or on
+        // disk I/O is not a deadlock -- a keystroke or a virtio completion
+        // IRQ can still arrive -- so idle and wait for it rather than treat
+        // it as stuck.
+        let input_waiter = crate::input::any_waiter();
+        if input_waiter || crate::virtio_blk::any_waiter() {
+            // Deterministic delivery for headless smoke: if a synthetic
+            // keyboard event is armed, deliver it now (it wakes the blocked
+            // reader). Real keystrokes -- and every disk completion -- arrive
+            // via their device IRQ during the idle below.
+            if input_waiter {
+                crate::input::deliver_synthetic();
+            }
+            idle_until_runnable(); // never returns
+        }
+
+        if table_entirely_empty() {
+            match (on_idle, IS_LAUNCHER[me as usize]) {
+                // SAFETY: sched_start saved the anchor before entering the
+                // first process, and its stack frame is still live.
+                (NoWorkAction::ExitedReturnIfDone, true) => {
+                    // BKL (D4): returning to `run`'s caller, ordinary
+                    // (non-dispatch) boot-sequence code -- release before
+                    // this longjmp, the same as the ring-3 chokepoint in
+                    // resume_process.
+                    bkl::release();
+                    sched_return_to_kernel(0); // never returns
                 }
-                idle_until_runnable()
-            } else {
-                match on_idle {
-                    // SAFETY: sched_start saved the anchor before entering the
-                    // first process, and its stack frame is still live.
-                    LauncherOnIdle::Return => sched_return_to_kernel(0),
-                    LauncherOnIdle::Deadlock => {
-                        panic!("scheduler: every process is blocked (IPC deadlock)")
-                    }
+                (NoWorkAction::ExitedReturnIfDone, false) => {
+                    // Not the launcher -- no anchor to return to, and the
+                    // table really is empty, so there is nothing to claim
+                    // either; park exactly like any other idle core.
+                    bkl::release();
+                    ap_idle_loop(); // never returns
+                }
+                (NoWorkAction::BlockedDeadlockIfNoOtherWork, _) => {
+                    // Panics, halting the system -- no release needed.
+                    panic!("scheduler: every process is blocked (IPC deadlock)")
                 }
             }
         }
+
+        // Other cores still have live work (Stage B2.3): not (yet) a
+        // deadlock and not done -- wait for a wake (reschedule IPI or device
+        // IRQ) and recheck from the top, the same idle discipline as
+        // `idle_until_runnable`, just without that path's precondition of
+        // already having a blocked input/disk waiter to justify the wait.
+        bkl::release();
+        x86_64::instructions::interrupts::enable_and_hlt();
+        x86_64::instructions::interrupts::disable();
+        bkl::acquire();
     }
 }
 
@@ -628,17 +794,32 @@ unsafe fn switch_to_next(on_idle: LauncherOnIdle) -> ! {
 /// returns. Shared by the normal pick and the idle-on-input loop.
 ///
 /// # Safety
-/// `next` must name a Ready slot holding a process; the caller holds no locks.
+/// `next` must name a Ready slot holding a process; the caller holds the BKL
+/// and no other locks.
 unsafe fn resume_process(next: usize) -> ! {
+    let me = percpu::core_id() as u32;
     let table = &mut *addr_of_mut!(TABLE);
+    // D5: claim `next` for this core the first time anyone runs it; once
+    // owned, it never moves to a different core. (A no-op if `next` is
+    // already `me`'s own, e.g. a process this core blocked and is now
+    // resuming.)
+    if table[next].owner.is_none() {
+        table[next].owner = Some(me);
+    }
     let nproc = table[next].process.take().expect("Ready slot has no process");
     table[next].state = State::Running;
     let rsp = table[next].kernel_rsp;
     let l4 = nproc.l4;
-    *process::CURRENT.lock() = Some(nproc);
-    CURRENT_SLOT = next;
+    *process::current().lock() = Some(nproc);
+    CURRENT_SLOT[me as usize] = next;
     memory::switch_to(l4);
     gdt::set_kernel_stack(kstack_top(next));
+    // BKL (D4): about to iretq into ring 3 via sched_resume, which never
+    // returns and never runs Drop -- release here, the one chokepoint every
+    // "switch to a Ready process" path (on_exit, block_current,
+    // idle_until_runnable, timer_tick's own inline switch is separate) funnels
+    // through.
+    bkl::release();
     sched_resume(rsp)
 }
 
@@ -650,31 +831,48 @@ unsafe fn resume_process(next: usize) -> ! {
 /// caller before we get here. Never returns.
 ///
 /// # Safety
-/// The caller holds no locks; a process is blocked on input, so a wake is
-/// possible (otherwise this idles forever, which is correct -- the system is
-/// waiting for a keystroke).
+/// The caller holds the BKL (D4) and no other locks; a process is blocked on
+/// input, so a wake is possible (otherwise this idles forever, which is
+/// correct -- the system is waiting for a keystroke).
 unsafe fn idle_until_runnable() -> ! {
+    let me = percpu::core_id() as u32;
     loop {
         // A delivery (synthetic, or a keyboard IRQ on a prior iteration) may have
         // made a reader Ready -- including the one in CURRENT_SLOT, which
-        // pick_next skips, so scan for any Ready slot.
-        if let Some(next) = first_ready_slot() {
+        // pick_next skips, so scan for any Ready slot this core may claim
+        // (unowned, or already its own -- D5).
+        if let Some(next) = first_claimable_slot(me) {
             resume_process(next);
         }
-        // Nothing Ready yet: enable interrupts and halt as one atomic step
-        // (sti;hlt -- no wakeup lost between them); a device IRQ wakes us, then
-        // we re-disable and re-check.
+        // BKL (D4): the lock must NOT be held while halted -- a device IRQ's
+        // handler (keyboard_interrupt, blk_interrupt_*) needs to acquire it to
+        // record the event/completion that wakes us, and (from B2.3) another
+        // core needs it to schedule. Release before the wait, re-acquire
+        // before touching TABLE again on the next iteration.
+        unsafe { bkl::release() };
+        // Enable interrupts and halt as one atomic step (sti;hlt -- no wakeup
+        // lost between them); a device IRQ wakes us, then we re-disable and
+        // re-check.
         x86_64::instructions::interrupts::enable_and_hlt();
         x86_64::instructions::interrupts::disable();
+        bkl::acquire();
     }
 }
 
-/// Index of the first Ready slot, if any. Unlike `pick_next` (round-robin, which
-/// skips the current slot), this includes the current slot -- the idle loop must
-/// resume a reader that blocked and was just woken in place.
-fn first_ready_slot() -> Option<usize> {
-    // SAFETY: scalar reads of the single-CPU table.
-    unsafe { (*addr_of!(TABLE)).iter().position(|s| s.state == State::Ready) }
+/// Index of the first Ready slot core `me` may claim -- unowned, or already
+/// its own (Stage B2.3, D5: never a process pinned to a different core).
+/// Unlike `pick_next` (round-robin, which skips the current slot), this
+/// includes the current slot -- the idle loop must resume a reader that
+/// blocked and was just woken in place. Shared by `idle_until_runnable`
+/// (must already have a reason to wait -- a blocked input/disk waiter) and
+/// `ap_idle_loop` (waits for any claimable work at all).
+fn first_claimable_slot(me: u32) -> Option<usize> {
+    // SAFETY: scalar reads of the table; the BKL is held by every caller.
+    unsafe {
+        (*addr_of!(TABLE))
+            .iter()
+            .position(|s| s.state == State::Ready && s.owner.is_none_or(|o| o == me))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -683,10 +881,10 @@ fn first_ready_slot() -> Option<usize> {
 // the intrusive wait-queue links (which live in the slots).
 // ---------------------------------------------------------------------------
 
-/// Index of the process currently on the CPU.
+/// Index of the process currently on THIS core.
 pub fn current_slot() -> usize {
-    // SAFETY: scalar read of a single-CPU static.
-    unsafe { CURRENT_SLOT }
+    // SAFETY: this core's own slot (percpu::core_id).
+    unsafe { CURRENT_SLOT[percpu::core_id()] }
 }
 
 /// Run `f` with the wait-queue link array, so the IPC layer can drive its pure
@@ -740,7 +938,8 @@ pub fn is_blocked(slot: usize) -> bool {
 /// treats rsi/rdx as clobbered).
 pub fn wake_with(slot: usize, status: u64, payload: u64, landing: u64) {
     // SAFETY: the slot is Blocked, so its kernel_rsp points at a valid saved
-    // trap frame on its own (live) kernel stack; single CPU, IF=0.
+    // trap frame on its own (live) kernel stack; the BKL (D4) is held by
+    // every caller.
     unsafe {
         let table = &mut *addr_of_mut!(TABLE);
         let frame = table[slot].kernel_rsp as *mut TrapFrame;
@@ -749,6 +948,13 @@ pub fn wake_with(slot: usize, status: u64, payload: u64, landing: u64) {
         (*frame).gp[GP_RDX] = landing;
         table[slot].state = State::Ready;
     }
+    // The slot was already owned (only a Running process can have blocked)
+    // (Stage B2.3, D5) -- its owning core may be halted waiting for exactly
+    // this; wake every other online core out of `hlt` to go check. Slightly
+    // wasteful (only the owner cares) but simple and correct; targeted IPIs
+    // are a B3-style optimization, not needed before there is evidence this
+    // contends.
+    crate::irq::send_reschedule_ipi();
 }
 
 /// Mint `cap` into the table of the Blocked process at `slot`; returns its
@@ -784,11 +990,12 @@ pub fn revoke_from_blocked(slot: usize, cap_slot: usize) -> Option<Capability> {
 /// Never returns to its caller; the process resumes later via `wake_with` +
 /// the scheduler picking it up.
 pub fn block_current(frame_ptr: u64) -> ! {
-    // SAFETY: reached from the IPC interrupt handler with IF=0 and no locks
-    // held; CURRENT holds the running process.
+    // SAFETY: reached from the IPC interrupt handler with IF=0, the BKL (D4)
+    // held (acquired by ipc_dispatch) and no other locks; CURRENT holds the
+    // running process.
     unsafe {
-        let cur = CURRENT_SLOT;
-        let running = process::CURRENT
+        let cur = CURRENT_SLOT[percpu::core_id()];
+        let running = process::current()
             .lock()
             .take()
             .expect("no CURRENT process to block");
@@ -796,7 +1003,7 @@ pub fn block_current(frame_ptr: u64) -> ! {
         table[cur].kernel_rsp = frame_ptr;
         table[cur].process = Some(running);
         table[cur].state = State::Blocked;
-        switch_to_next(LauncherOnIdle::Deadlock)
+        switch_to_next(NoWorkAction::BlockedDeadlockIfNoOtherWork)
     }
 }
 
@@ -808,7 +1015,7 @@ pub fn block_current(frame_ptr: u64) -> ! {
 /// nesting.
 pub fn spawn(binary: &[u8], phys_offset: u64, caps: &[Option<Capability>]) -> Option<usize> {
     let id = find_free_slot()?;
-    setup_process(id, binary, phys_offset, caps).ok()?;
+    setup_process(id, binary, phys_offset, caps, true).ok()?;
     Some(id)
 }
 
@@ -822,7 +1029,8 @@ fn find_free_slot() -> Option<usize> {
 /// on the setup-failure path, where nothing has run yet, so each slot still
 /// holds its `Process` and `boot_frames`.
 fn teardown_all() {
-    // SAFETY: single CPU, IF=0; nothing is running.
+    // SAFETY: the BKL (D4) is held by `run` (its only caller); nothing is
+    // running yet.
     unsafe {
         let table = &mut *addr_of_mut!(TABLE);
         for slot in table.iter_mut() {
@@ -834,5 +1042,35 @@ fn teardown_all() {
             *slot = Slot::empty();
         }
         *addr_of_mut!(WAIT_LINKS) = [None; MAX_PROCESSES];
+    }
+}
+
+/// Loop forever, claiming and running any Ready process this core may claim
+/// (unowned, or already its own -- D5), halting between attempts. Entered by
+/// every AP once its per-core infrastructure is up (Stage B2.3,
+/// `smp.rs::ap_entry64`); the BSP reaches the same claim logic through
+/// `switch_to_next`'s existing idle path once `run`'s own initial slot has
+/// exited. Unlike `idle_until_runnable` (which requires an existing blocked
+/// input/disk waiter to justify waiting, else it would mask a genuine
+/// deadlock), this is a true idle task: an AP with nothing claimable yet is
+/// not a deadlock, just an idle core, so it waits unconditionally for the
+/// next reschedule IPI (`setup_process`/`wake_with`) or device IRQ. Never
+/// returns.
+pub fn ap_idle_loop() -> ! {
+    // SAFETY: percpu::init has already run on this core (smp.rs, before this
+    // is reached).
+    let me = unsafe { percpu::core_id() as u32 };
+    loop {
+        bkl::acquire();
+        // SAFETY: the BKL is held; `next` is freshly looked up under it.
+        if let Some(next) = first_claimable_slot(me) {
+            unsafe { resume_process(next) }; // never returns
+        }
+        // BKL (D4): release before halting, same discipline as
+        // idle_until_runnable -- another core (or this core's own later
+        // wake) needs the lock free to make progress while we wait.
+        unsafe { bkl::release() };
+        x86_64::instructions::interrupts::enable_and_hlt();
+        x86_64::instructions::interrupts::disable();
     }
 }

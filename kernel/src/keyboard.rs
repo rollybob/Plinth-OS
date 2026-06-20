@@ -17,6 +17,7 @@ use core::fmt::Write;
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
+use crate::bkl;
 use crate::input::{self, Event};
 use crate::irq;
 
@@ -101,12 +102,16 @@ pub fn selftest<W: Write>(out: &mut W) -> bool {
 
 /// IRQ1 handler: read the scancode and record it. An interrupt gate clears IF,
 /// so this runs non-preemptibly and the event ring needs no further locking.
+/// BKL (D4): acquired/released around the body -- `input::record` can call
+/// `scheduler::wake_with`, which touches the scheduler table.
 extern "x86-interrupt" fn keyboard_interrupt(_frame: InterruptStackFrame) {
+    bkl::acquire();
     // SAFETY: reached only on IRQ1 with IF=0; reading the i8042 data port
     // consumes the pending byte (and lets the controller deliver the next one).
     let scancode = unsafe { Port::<u8>::new(PS2_DATA).read() };
     input::record(input::SOURCE_KEYBOARD, Event::key(scancode));
     irq::eoi(1);
+    unsafe { bkl::release() };
 }
 
 // --- bounded i8042 access helpers ---

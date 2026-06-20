@@ -224,7 +224,7 @@ pub fn event_recv(source_slot: u64, frame_ptr: u64) -> u64 {
 /// held across a later block. A non-`EventSource` cap (or one without the read
 /// right, or naming an unknown source) yields None -- the multiplexing gate.
 fn source_for(slot: u64) -> Option<usize> {
-    let guard = process::CURRENT.lock();
+    let guard = process::current().lock();
     let cap = guard.as_ref()?.caps.lookup(slot as usize, RIGHT_READ).ok()?;
     match cap.object {
         CapObject::EventSource { id } if (id as usize) < N_SOURCES => Some(id as usize),

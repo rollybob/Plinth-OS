@@ -130,7 +130,20 @@ impl Process {
     }
 }
 
-pub static CURRENT: Mutex<Option<Process>> = Mutex::new(None);
+/// The process on each core right now (Stage B2.3, D6): one slot per
+/// possible core, so two cores never alias the same `Option<Process>`.
+/// Reached only through `current()`, never indexed directly -- the whole
+/// point is that a caller never has to know its own core id to find it.
+static CURRENT: [Mutex<Option<Process>>; crate::percpu::MAX_CORES] =
+    [const { Mutex::new(None) }; crate::percpu::MAX_CORES];
+
+/// The process on THIS core right now.
+pub fn current() -> &'static Mutex<Option<Process>> {
+    // SAFETY: percpu::init has already run on every core by the time any
+    // process exists for current() to find (boot for the BSP, AP bring-up
+    // for an AP -- both happen before scheduling starts).
+    &CURRENT[unsafe { crate::percpu::core_id() }]
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -265,13 +278,23 @@ pub fn spawn_process(transferred: Option<Capability>) -> Process {
 pub fn exit_current(value: u64) -> ! {
     if crate::scheduler::active() {
         // The scheduler surfaces a process's result via IPC, not this exit
-        // code (Stage 1); reclaim it and run the next process.
+        // code (Stage 1); reclaim it and run the next process. on_exit
+        // releases the BKL (D4) at its own chokepoint (resume_process /
+        // switch_to_next), once the scheduled switch is decided.
         crate::scheduler::on_exit()
     } else {
+        // BKL (D4): the synchronous (pre-scheduler demo) exit path -- this
+        // longjmp returns control to `process::run`'s caller, ordinary
+        // boot-sequence code, so the lock must be released before it, the
+        // same as the scheduled exit path's chokepoint.
+        //
         // SAFETY: every caller reaches this with user code (or its fault
         // handler) on the CPU and the synchronous kernel context live; no
         // locks are held.
-        unsafe { usermode::kernel_resume(value) }
+        unsafe {
+            crate::bkl::release();
+            usermode::kernel_resume(value)
+        }
     }
 }
 
@@ -293,14 +316,14 @@ pub fn run(binary: &[u8], phys_offset: u64) -> Result<Outcome, &'static str> {
 
     let mut proc = spawn_process(None);
     proc.l4 = l4;
-    *CURRENT.lock() = Some(proc);
+    *current().lock() = Some(proc);
 
     // Run under the process's own address space; locks are all released here.
     memory::switch_to(l4);
     let raw = usermode::enter_user(entry, USER_STACK_TOP);
     memory::switch_to_kernel();
 
-    let proc = CURRENT.lock().take().expect("CURRENT vanished during user execution");
+    let proc = current().lock().take().expect("CURRENT vanished during user execution");
     teardown(proc, &boot_frames);
     memory::destroy_address_space(l4);
 
