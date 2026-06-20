@@ -6,6 +6,16 @@ plinth: frame allocator ready
 plinth: GDT + TSS loaded
 plinth: IDT loaded
 plinth: syscall interface ready
+
+# ACPI MADT discovery (broader hardware, Stage A1): parse the RSDP -> XSDT ->
+# MADT for the CPU + interrupt-controller topology. Pure discovery -- the 8259
+# PIC still drives interrupts; this only reports what an APIC bring-up (Stage A2)
+# will consume. Only the stable count summary is asserted: the per-entry detail
+# lines (LAPIC base, I/O APIC base/GSI, source overrides) carry addresses that
+# can shift across QEMU versions, so they are skipped like the PCI BAR lines.
+# Counts are stable under the -smp 1 q35 smoke config: 1 CPU, 1 I/O APIC.
+plinth: acpi: 1 cpu(s), 1 ioapic(s)
+
 plinth: timer armed
 
 # Console input bring-up (Stage 1): the i8042 keyboard comes up as the first

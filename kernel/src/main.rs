@@ -9,6 +9,10 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+// ACPI MADT discovery (Stage A1 of broader hardware) runs only on the userspace
+// boot path; the test build stops before it, so silence dead-code noise there.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod acpi;
 mod capability;
 // The ELF loader's parser is exercised by the test suite, but its mapping
 // helpers are only reached from the userspace boot path; silence their
@@ -153,6 +157,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ];
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
+
+        // Discover the CPU + interrupt-controller topology from ACPI (Stage A1
+        // of broader hardware): parse the MADT for the Local APIC base, the I/O
+        // APIC(s), the CPU/AP APIC ids, and the ISA->GSI interrupt source
+        // overrides. Pure discovery -- the 8259 PIC still drives interrupts
+        // (irq::init below); the LAPIC + I/O APIC bring-up that consumes this map
+        // is Stage A2. Reads firmware tables through the phys-offset window.
+        acpi::init(&mut serial, boot_info.rsdp_addr.into_option(), phys_offset);
 
         // Initialise the interrupt controller (remap the PIC off the exception
         // vectors, mask every line); devices unmask their own line as they arm.
