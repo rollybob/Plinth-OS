@@ -158,17 +158,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
 
-        // Discover the CPU + interrupt-controller topology from ACPI (Stage A1
-        // of broader hardware): parse the MADT for the Local APIC base, the I/O
+        // Discover the CPU + interrupt-controller topology from ACPI (broader
+        // hardware, Stage A1): parse the MADT for the Local APIC base, the I/O
         // APIC(s), the CPU/AP APIC ids, and the ISA->GSI interrupt source
-        // overrides. Pure discovery -- the 8259 PIC still drives interrupts
-        // (irq::init below); the LAPIC + I/O APIC bring-up that consumes this map
-        // is Stage A2. Reads firmware tables through the phys-offset window.
-        acpi::init(&mut serial, boot_info.rsdp_addr.into_option(), phys_offset);
+        // overrides. Reads firmware tables through the phys-offset window; returns
+        // the topology the interrupt controller consumes below.
+        let topology = acpi::init(&mut serial, boot_info.rsdp_addr.into_option(), phys_offset);
 
-        // Initialise the interrupt controller (remap the PIC off the exception
-        // vectors, mask every line); devices unmask their own line as they arm.
-        irq::init();
+        // Initialise the interrupt controller (broader hardware, Stage A2). With
+        // an ACPI topology this brings up the LAPIC + I/O APIC and retires the
+        // 8259 PIC, routing each line through the I/O APIC (incl. the IRQ0->GSI2
+        // PIT remap); without one it falls back to the PIC. Either way the PIC is
+        // remapped off the exception vectors and masked, and devices unmask their
+        // own line as they arm. The seam is invisible above this call -- the boot
+        // trace is unchanged whether the PIC or the APIC delivers.
+        irq::init(topology.as_ref());
 
         // Arm the periodic timer. It fires only once a process is in ring 3
         // (where interrupts are enabled); Stage 1 just counts the ticks, it

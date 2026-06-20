@@ -60,17 +60,57 @@ unsafe fn sig4(p: *const u8) -> [u8; 4] {
 const MAX_TABLES: usize = 256;
 /// The largest number of MADT entries we will walk, likewise bounded.
 const MAX_MADT_ENTRIES: usize = 1024;
+/// The largest number of Interrupt Source Overrides we retain. Real firmware
+/// lists a handful (the ISA legacy IRQ remaps); the rest are ignored.
+pub const MAX_ISOS: usize = 16;
 
-/// Discover the CPU + interrupt-controller topology from ACPI and report it.
+/// One Interrupt Source Override: an ISA IRQ that the chipset routes to a
+/// non-default GSI and/or with a non-default polarity/trigger. The interrupt
+/// controller (`irq`) consumes these to program the I/O APIC redirection entry
+/// for each line it unmasks.
+#[derive(Clone, Copy)]
+pub struct Iso {
+    /// The ISA IRQ source (e.g. 0 = PIT, the canonical IRQ0 -> GSI2 remap).
+    pub source: u8,
+    /// The global system interrupt the source actually arrives on.
+    pub gsi: u32,
+    /// Pin polarity: true = active low (MADT flags bits[1:0] == 0b11).
+    pub active_low: bool,
+    /// Trigger mode: true = level (MADT flags bits[3:2] == 0b11).
+    pub level: bool,
+}
+
+impl Iso {
+    const EMPTY: Iso = Iso { source: 0, gsi: 0, active_low: false, level: false };
+}
+
+/// The interrupt-controller topology the MADT describes: the Local APIC base,
+/// the (first) I/O APIC's MMIO base and GSI base, and the ISA->GSI source
+/// overrides. This is exactly what Stage A2 (`irq`'s APIC path) consumes to
+/// route line IRQs through the I/O APIC. Plinth assumes one I/O APIC (asserted
+/// by the count summary); GSIs for every line it uses fall in its range.
+#[derive(Clone, Copy)]
+pub struct Topology {
+    pub lapic_base: u64,
+    pub ioapic_base: u64,
+    pub ioapic_gsi_base: u32,
+    pub isos: [Iso; MAX_ISOS],
+    pub iso_count: usize,
+}
+
+/// Discover the CPU + interrupt-controller topology from ACPI, report it, and
+/// return it.
 ///
 /// Pure discovery: reads only, bounded walks, no behaviour change. `rsdp` is
 /// `BootInfo.rsdp_addr` (the RSDP physical address; `None` if the bootloader did
-/// not report one). Call once at boot, before the interrupt controller is
-/// brought up.
-pub fn init<W: Write>(out: &mut W, rsdp: Option<u64>, phys_offset: u64) {
+/// not report one). Returns the parsed `Topology` for the interrupt controller
+/// to consume (Stage A2), or `None` if no usable MADT was found -- in which case
+/// the caller keeps the legacy 8259 PIC. Call once at boot, before the interrupt
+/// controller is brought up.
+pub fn init<W: Write>(out: &mut W, rsdp: Option<u64>, phys_offset: u64) -> Option<Topology> {
     let Some(rsdp_phys) = rsdp else {
         let _ = writeln!(out, "plinth: acpi: no RSDP reported (skipping discovery)");
-        return;
+        return None;
     };
 
     // SAFETY: rsdp_phys is the firmware RSDP physical address from BootInfo,
@@ -84,7 +124,7 @@ pub fn init<W: Write>(out: &mut W, rsdp: Option<u64>, phys_offset: u64) {
         }
         if &sig != b"RSD PTR " {
             let _ = writeln!(out, "plinth: acpi: bad RSDP signature (skipping discovery)");
-            return;
+            return None;
         }
 
         // Revision >= 2 means an ACPI 2.0+ RSDP carrying a 64-bit XSDT; older
@@ -97,9 +137,10 @@ pub fn init<W: Write>(out: &mut W, rsdp: Option<u64>, phys_offset: u64) {
         };
 
         match madt {
-            Some(madt_phys) => parse_madt(out, phys_offset, madt_phys),
+            Some(madt_phys) => Some(parse_madt(out, phys_offset, madt_phys)),
             None => {
                 let _ = writeln!(out, "plinth: acpi: MADT not found");
+                None
             }
         }
     }
@@ -135,13 +176,14 @@ unsafe fn find_madt(phys_offset: u64, sdt_phys: u64, entry_size: usize) -> Optio
 }
 
 /// Parse the MADT: log the Local APIC base, each I/O APIC, each enabled CPU's
-/// APIC id, and each Interrupt Source Override, then emit the asserted count
-/// summary. The entry walk is bounded by the table length and `MAX_MADT_ENTRIES`
-/// and stops at the first entry whose length is degenerate or overruns the table.
+/// APIC id, and each Interrupt Source Override; emit the asserted count summary;
+/// and return the `Topology` for the interrupt controller. The entry walk is
+/// bounded by the table length and `MAX_MADT_ENTRIES` and stops at the first
+/// entry whose length is degenerate or overruns the table.
 ///
 /// # Safety
 /// `madt_phys` must name the MADT in mapped physical memory.
-unsafe fn parse_madt<W: Write>(out: &mut W, phys_offset: u64, madt_phys: u64) {
+unsafe fn parse_madt<W: Write>(out: &mut W, phys_offset: u64, madt_phys: u64) -> Topology {
     let p = ptr_at(phys_offset, madt_phys);
     let length = rd_u32(p, 4) as usize;
     // The 32-bit Local APIC base, possibly overridden by a type-5 entry below.
@@ -149,7 +191,12 @@ unsafe fn parse_madt<W: Write>(out: &mut W, phys_offset: u64, madt_phys: u64) {
 
     let mut cpus = 0usize;
     let mut ioapics = 0usize;
-    let mut isos = 0usize;
+    // First I/O APIC's base + GSI base (Plinth uses one; later ones are logged
+    // but the topology keeps the first, which covers every GSI Plinth routes).
+    let mut ioapic_base = 0u64;
+    let mut ioapic_gsi_base = 0u32;
+    let mut isos = [Iso::EMPTY; MAX_ISOS];
+    let mut iso_count = 0usize;
 
     // Entries start at offset 44 (after the 36-byte SDT header + the 8 bytes of
     // Local APIC address and flags).
@@ -176,6 +223,10 @@ unsafe fn parse_madt<W: Write>(out: &mut W, phys_offset: u64, madt_phys: u64) {
                 let id = rd_u8(p, off + 2);
                 let addr = rd_u32(p, off + 4);
                 let gsi_base = rd_u32(p, off + 8);
+                if ioapics == 0 {
+                    ioapic_base = addr as u64;
+                    ioapic_gsi_base = gsi_base;
+                }
                 ioapics += 1;
                 let _ = writeln!(
                     out,
@@ -183,11 +234,22 @@ unsafe fn parse_madt<W: Write>(out: &mut W, phys_offset: u64, madt_phys: u64) {
                 );
             }
             2 => {
-                // Interrupt Source Override (ISA IRQ -> GSI remap).
+                // Interrupt Source Override (ISA IRQ -> GSI remap). MADT flags:
+                // bits[1:0] polarity (0b11 = active low), bits[3:2] trigger
+                // (0b11 = level); 0 means "conforms to bus default" (ISA = edge,
+                // active high), which both decodes below treat as false/false.
                 let source = rd_u8(p, off + 3);
                 let gsi = rd_u32(p, off + 4);
                 let flags = rd_u16(p, off + 8);
-                isos += 1;
+                if iso_count < MAX_ISOS {
+                    isos[iso_count] = Iso {
+                        source,
+                        gsi,
+                        active_low: flags & 0b11 == 0b11,
+                        level: flags & 0b1100 == 0b1100,
+                    };
+                    iso_count += 1;
+                }
                 let _ = writeln!(
                     out,
                     "plinth:   acpi iso: irq {source} -> gsi {gsi} flags 0x{flags:x}"
@@ -206,15 +268,23 @@ unsafe fn parse_madt<W: Write>(out: &mut W, phys_offset: u64, madt_phys: u64) {
                     let _ = writeln!(out, "plinth:   acpi cpu: x2apic id {x2id}");
                 }
             }
-            _ => {} // other entry kinds are not needed for Stage A1.
+            _ => {} // other entry kinds are not needed yet.
         }
         off += elen;
     }
 
     let _ = writeln!(out, "plinth:   acpi lapic base 0x{lapic_base:x}");
-    let _ = writeln!(out, "plinth:   acpi source overrides: {isos}");
+    let _ = writeln!(out, "plinth:   acpi source overrides: {iso_count}");
     // The one asserted summary line. Counts are stable under the -smp 1 q35
     // smoke configuration (1 CPU, 1 I/O APIC); the addresses above are not
     // asserted, the way the PCI BAR lines are not.
     let _ = writeln!(out, "plinth: acpi: {cpus} cpu(s), {ioapics} ioapic(s)");
+
+    Topology {
+        lapic_base,
+        ioapic_base,
+        ioapic_gsi_base,
+        isos,
+        iso_count,
+    }
 }
