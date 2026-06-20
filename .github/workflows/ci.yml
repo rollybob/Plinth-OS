@@ -44,3 +44,6 @@ jobs:
 
       - name: Boot smoke test (in QEMU)
         run: cargo xtask smoke
+
+      - name: Multi-core smoke test (in QEMU)
+        run: cargo xtask smoke-smp

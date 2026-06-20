@@ -5,6 +5,11 @@
 //! `cargo xtask run-gdb` -- boot paused with a GDB server on :1234
 //! `cargo xtask smoke` -- boot with captured serial output and assert that
 //!                        every line in expected_boot_log.txt appears in order
+//! `cargo xtask smoke-smp` -- the same assertion battery as `smoke`, rerun
+//!                        once per PLINTH_SMP core count in SMP_TEST_CORE_COUNTS
+//!                        (Stage B2.4, design D8) -- the multi-core regression
+//!                        net `smoke`'s own -smp 1 byte-exact transcript can't
+//!                        be, since cross-core interleaving isn't deterministic
 //! `cargo xtask test`  -- build with --features tests, run the in-kernel
 //!                        suite, parse [PASS]/[FAIL]/[SUITE] tags
 
@@ -22,6 +27,7 @@ fn main() {
         "run"     => { let img = build_all(); run(&img, false); }
         "run-gdb" => { let img = build_all(); run(&img, true); }
         "smoke"   => { let img = build_all(); smoke(&img); }
+        "smoke-smp" => { let img = build_all(); smoke_smp(&img); }
         "test"    => { let img = build_test(); run_tests(&img); }
         "check"   => { check_clobbers(); }
         other     => { eprintln!("unknown subcommand: {other}"); std::process::exit(1); }
@@ -780,9 +786,28 @@ fn check_reap(actual: &str) {
 }
 
 fn smoke(uefi_path: &Path) {
+    run_smoke_checks(uefi_path, true);
+}
+
+/// The full assertion battery `smoke` runs, factored out so `smoke_smp` (Stage
+/// B2.4) can rerun most of it unchanged under `PLINTH_SMP`. Every check below
+/// `check_smoke_output` is already interleaving-robust by construction
+/// (Design section 2): each asserts a single process's/role's own values are
+/// in order, or a before/after count matches, never an exact global line
+/// position -- the same property that already lets them survive real timer-
+/// preemption reordering at -smp 1 extends to real cross-core reordering at
+/// -smp N.
+///
+/// `check_smoke_output` itself does NOT carry over: `expected_boot_log.txt`
+/// hardcodes "acpi: 1 cpu(s), 1 ioapic(s)" (true, and asserted, only under
+/// -smp 1 -- see that file's own comment), so `with_transcript` is false for
+/// `smoke_smp`'s runs and true for `smoke`'s.
+fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     let actual = run_capture(uefi_path);
-    let expected_path = workspace_root().join("expected_boot_log.txt");
-    check_smoke_output(&actual, &expected_path);
+    if with_transcript {
+        let expected_path = workspace_root().join("expected_boot_log.txt");
+        check_smoke_output(&actual, &expected_path);
+    }
     check_per_process_order(&actual, SCHED_PROCESSES, SCHED_ITERS);
     check_frames_baseline(&actual, "scheduler");
     check_ipc_order(&actual, IPC_ROUNDS);
@@ -802,6 +827,27 @@ fn smoke(uefi_path: &Path) {
     check_frames_baseline(&actual, "fs");
     check_frames_baseline(&actual, "evt");
     check_frames_baseline(&actual, "kbd");
+}
+
+/// Core counts `smoke-smp` boots under. 2 is the minimum that exercises any
+/// AP at all; 3 and 4 are kept because Stage B2.3's real bugs needed 2+ APs
+/// contending (never reproduced at -smp 2) to surface at all.
+const SMP_TEST_CORE_COUNTS: &[u32] = &[2, 3, 4];
+
+/// The multi-core regression lane (Stage B2.4, design D8): reruns `smoke`'s
+/// own assertion battery once per count in `SMP_TEST_CORE_COUNTS`, so a
+/// future concurrency regression is caught automatically instead of relying
+/// on a manual `PLINTH_SMP` stress run the way Stage B2.3's bugs were found
+/// and fixed. Deliberately a separate command from `smoke`, not folded into
+/// it: -smp 1 stays the fast, fully deterministic (PLINTH_ICOUNT-compatible)
+/// default every other check runs against.
+fn smoke_smp(uefi_path: &Path) {
+    for &cores in SMP_TEST_CORE_COUNTS {
+        println!("smoke-smp: -smp {cores}");
+        std::env::set_var("PLINTH_SMP", cores.to_string());
+        run_smoke_checks(uefi_path, false);
+    }
+    std::env::remove_var("PLINTH_SMP");
 }
 
 /// Build the kernel with the test suite compiled in. Uses a separate
