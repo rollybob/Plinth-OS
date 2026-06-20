@@ -63,6 +63,13 @@ mod process;
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod scheduler;
 mod serial;
+// AP bring-up (broader hardware, Stage B1) runs only on the userspace boot
+// path, after the LAPIC is up; the test build never reaches it. frame_alloc
+// reads its TRAMPOLINE_PHYS constant regardless of build (the reservation
+// must hold even in a build that never starts an AP), so this is the one
+// dead-code-allowed module the test build still partially depends on.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod smp;
 mod syscall;
 // The timer's IRQ vector is installed in every build (interrupts::init),
 // but it is armed and read only on the userspace boot path.
@@ -173,6 +180,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // own line as they arm. The seam is invisible above this call -- the boot
         // trace is unchanged whether the PIC or the APIC delivers.
         irq::init(topology.as_ref());
+
+        // Wake every other CPU the MADT reported (broader hardware, Stage
+        // B1). Needs the LAPIC up (just above) to send IPIs. Phase 1: each AP
+        // proves it can be woken at all and halts in real mode -- it does not
+        // yet touch any structure the BSP's demos below use, so nothing here
+        // changes the single-CPU concurrency story (that is Stage B2).
+        smp::start_aps(&mut serial, topology.as_ref(), phys_offset);
 
         // Arm the periodic timer. It fires only once a process is in ring 3
         // (where interrupts are enabled); Stage 1 just counts the ticks, it

@@ -137,6 +137,44 @@ pub fn mask(line: u8) {
     set_mask(line, true);
 }
 
+/// True once the LAPIC + I/O APIC are up (vs. the PIC fallback). Lets a device
+/// that is itself part of the Local APIC -- today, its per-core timer -- know
+/// whether there is a LAPIC to program at all.
+pub fn apic_mode() -> bool {
+    APIC_MODE.load(Ordering::Relaxed)
+}
+
+/// The mapped LAPIC MMIO base, if the APIC is active. The LAPIC's own timer
+/// (the LVT Timer + count registers) is local-APIC hardware, not a line IRQ,
+/// so `timer.rs` programs it directly through this and `lapic_reg_read`/
+/// `lapic_reg_write` rather than through `unmask`/`mask` -- this is the one
+/// register window a device needs from the seam to do that. Returns `None`
+/// under the PIC fallback, where there is no LAPIC to hand out.
+pub fn lapic_base() -> Option<u64> {
+    apic_mode().then(|| LAPIC_VA.load(Ordering::Relaxed))
+}
+
+/// Read a Local APIC register at `off` from a base returned by `lapic_base`.
+/// SAFETY: `va` must be a value `lapic_base` returned (so it is the mapped
+/// LAPIC page) and `off` a defined register offset.
+pub unsafe fn lapic_reg_read(va: u64, off: u32) -> u32 {
+    lapic_read(va, off)
+}
+
+/// Write a Local APIC register at `off`. Same SAFETY contract as
+/// `lapic_reg_read`.
+pub unsafe fn lapic_reg_write(va: u64, off: u32, val: u32) {
+    lapic_write(va, off, val)
+}
+
+/// The boot CPU's APIC id, if the APIC is active. Needed by anything that
+/// targets the LAPIC directly by physical destination -- today, an MSI-X
+/// table entry's Message Address (Stage A3, D7) -- the same id the I/O APIC
+/// redirection entries already use as their destination.
+pub fn bsp_apic_id() -> Option<u8> {
+    IOAPIC.lock().as_ref().map(|s| s.bsp_id)
+}
+
 /// Acknowledge IRQ `line`. Under the APIC a single Local APIC EOI ends the
 /// in-service interrupt (and, for a level I/O APIC line whose device has already
 /// been deasserted, clears its remote IRR). Under the PIC, EOI the master, and

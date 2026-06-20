@@ -63,6 +63,10 @@ const MAX_MADT_ENTRIES: usize = 1024;
 /// The largest number of Interrupt Source Overrides we retain. Real firmware
 /// lists a handful (the ISA legacy IRQ remaps); the rest are ignored.
 pub const MAX_ISOS: usize = 16;
+/// The largest number of CPU APIC ids we retain (Stage B1: AP bring-up needs
+/// to know who to wake). Generous for a toy kernel; x2APIC-only systems
+/// (>255 CPUs) are out of scope (D3) and would not enumerate here anyway.
+pub const MAX_CPUS: usize = 16;
 
 /// One Interrupt Source Override: an ISA IRQ that the chipset routes to a
 /// non-default GSI and/or with a non-default polarity/trigger. The interrupt
@@ -96,6 +100,14 @@ pub struct Topology {
     pub ioapic_gsi_base: u32,
     pub isos: [Iso; MAX_ISOS],
     pub iso_count: usize,
+    /// Every enabled CPU's (xAPIC, type-0 MADT entry) APIC id, including the
+    /// BSP's own -- `smp::start_aps` (Stage B1) filters that one out via
+    /// `irq::bsp_apic_id()`. x2APIC-only entries (type 9, MADT ids >= 256) are
+    /// not collected here (D3: x2APIC is a later refinement); a system that
+    /// needs one would simply have fewer entries in this list than `cpus` in
+    /// the asserted summary line, not a wrong id.
+    pub cpu_apic_ids: [u8; MAX_CPUS],
+    pub cpu_id_count: usize,
 }
 
 /// Discover the CPU + interrupt-controller topology from ACPI, report it, and
@@ -197,6 +209,8 @@ unsafe fn parse_madt<W: Write>(out: &mut W, phys_offset: u64, madt_phys: u64) ->
     let mut ioapic_gsi_base = 0u32;
     let mut isos = [Iso::EMPTY; MAX_ISOS];
     let mut iso_count = 0usize;
+    let mut cpu_apic_ids = [0u8; MAX_CPUS];
+    let mut cpu_id_count = 0usize;
 
     // Entries start at offset 44 (after the 36-byte SDT header + the 8 bytes of
     // Local APIC address and flags).
@@ -215,6 +229,10 @@ unsafe fn parse_madt<W: Write>(out: &mut W, phys_offset: u64, madt_phys: u64) ->
                 let apic_id = rd_u8(p, off + 3);
                 if rd_u32(p, off + 4) & 1 != 0 {
                     cpus += 1;
+                    if cpu_id_count < MAX_CPUS {
+                        cpu_apic_ids[cpu_id_count] = apic_id;
+                        cpu_id_count += 1;
+                    }
                     let _ = writeln!(out, "plinth:   acpi cpu: apic id {apic_id}");
                 }
             }
@@ -286,5 +304,7 @@ unsafe fn parse_madt<W: Write>(out: &mut W, phys_offset: u64, madt_phys: u64) ->
         ioapic_gsi_base,
         isos,
         iso_count,
+        cpu_apic_ids,
+        cpu_id_count,
     }
 }

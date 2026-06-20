@@ -34,6 +34,9 @@ const VIRTIO_BLK_LEGACY: u16 = 0x1001;
 /// virtio device points at its structures inside a BAR.
 const CAP_ID_VENDOR: u8 = 0x09;
 
+/// PCI capability id for the standard MSI-X capability (PCI 3.0 spec, 6.8.2).
+const CAP_ID_MSIX: u8 = 0x11;
+
 /// virtio `cfg_type` values (virtio 1.x spec, 4.1.4): which structure a given
 /// vendor capability describes.
 const VIRTIO_CAP_COMMON: u8 = 1;
@@ -74,8 +77,29 @@ pub struct VirtioBlkInfo {
     pub device: VirtioCfg,
     /// The INTx# line IRQ the firmware routed this device to (config space
     /// byte 0x3C). The virtio-blk driver installs its completion handler at
-    /// VECTOR_BASE+line and unmasks it through the `irq` seam (Stage 4).
+    /// VECTOR_BASE+line and unmasks it through the `irq` seam (Stage 4); kept
+    /// as the no-MADT fallback once MSI-X lands (Stage A3, D7).
     pub intr_line: u8,
+    /// The standard MSI-X capability, if the device has one (every virtio-pci
+    /// modern device does under QEMU q35). `None` only on a device that
+    /// genuinely lacks MSI-X, in which case INTx is the only option.
+    pub msix: Option<MsixCap>,
+}
+
+/// The standard PCI MSI-X capability (PCI 3.0 spec, 6.8.2): where the MSI-X
+/// table and pending-bit array live (each a BAR + byte offset into it) and how
+/// many vector slots the table holds. `cap_ptr` is the capability's own offset
+/// in config space, kept so the driver can flip the Message Control enable bit
+/// once the table is programmed.
+#[derive(Clone, Copy, Default)]
+pub struct MsixCap {
+    pub cap_ptr: u8,
+    /// Table size, already converted from the spec's N-1 encoding to N.
+    pub table_size: u16,
+    pub table_bar: u8,
+    pub table_offset: u32,
+    pub pba_bar: u8,
+    pub pba_offset: u32,
 }
 
 /// Read a BAR's base address, decoding I/O vs 32/64-bit memory BARs. `index`
@@ -102,6 +126,16 @@ pub fn enable_bus_master(loc: Location) {
     // Set Memory Space Enable (bit 1) + Bus Master Enable (bit 2). Keep the
     // high half (status, write-1-to-clear) zero so we clear nothing.
     let cmd = (dword as u16) | (1 << 1) | (1 << 2);
+    write32(loc.bus, loc.slot, loc.func, 0x04, cmd as u32);
+}
+
+/// Set the command register's INTx Disable bit (bit 10): once a device's
+/// completion interrupts move to MSI-X, the legacy INTx# pin must stop being
+/// asserted, so it cannot deliver a stray interrupt alongside (or instead of)
+/// the MSI-X vector.
+pub fn disable_intx(loc: Location) {
+    let dword = read32(loc.bus, loc.slot, loc.func, 0x04);
+    let cmd = (dword as u16) | (1 << 10);
     write32(loc.bus, loc.slot, loc.func, 0x04, cmd as u32);
 }
 
@@ -137,9 +171,20 @@ pub fn write32(bus: u8, slot: u8, func: u8, offset: u8, value: u32) {
 }
 
 /// Read a 16-bit field, extracted from its containing dword.
-fn read16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 {
+pub fn read16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 {
     let dword = read32(bus, slot, func, offset);
     (dword >> ((offset as u32 & 2) * 8)) as u16
+}
+
+/// Write a 16-bit field: read-modify-write the containing dword so the other
+/// half (e.g. a capability's id + next-pointer byte pair, sharing a dword with
+/// its Message Control word) is preserved.
+pub fn write16(bus: u8, slot: u8, func: u8, offset: u8, value: u16) {
+    let shift = (offset as u32 & 2) * 8;
+    let aligned = offset & 0xFC;
+    let dword = read32(bus, slot, func, aligned);
+    let merged = (dword & !(0xFFFFu32 << shift)) | ((value as u32) << shift);
+    write32(bus, slot, func, aligned, merged);
 }
 
 /// Read an 8-bit field, extracted from its containing dword.
@@ -252,6 +297,23 @@ fn fill_caps(info: &mut VirtioBlkInfo) {
                 VIRTIO_CAP_DEVICE => info.device = cfg,
                 _ => {} // VIRTIO_CAP_PCI and any others: not needed here.
             }
+        } else if cap_id == CAP_ID_MSIX {
+            // Message Control (16 bits at cap+2): bits 0..11 = table size - 1,
+            // bit 14 = function mask, bit 15 = enable (left alone here; the
+            // driver sets it once the table is programmed). Table/PBA offset
+            // dwords pack a BIR in the low 3 bits and a sector-aligned offset
+            // in the rest.
+            let control = read16(bus, slot, func, ptr + 2);
+            let table = read32(bus, slot, func, ptr + 4);
+            let pba = read32(bus, slot, func, ptr + 8);
+            info.msix = Some(MsixCap {
+                cap_ptr: ptr,
+                table_size: (control & 0x7FF) + 1,
+                table_bar: (table & 0x7) as u8,
+                table_offset: table & !0x7,
+                pba_bar: (pba & 0x7) as u8,
+                pba_offset: pba & !0x7,
+            });
         }
         ptr = next;
         guard += 1;
@@ -276,6 +338,7 @@ pub fn discover_all() -> ([Option<VirtioBlkInfo>; MAX_DEVICES], usize) {
             isr: VirtioCfg::default(),
             device: VirtioCfg::default(),
             intr_line: read8(loc.bus, loc.slot, loc.func, 0x3C),
+            msix: None,
         };
         fill_caps(&mut info);
         infos[i] = Some(info);
@@ -311,6 +374,18 @@ fn report<W: Write>(out: &mut W, info: &VirtioBlkInfo) {
     }
     let _ = writeln!(out, "plinth:   notify multiplier 0x{:x}", info.notify_mult);
     let _ = writeln!(out, "plinth:   interrupt line {}", info.intr_line);
+    match info.msix {
+        Some(m) => {
+            let _ = writeln!(
+                out,
+                "plinth:   msix table_size {} bar {} offset 0x{:x} pba bar {} offset 0x{:x}",
+                m.table_size, m.table_bar, m.table_offset, m.pba_bar, m.pba_offset
+            );
+        }
+        None => {
+            let _ = writeln!(out, "plinth:   msix not present (INTx only)");
+        }
+    }
 }
 
 /// Storage discovery entry point: find every virtio-blk device and report what

@@ -214,6 +214,66 @@ pub fn map_kernel_mmio(phys: u64, size: u64) -> Result<u64, &'static str> {
     Ok(phys_offset() + phys)
 }
 
+/// Map one page identity (virtual address == physical address) into the
+/// kernel's own address space: present, writable, executable, kernel-only.
+///
+/// Needed only by the AP trampoline (broader hardware, Stage B1): the moment
+/// the trampoline enables paging, the instruction fetch for whatever runs
+/// next is already translated through the new page tables -- and that
+/// "next" is still the trampoline's own code, sitting at its low physical
+/// address (the bootloader's `phys_offset + phys` scheme everywhere else
+/// does NOT cover raw low physical addresses at their own value). This is a
+/// transient mapping: `unmap_identity` removes it once every AP has moved
+/// past it into normal phys-offset-mapped kernel code, per
+/// Design/broader_hardware.md section 10.
+pub fn map_identity(phys: u64, size: u64) -> Result<(), &'static str> {
+    let mut fa_guard = FRAME_ALLOC.lock();
+    let fa = fa_guard.as_mut().ok_or("frame allocator not initialised")?;
+    // SAFETY: kernel_l4() is the live kernel L4; boot-time, single CPU, and
+    // the identity range is the trampoline's own reserved page (never
+    // otherwise mapped).
+    let mut mapper = unsafe { mapper_for(kernel_l4()) };
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+
+    let first = phys & !(FRAME_SIZE - 1);
+    let last = (phys + size + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
+    let mut p = first;
+    while p < last {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(p));
+        let frame = PhysFrame::containing_address(PhysAddr::new(p));
+        // SAFETY: identity-mapping the trampoline's own reserved, otherwise
+        // untouched low page; the parent flags never weaken existing kernel
+        // mappings (this range was never mapped before).
+        unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, fa) }
+            .map_err(|e| match e {
+                MapToError::FrameAllocationFailed => "identity map: frame alloc failed",
+                MapToError::ParentEntryHugePage => "identity map: parent huge page",
+                MapToError::PageAlreadyMapped(_) => "identity map: page already mapped",
+            })?
+            .flush();
+        p += FRAME_SIZE;
+    }
+    Ok(())
+}
+
+/// Remove a mapping `map_identity` installed. Call once every AP that needs
+/// it has moved past the trampoline into ordinary kernel code.
+pub fn unmap_identity(phys: u64, size: u64) {
+    let mut mapper = unsafe { mapper_for(kernel_l4()) };
+    let first = phys & !(FRAME_SIZE - 1);
+    let last = (phys + size + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
+    let mut p = first;
+    while p < last {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(p));
+        if let Ok((_frame, flush)) = mapper.unmap(page) {
+            flush.flush();
+        }
+        p += FRAME_SIZE;
+    }
+}
+
 pub fn unmap_user_page(l4: u64, va: u64) {
     let mut mapper = unsafe { mapper_for(l4) };
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));

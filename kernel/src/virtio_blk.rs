@@ -36,6 +36,13 @@ const CFG_QUEUE_NOTIFY_OFF: u64 = 0x1E;
 const CFG_QUEUE_DESC: u64 = 0x20;
 const CFG_QUEUE_DRIVER: u64 = 0x28;
 const CFG_QUEUE_DEVICE: u64 = 0x30;
+// MSI-X vector selectors (virtio 1.x, 4.1.4.3): each holds an INDEX into the
+// MSI-X table (which table entry signals this source), not a CPU vector
+// number. 0xFFFF (VIRTIO_MSI_NO_VECTOR) means "deliver nothing" for that
+// source.
+const CFG_MSIX_CONFIG: u64 = 0x10;
+const CFG_QUEUE_MSIX_VECTOR: u64 = 0x1A;
+const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF;
 
 // --- device_status bits ---
 const STATUS_ACK: u8 = 1;
@@ -89,6 +96,13 @@ const QUEUE_SIZE_MAX: u16 = 64;
 /// fault instead of a kernel hang (D6).
 const POLL_MAX: u64 = 50_000_000;
 
+/// First CPU vector handed out for virtio MSI-X completions (Stage A3, D7).
+/// Distinct from the legacy IRQ vector range (`VECTOR_BASE`..`VECTOR_BASE+16`)
+/// and the LAPIC spurious vector (0xFF) -- MSI-X delivers straight to the
+/// LAPIC, bypassing the I/O APIC and its line numbering entirely, so these
+/// vectors have no relationship to `intr_line`. One per device, by index.
+const MSIX_VECTOR_BASE: u8 = 0x30;
+
 /// The brought-up device. Holds virtual addresses (and the physical addresses
 /// the device DMAs to/from) as plain integers, so the struct is `Send` and can
 /// live in a static behind a spinlock.
@@ -113,13 +127,20 @@ struct VirtioBlk {
     /// Device capacity in 512-byte sectors (virtio-blk device-config offset 0).
     /// The boot code grants a whole-device BlockRange of this many sectors.
     capacity: u64,
-    /// MMIO virtual address of the ISR-status register. The completion IRQ
-    /// handler reads it to ack/deassert the level-triggered INTx at the device
-    /// (a read clears it) before EOIing the controller (Stage 4 S4c).
+    /// MMIO virtual address of the ISR-status register. Read to ack/deassert
+    /// the level-triggered INTx at the device (a read clears it) before EOIing
+    /// the controller (Stage 4 S4c) -- only meaningful on the INTx fallback
+    /// path (`msix_vector.is_none()`); MSI-X needs no such read (Stage A3).
     isr_va: u64,
-    /// The INTx line IRQ this device is wired to (PCI config 0x3C). The handler
-    /// is installed at VECTOR_BASE+line and EOIs this line.
+    /// The INTx line IRQ this device is wired to (PCI config 0x3C), used only
+    /// when `msix_vector` is `None`: the handler is installed at
+    /// VECTOR_BASE+line and EOIs this line.
     intr_line: u8,
+    /// The CPU vector this device's MSI-X table entry 0 was programmed to
+    /// deliver, if MSI-X came up for it (Stage A3, D7: only under
+    /// `irq::apic_mode()`, with a MADT-supplied LAPIC to target). `None` means
+    /// this device is on the INTx fallback (`intr_line` instead).
+    msix_vector: Option<u8>,
     /// The process slot blocked waiting for this device's I/O completion, if
     /// any. One waiter per device (a device's Mutex serialises requests, so at
     /// most one read is ever outstanding); woken by the completion IRQ. Named by
@@ -306,6 +327,61 @@ fn required_span(info: &VirtioBlkInfo) -> u64 {
         .max(end(info.notify))
 }
 
+/// Bring up MSI-X for device `dev` if the controller is in APIC mode and the
+/// device advertises the capability (Stage A3, D7): map its MSI-X table BAR
+/// (QEMU puts it in a different BAR than the virtio structures -- confirmed
+/// by discovery, not assumed), program table entry 0 to deliver
+/// `MSIX_VECTOR_BASE + dev` to the boot CPU, enable MSI-X in the capability's
+/// Message Control word, and disable the device's legacy INTx# pin so it
+/// cannot also fire. Returns the assigned vector, or `None` if MSI-X is
+/// unavailable (no MADT/LAPIC, or the device lacks the capability) -- the
+/// caller then stays on the INTx path entirely, unchanged from Stage 4.
+///
+/// Deliberately does NOT touch virtio common-config here: the
+/// `queue_msix_vector`/`msix_config` writes need `queue_select` already at 0,
+/// which `init` only guarantees later in its own queue-setup block.
+fn setup_msix(info: &VirtioBlkInfo, dev: usize) -> Result<Option<u8>, &'static str> {
+    let Some(msix) = info.msix else {
+        return Ok(None);
+    };
+    let Some(bsp_id) = irq::bsp_apic_id() else {
+        return Ok(None); // no LAPIC/MADT: nothing to target, stay on INTx
+    };
+
+    let table_phys = pci::read_bar(info.loc, msix.table_bar);
+    let table_span = (msix.table_offset as u64) + (msix.table_size as u64) * 16;
+    let table_base = memory::map_kernel_mmio(table_phys, table_span)?;
+    let table_va = table_base + msix.table_offset as u64;
+
+    let vector = MSIX_VECTOR_BASE + dev as u8;
+    // SAFETY: table_va is the freshly mapped MSI-X table; entry 0 is within
+    // table_size (a working device reports table_size >= 1).
+    unsafe {
+        // Message Address: physical destination, no redirection hint -- the
+        // same addressing the I/O APIC redirection entries already use for
+        // their destination field (irq.rs), just inlined into the message
+        // instead of going through a redirection table.
+        w32(table_va, 0xFEE0_0000 | ((bsp_id as u32) << 12));
+        w32(table_va + 4, 0); // address high: no x2APIC destination needed
+        w32(table_va + 8, vector as u32); // data: fixed delivery, this vector
+        w32(table_va + 12, 0); // vector control: unmasked
+    }
+
+    // Enable MSI-X (Message Control bit 15); leave the function-mask bit and
+    // the read-only table-size field as the device reported them.
+    let control = pci::read16(info.loc.bus, info.loc.slot, info.loc.func, msix.cap_ptr + 2);
+    pci::write16(
+        info.loc.bus,
+        info.loc.slot,
+        info.loc.func,
+        msix.cap_ptr + 2,
+        control | (1 << 15),
+    );
+    pci::disable_intx(info.loc);
+
+    Ok(Some(vector))
+}
+
 /// Bring device `dev` up: enable bus mastering, map its BAR, negotiate
 /// features, stand up queue 0, and stash it in `DEVICES[dev]` for `read`. Call
 /// once per device at boot, after `pci::discover_all`; `dev` is the device's
@@ -324,8 +400,10 @@ pub fn init<W: Write>(
         return Err("virtio-blk spreads structures across multiple BARs (unsupported)");
     }
 
-    // MMIO + DMA must be enabled before we touch registers or post a request.
+    // MMIO + DMA must be enabled before we touch registers or post a request
+    // (including the MSI-X table, which lives in its own BAR).
     pci::enable_bus_master(info.loc);
+    let msix_vector = setup_msix(info, dev)?;
 
     let bar_phys = pci::read_bar(info.loc, bar);
     let base = memory::map_kernel_mmio(bar_phys, required_span(info))?;
@@ -393,6 +471,12 @@ pub fn init<W: Write>(
         w64_split(common + CFG_QUEUE_DRIVER, avail_phys);
         w64_split(common + CFG_QUEUE_DEVICE, used_phys);
         queue_notify_off = r16(common + CFG_QUEUE_NOTIFY_OFF);
+        if msix_vector.is_some() {
+            // queue_select is still 0 from above; route queue 0's completions
+            // to MSI-X table entry 0 and skip config-change notifications.
+            w16(common + CFG_MSIX_CONFIG, VIRTIO_MSI_NO_VECTOR);
+            w16(common + CFG_QUEUE_MSIX_VECTOR, 0);
+        }
         w16(common + CFG_QUEUE_ENABLE, 1);
 
         w8(
@@ -422,6 +506,7 @@ pub fn init<W: Write>(
         capacity,
         isr_va: isr,
         intr_line: info.intr_line,
+        msix_vector,
         waiter: None,
     });
 
@@ -429,6 +514,14 @@ pub fn init<W: Write>(
         out,
         "plinth: virtio-blk[{dev}] ready (queue 0, size {qsize}, capacity {capacity} sectors)"
     );
+    match msix_vector {
+        Some(v) => {
+            let _ = writeln!(out, "plinth: virtio-blk[{dev}] msix vector 0x{v:x}");
+        }
+        None => {
+            let _ = writeln!(out, "plinth: virtio-blk[{dev}] msix unavailable, using INTx");
+        }
+    }
     Ok(())
 }
 
@@ -549,12 +642,21 @@ pub fn any_waiter() -> bool {
     (0..pci::MAX_DEVICES).any(|dev| DEVICES[dev].lock().as_ref().is_some_and(|d| d.waiter.is_some()))
 }
 
-/// Service device `dev`'s completion interrupt: ack at the device (read ISR to
-/// deassert the level-triggered INTx -- a read clears it, without which the line
-/// re-fires after EOI), consume the completion, wake the blocked reader with the
-/// status, and EOI the line. Shared by the per-device IRQ stubs.
+/// Service device `dev`'s completion interrupt, consume the completion, wake
+/// the blocked reader with the status, and EOI. Shared by the per-device IRQ
+/// stubs, on either path:
+///
+/// - **INTx** (`msix_vector` is `None`): ack at the device first -- read ISR
+///   to deassert the level-triggered line (a read clears it, without which it
+///   re-fires after EOI) -- then EOI `intr_line` at the controller.
+/// - **MSI-X** (Stage A3, D7): no ISR read (the spec defines it as
+///   meaningless once MSI-X is enabled -- a shared level-triggered status
+///   register has nothing to deassert for a per-vector, edge-triggered
+///   source) and no line to resolve; EOI is the same blanket Local APIC write
+///   `irq::eoi` already makes under APIC mode for any vector, so passing `0`
+///   is just "not a PIC line", never read on this path.
 fn complete_irq(dev: usize) {
-    let (woken, line) = {
+    let (woken, eoi_line) = {
         let Some(g) = DEVICES.get(dev) else {
             return;
         };
@@ -562,10 +664,15 @@ fn complete_irq(dev: usize) {
         let Some(d) = guard.as_mut() else {
             return;
         };
-        // SAFETY: isr_va is the device's mapped ISR-status MMIO; reading it acks
-        // and deasserts the device's INTx.
-        let _isr = unsafe { r8(d.isr_va) };
-        let line = d.intr_line;
+        let eoi_line = match d.msix_vector {
+            Some(_) => 0, // MSI-X: irq::eoi ignores this under APIC mode
+            None => {
+                // SAFETY: isr_va is the device's mapped ISR-status MMIO;
+                // reading it acks and deasserts the device's INTx.
+                let _isr = unsafe { r8(d.isr_va) };
+                d.intr_line
+            }
+        };
         let woken = if d.completed() {
             let status = match d.take_completion() {
                 Ok(()) => BLK_OK,
@@ -575,14 +682,14 @@ fn complete_irq(dev: usize) {
         } else {
             None
         };
-        (woken, line)
+        (woken, eoi_line)
     };
     // Wake outside the device lock (wake_with touches the scheduler table, not
     // the device). NO_CAP in rdx -- block_read returns a status word only.
     if let Some((waiter, status)) = woken {
         scheduler::wake_with(waiter, status, 0, u64::MAX);
     }
-    irq::eoi(line);
+    irq::eoi(eoi_line);
 }
 
 // The completion-IRQ stubs: one per device, because the two devices sit on
@@ -595,18 +702,27 @@ extern "x86-interrupt" fn blk_interrupt_dev1(_frame: InterruptStackFrame) {
     complete_irq(1);
 }
 
-/// Install each present device's completion-IRQ handler at its line's vector and
-/// unmask the line. Call once at boot AFTER the devices are brought up (their
-/// INTx lines are known) and AFTER the polled selftests (which suppress
-/// completion interrupts): from here on, runtime `block_read` blocks and is woken
-/// by these handlers. The IDT is already loaded, so the handler is installed live
-/// into it (interrupts::set_irq_handler); the IDTR points at the same table.
+/// Install each present device's completion-IRQ handler and (on the INTx
+/// fallback) unmask its line. Call once at boot AFTER the devices are brought
+/// up (their vectors -- MSI-X or INTx -- are known) and AFTER the polled
+/// selftests (which suppress completion interrupts): from here on, runtime
+/// `block_read` blocks and is woken by these handlers. The IDT is already
+/// loaded, so the handler is installed live into it
+/// (interrupts::set_irq_handler); the IDTR points at the same table.
+///
+/// MSI-X (Stage A3, D7) needs no `irq::unmask` call: MSI/MSI-X delivers
+/// straight to the LAPIC, bypassing the I/O APIC and its line-based
+/// masking entirely -- the device starts asserting the vector the moment its
+/// MSI-X table entry is unmasked, which `setup_msix` already did.
 pub fn enable_completion_irqs() {
     for dev in 0..pci::MAX_DEVICES {
-        let line = {
+        let (vector, needs_unmask) = {
             let guard = DEVICES[dev].lock();
             match guard.as_ref() {
-                Some(d) => d.intr_line,
+                Some(d) => match d.msix_vector {
+                    Some(v) => (v, false),
+                    None => (irq::VECTOR_BASE + d.intr_line, true),
+                },
                 None => continue,
             }
         };
@@ -615,8 +731,11 @@ pub fn enable_completion_irqs() {
             1 => blk_interrupt_dev1,
             _ => continue, // add a stub if MAX_DEVICES grows
         };
-        interrupts::set_irq_handler(irq::VECTOR_BASE + line, handler);
-        irq::unmask(line);
+        interrupts::set_irq_handler(vector, handler);
+        if needs_unmask {
+            let line = vector - irq::VECTOR_BASE;
+            irq::unmask(line);
+        }
     }
 }
 

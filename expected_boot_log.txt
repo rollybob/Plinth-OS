@@ -39,6 +39,16 @@ plinth: scanning PCI bus
 plinth: virtio-blk found at 00:03.0
 plinth: virtio-blk found at 00:04.0
 plinth: virtio-blk[0] ready (queue 0, size 64, capacity 2048 sectors)
+
+# MSI-X completions (broader hardware, Stage A3, D7): once Stage A2's LAPIC is
+# up, each device's block-completion interrupt moves from a shared INTx line to
+# its own MSI-X table entry, retiring the ISR-status deassert read Stage 4
+# needed. Printed (and asserted) right after each device's bring-up, before
+# the polled sector-0 reads below. The assigned vectors are deterministic
+# (MSIX_VECTOR_BASE + device index, no addresses), so a silent regression back
+# to INTx would change or drop these lines.
+plinth: virtio-blk[0] msix vector 0x30
+plinth: virtio-blk[1] msix vector 0x31
 plinth: virtio-blk[0] sector 0 read ok (ramp verified)
 plinth: virtio-blk[1] sector 0 read ok (distinct disk)
 

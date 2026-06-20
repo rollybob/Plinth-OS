@@ -100,6 +100,12 @@ impl FrameAlloc {
         // closes both at the source.
         alloc.mark_used(0);
 
+        // Reserve the AP trampoline page (broader hardware, Stage B1):
+        // `smp::TRAMPOLINE_PHYS` is a fixed low address the SIPI vector must
+        // name directly, so it can never be handed out as an ordinary frame --
+        // same reasoning and same mechanism as the frame-0 reservation above.
+        alloc.mark_used((crate::smp::TRAMPOLINE_PHYS / FRAME_SIZE) as usize);
+
         alloc
     }
 

@@ -339,14 +339,20 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool) -> Command {
         "-serial", "stdio",
         "-no-reboot",
         "-m", "256M",
-        // Single CPU: Plinth is deliberately uniprocessor. Deterministic
-        // serial output is a feature, not a limitation.
-        "-smp", "1",
         "-cpu", "qemu64",
         // isa-debug-exit: the kernel writes N to port 0xF4 and QEMU exits
         // with status (N << 1) | 1. Kernel success (N=0) -> exit code 1.
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
     ]);
+
+    // Plinth is deliberately uniprocessor by default: deterministic serial
+    // output is a feature, not a limitation, and `-smp 1` is the regression
+    // net every other check still runs against (Design/broader_hardware.md
+    // D8). PLINTH_SMP=N opts into N cores for testing AP bring-up (Stage B1)
+    // and, later, real cross-core scheduling (Stage B2) -- off by default, and
+    // the kernel does not depend on it for anything `smoke`/`test` assert.
+    let smp = std::env::var("PLINTH_SMP").unwrap_or_else(|_| "1".to_string());
+    cmd.args(["-smp", &smp]);
 
     // Stage 1 storage: a deterministic raw disk behind a modern virtio-blk-pci
     // device, pinned to slot 3 so discovery output is stable across runs.
