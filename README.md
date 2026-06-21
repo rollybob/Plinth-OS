@@ -12,18 +12,19 @@ on the same kernel answer those questions differently, in unprivileged code,
 and the boot log shows the difference.
 
 It began as one boot proving a single contrast -- the same workload over two
-allocators -- and has grown a preemptive scheduler, IPC, a disk, and a
-keyboard, without giving up the property that makes it worth reading: a
-kernel that is mechanism, with policy in unprivileged library OSes, whose
-every boot is checked line-by-line in CI.
+allocators -- and has grown a preemptive scheduler, IPC, a disk, a keyboard,
+and symmetric multiprocessing, without giving up the property that makes it
+worth reading: a kernel that is mechanism, with policy in unprivileged library
+OSes, whose single-core boot is still checked line-by-line in CI.
 
 ## The demo
 
-This is one boot, verified line-by-line in CI against
-[expected_boot_log.txt](expected_boot_log.txt). It runs in two acts: the
-core exokernel moves, then the system machinery -- a scheduler, IPC, storage,
-and input -- that turns the kernel into something you could build on. The
-machinery was added without giving up the determinism that makes the boot
+This is one single-core boot, verified line-by-line in CI against
+[expected_boot_log.txt](expected_boot_log.txt) -- the same assertion battery
+reruns on 2-4 cores (see [Testing](#testing)). It runs in two acts: the core
+exokernel moves, then the system machinery -- a scheduler, IPC, storage, and
+input -- that turns the kernel into something you could build on. The machinery
+was added without giving up the determinism that makes the single-core boot
 checkable.
 
 ```text
@@ -32,6 +33,7 @@ plinth: frame allocator ready
 plinth: GDT + TSS loaded
 plinth: IDT loaded
 plinth: syscall interface ready
+plinth: acpi: 1 cpu(s), 1 ioapic(s)
 plinth: timer armed
 plinth: keyboard ready (i8042, IRQ1)
 plinth: keyboard selftest ok
@@ -39,6 +41,8 @@ plinth: scanning PCI bus
 plinth: virtio-blk found at 00:03.0
 plinth: virtio-blk found at 00:04.0
 plinth: virtio-blk[0] ready (queue 0, size 64, capacity 2048 sectors)
+plinth: virtio-blk[0] msix vector 0x30
+plinth: virtio-blk[1] msix vector 0x31
 plinth: virtio-blk[0] sector 0 read ok (ramp verified)
 plinth: virtio-blk[1] sector 0 read ok (distinct disk)
 plinth: running hello
@@ -253,8 +257,9 @@ Plinth implements the minimum machinery that makes the argument concrete:
   |  capabilities | frames | CPU budgets | endpoints | block ranges|
   |  event sources | scheduler + timer | per-process address spaces|
   |  fault upcall  | virtio-blk | i8042 keyboard | irq seam        |
+  |  LAPIC + I/O APIC | MSI-X | SMP: AP trampoline + BKL + per-CPU |
   +----------------------------------------------------------------+
-                              ring 0
+                       ring 0, one or more CPUs
 ```
 
 Two entry mechanisms: the non-blocking calls use `syscall`/`sysretq`; the
@@ -270,10 +275,15 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
   syscall.rs       the non-blocking calls, syscall/sysret entry
   ipc.rs           the int 0x80 gate: endpoints, send/recv/call/reply,
                    plus event_recv and block_read (blocking ops share it)
-  scheduler.rs     preemptive round-robin, per-process kernel stacks
-  timer.rs         100 Hz PIT, the preemption source
-  irq.rs           interrupt-controller seam (8259 PIC today; the one
-                   module an APIC port swaps)
+  scheduler.rs     preemptive round-robin, per-process kernel stacks,
+                   core-agnostic claim-and-run across CPUs
+  timer.rs         100 Hz preemption tick: per-CPU LAPIC timer (PIT fallback)
+  irq.rs           interrupt-controller seam: LAPIC + I/O APIC, MSI-X
+                   (8259 PIC kept as a fallback when no MADT is present)
+  acpi.rs          MADT parser: CPU + interrupt-controller topology
+  smp.rs           AP bring-up: INIT-SIPI-SIPI + the long-mode trampoline
+  bkl.rs           the big kernel lock: one lock, held entry-to-exit
+  percpu.rs        per-CPU state via IA32_GS_BASE (current process, stacks)
   interrupts.rs    IDT, ring-3-surviving exception handlers
   process.rs       process lifecycle + teardown
   usermode.rs      ring transition: iretq in, context switch out
@@ -321,15 +331,16 @@ xtask/       build orchestration: user binaries, disk images, QEMU,
 - **No kernel heap.** Capability tables, process state, endpoints, and event
   rings are fixed-size arrays. A toy kernel that needs malloc to express
   ownership has already smuggled in a policy.
-- **Preemptive multitasking, but a non-preemptible kernel.** A 100 Hz PIT
+- **Preemptive multitasking, but a non-preemptible kernel.** A 100 Hz timer
   preempts ring-3 code; the kernel saves the full interrupted context,
   switches address space and per-process kernel stack, and round-robins
   independent processes. But the kernel reschedules only on the way *out* to
   ring 3 -- it never preempts itself -- so kernel data structures are never
-  reentered and need no locks on a single CPU. This is the line the whole
-  design rests on, and it is exactly what a second CPU would end (see the
-  roadmap). Preemption cost the exact-trace smoke test; per-process ordering
-  and no-leak invariants replaced it.
+  reentered on a given core. On one CPU that meant no locks at all; under SMP a
+  single big kernel lock (`bkl.rs`), held entry-to-exit, does the cross-core
+  arbitration, so the non-preemptible-kernel property now reads *per core* and
+  the lock serializes the rest. Preemption cost the exact-trace smoke test;
+  per-process ordering and no-leak invariants replaced it.
 - **Per-process address spaces.** Each process gets its own page tables: a
   private L4 whose user half is its own and whose kernel half is copied from
   the bootloader's L4, so the kernel runs correctly under any process's CR3.
@@ -366,15 +377,26 @@ xtask/       build orchestration: user binaries, disk images, QEMU,
   error -- not even `u64::MAX` -- including the `IPC_PEER_DIED` status that
   frees a process blocked on a counterpart that died.
 - **One interrupt-controller seam.** The keyboard IRQ and the virtio-blk
-  completion IRQ both route through a single `irq` module that today drives the
-  8259 PIC. It is deliberately the one place an APIC port has to touch -- the
-  rest of the kernel asks for "the IRQ for this line" and "EOI this line"
-  without knowing which controller answers.
-- **Uniprocessor today, by scope not by dogma.** Plinth runs on one CPU, which
-  is what makes the no-lock, non-preemptible-kernel discipline above sound. SMP
-  is the next roadmap item, taken on its own merits -- it is a concurrency
-  redesign, not a feature toggle, precisely because it ends the single-CPU
-  invariant -- not something bolted on to pad the feature list.
+  completion IRQ both route through a single `irq` module, built as the one
+  place an interrupt-controller swap has to touch -- and that swap has since
+  happened. `irq` now drives the Local APIC + I/O APIC, discovered from the
+  ACPI MADT (`acpi.rs`), with MSI-X for virtio completions and a per-CPU LAPIC
+  timer for the preemption tick; it keeps the 8259 PIC and the PIT as fallbacks
+  when no MADT is present. The rest of the kernel still asks only for "the IRQ
+  for this line" and "EOI this line" without knowing which controller answers --
+  the seam paid off exactly as intended.
+- **Symmetric multiprocessing, under a single big kernel lock.** Plinth boots
+  every CPU the MADT lists: the BSP wakes each application processor with
+  INIT-SIPI-SIPI through a real-mode trampoline (`smp.rs`) that walks it to long
+  mode and into Rust. Per-CPU state (the current process, the kernel stacks)
+  lives behind `IA32_GS_BASE` (`percpu.rs`); a single big kernel lock serializes
+  every shared structure; a reschedule IPI wakes a halted core when work
+  appears. A process is pinned to the core that first schedules it -- no
+  cross-core migration yet -- which is the first step toward per-core ownership,
+  not a stopgap. Scaling the lock (per-CPU run queues, work stealing) is
+  deliberately deferred until contention data asks for it; a uniprocessor
+  (`-smp 1`) lane is kept as the deterministic regression net. The direction is
+  share-nothing, not faster locks.
 - **Self-paging is signal delivery, kept honest.** A `#PF` in a registered
   lazy region is delivered to a ring-3 handler by saving the full faulting
   register context, `iretq`-ing into the handler on its own stack, and a
@@ -431,6 +453,9 @@ Three layers, all in CI on every push:
    baseline around each demo, since the cross-process interleaving is
    deliberately nondeterministic. `PLINTH_ICOUNT` can pin the interleaving
    reproducibly for debugging; the kernel never depends on it.
+   `cargo xtask smoke-smp` reruns the same interleaving-robust assertions on 2,
+   3, and 4 cores -- the SMP regression lane, since multicore output is no
+   longer a fixed transcript the single-core boot can stand in for.
 3. `cargo xtask check` -- static lint: every syscall `asm!` block in libplinth
    must declare the full clobber set the kernel ABI implies.
 
@@ -442,10 +467,13 @@ your own programs and library OSes against it; growing Plinth toward a
 genuinely usable general-purpose exokernel is the ongoing direction
 ([ROADMAP.md](ROADMAP.md)).
 
-- **One CPU.** The kernel is uniprocessor; SMP and real-machine device support
-  are the next roadmap item. The non-preemptible-kernel, no-lock discipline
-  the design rests on assumes a single core, so SMP is a concurrency redesign,
-  not a flag.
+- **SMP, but not yet scaled.** Plinth boots and schedules on multiple cores,
+  but all kernel entry serializes on a single big kernel lock, so adding cores
+  does not yet add kernel throughput. Per-CPU run queues and work stealing -- the
+  step that makes the lock stop being a bottleneck -- are the next roadmap item,
+  deferred on purpose until there is contention data to justify the complexity.
+  Real-machine device support (leaving QEMU's defaults) is the milestone after
+  that.
 - **`write` is uncapability-gated console output** for demo legibility -- the
   one call that is not behind a capability. A single `write` is atomic with
   respect to other processes, so interleaved demos never tear a line.

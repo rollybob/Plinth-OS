@@ -12,6 +12,29 @@ block (hidden behind the `libplinth` wrapper).
 ## [Unreleased]
 
 ### Added
+- Broader hardware -- APIC (Stages A1-A3). Interrupt delivery moved off the 8259
+  PIC. A hand-rolled, bounded ACPI **MADT parser** (`kernel/src/acpi.rs`,
+  modeled on the PCI enumerator -- no ACPI crate, no AML) discovers the CPU and
+  interrupt-controller topology, and the `irq` seam now drives the **Local APIC
+  + I/O APIC**, with the 8259 kept as a fallback when no MADT is present.
+  virtio-blk completions moved to **MSI-X** (retiring the level-triggered INTx
+  deassert dance) and the preemption tick to the **per-CPU LAPIC timer** (the
+  PIT kept as a fallback). All still uniprocessor and byte-identical under
+  `PLINTH_ICOUNT` -- the seam swapped underneath with nothing above it changing.
+- Broader hardware -- SMP (Stages B1-B2). The kernel now boots and schedules on
+  every CPU the MADT lists. Each application processor is woken with
+  INIT-SIPI-SIPI and carried real -> protected -> long mode into Rust by a
+  trampoline (`kernel/src/smp.rs`); per-CPU state (current process, kernel
+  stacks) lives behind `IA32_GS_BASE` (`kernel/src/percpu.rs`; `gdt.rs` and
+  `syscall.rs` rebuilt per-core); a **single big kernel lock**
+  (`kernel/src/bkl.rs`, held entry-to-exit) serializes every shared kernel
+  static, and a reschedule IPI wakes a halted core when work appears. A process
+  is pinned to the core that first schedules it (no cross-core migration yet).
+  The non-preemptible-kernel discipline narrows from "single CPU" to "per core,
+  while holding the lock"; the ABI is unchanged -- SMP is entirely
+  kernel-internal. A new `cargo xtask smoke-smp` reruns the smoke assertion
+  battery on 2-4 cores (wired into CI); the `-smp 1` lane keeps the
+  deterministic line-by-line contract as a regression net.
 - Interrupt-driven blocking block I/O (storage Stage 4). `block_read` no longer
   busy-polls the device with interrupts off: the issuing process now goes
   **Blocked** and the CPU runs other processes (or idles) until the disk's
