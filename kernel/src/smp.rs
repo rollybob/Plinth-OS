@@ -127,13 +127,15 @@ const GDT_CODE64: u64 = (1 << 41) | (1 << 43) | (1 << 44) | (1 << 47) | (1 << 53
 // Rust `fn` pointer cast, written into the param block in
 // `install_trampoline`) rather than one hand-assembled here.
 //
-// The blob is Intel syntax (the default), but the two far jumps below must
-// switch to AT&T (`.att_syntax prefix`) and back: GAS only accepts the
-// immediate far-jump form `ljmp $sel, $off` in AT&T mode. `options(att_syntax)`
-// is all-or-nothing for the whole block, so it cannot express a two-instruction
-// switch -- the local `.att_syntax`/`.intel_syntax` directives are deliberate.
-// The `bad_asm_style` lint they trip is allowed at module level above (an
-// item-level allow on `global_asm!` is not honored for this lint).
+// The blob is Intel syntax (the default); the two far jumps are the only
+// instructions that must drop to AT&T (`.att_syntax prefix`) and back, because
+// LLVM's integrated assembler -- which `global_asm!` uses, NOT GAS -- will not
+// encode an immediate far jump in Intel syntax. Confirmed against the pinned
+// toolchain: every Intel spelling (`jmp 0x08:..`, `ljmp 0x08:..`, `jmp far ..`)
+// errors; only the AT&T `ljmp $sel, $off` assembles. `options(att_syntax)` is
+// whole-block, so it cannot express a two-instruction switch; the local
+// directives are deliberate, and `bad_asm_style` is allowed at module level
+// above.
 core::arch::global_asm!(
     r#"
 .global ap_trampoline16_start
