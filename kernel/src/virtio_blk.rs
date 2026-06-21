@@ -19,9 +19,8 @@ use spin::Mutex;
 use x86_64::structures::idt::InterruptStackFrame;
 
 use crate::bkl;
-use crate::capability::{CapObject, RIGHT_READ, RIGHT_WRITE};
 use crate::frame_alloc::{FRAME_ALLOC, FRAME_SIZE};
-use crate::{interrupts, irq, memory, process, scheduler};
+use crate::{interrupts, irq, memory, scheduler};
 use crate::pci::{self, VirtioBlkInfo};
 
 // --- virtio_pci_common_cfg field offsets (virtio 1.x, 4.1.4.3) ---
@@ -73,17 +72,18 @@ const VIRTIO_BLK_S_OK: u8 = 0;
 /// logical block size. This is the sector unit `BlockRange` will count (D3a).
 const SECTOR_SIZE: u64 = 512;
 
-/// `block_read` status words, returned in rax (the C1 status/payload split: the
-/// data lands in the caller's frame, so no read-back byte can be confused for an
-/// error). Mirrored in libplinth as BLK_*. `block_read` is an `int 0x80` op
-/// (Stage 4 S4a) because a blocking call needs a resumable trap frame.
+/// Block I/O status codes. The data lands in the caller's frame, so status is
+/// its own word and no read-back byte can be confused for an error. These ride
+/// the CQ entry's `status` field (Design/async_rings.md s4) and are mirrored in
+/// libplinth as BLK_*; the block I/O path is the ring ABI (`rings`), the
+/// `block_read` syscall having been retired in ABI v2.4.
 pub const BLK_OK: u64 = 0;
 /// count is zero, or count*512 would overflow the I/O frame.
-const BLK_E_BADARG: u64 = 1;
+pub const BLK_E_BADARG: u64 = 1;
 /// The request falls outside the holder's BlockRange (multiplexing guarantee).
-const BLK_E_RANGE: u64 = 2;
+pub const BLK_E_RANGE: u64 = 2;
 /// Bad slot, wrong object kind, or a missing right on the range or frame cap.
-const BLK_E_RIGHTS: u64 = 3;
+pub const BLK_E_RIGHTS: u64 = 3;
 /// The device reported an error or is not initialised.
 pub const BLK_E_DEV: u64 = 4;
 
@@ -104,6 +104,116 @@ const POLL_MAX: u64 = 50_000_000;
 /// vectors have no relationship to `intr_line`. One per device, by index.
 const MSIX_VECTOR_BASE: u8 = 0x30;
 
+/// Descriptors per request: a virtio-blk read is a 3-descriptor chain (the
+/// 16-byte header the device reads, the data buffer it writes, the 1-byte status
+/// it writes). The in-flight depth is `qsize / DESC_PER_REQ` requests.
+const DESC_PER_REQ: u16 = 3;
+
+/// Upper bound on concurrent in-flight requests, fixed by the largest queue we
+/// accept (`QUEUE_SIZE_MAX`). Sizes the per-device pool arrays and the
+/// header/status buffer layout; the actual usable count (`Inflights::slots`) is
+/// `qsize / DESC_PER_REQ` for the device's negotiated `qsize`.
+const MAX_SLOTS: usize = (QUEUE_SIZE_MAX / DESC_PER_REQ) as usize;
+
+/// Bytes per request header in the shared buffer frame. The status byte regions
+/// start after all `MAX_SLOTS` headers, so a slot's header and status never
+/// overlap another slot's (the device writes each concurrently).
+const HDR_BYTES: u64 = 16;
+const STATUS_REGION_OFF: u64 = MAX_SLOTS as u64 * HDR_BYTES;
+
+/// Where a completed request's result must go -- the routing the completion
+/// handler reads out of the in-flight table.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Completion {
+    /// Boot polled selftest: there is no scheduler yet, so nothing is parked;
+    /// the poller reads the status directly from the drain.
+    Poll,
+    /// Ring path: post the result to ring `ring`'s CQ with this `user_data`
+    /// cookie, and wake the ring's owner if it is parked in `ring_wait`.
+    Ring { ring: usize, user_data: u64 },
+}
+
+/// Routing recorded for one in-flight request (Design/async_rings.md s5): the
+/// completion handler reads `target` to route the result.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Inflight {
+    pub(crate) target: Completion,
+}
+
+/// Per-device in-flight bookkeeping: a free pool of descriptor-chain slots plus
+/// the routing entry for each live slot. This is the completion-demux core
+/// (Design/async_rings.md section 5) factored as pure logic over plain arrays --
+/// no MMIO -- so it is unit-testable host-side with a fake used ring, exactly
+/// like `ipc::WaitQueue`. The MMIO (writing descriptors, reading the status
+/// byte and used ring) stays in `VirtioBlk`; this owns only the bookkeeping.
+///
+/// Slot `i` owns the descriptor chain anchored at head `i * DESC_PER_REQ`, so a
+/// head and its slot convert by multiply/divide. The device echoes the chain
+/// head back in the used-ring `id`, which is the demux key.
+pub(crate) struct Inflights {
+    /// `routing[slot]` is `Some` iff that slot is live (submitted, not yet
+    /// completed). Doubles as the liveness marker the completion path validates.
+    routing: [Option<Inflight>; MAX_SLOTS],
+    /// Free slot indices, as a stack: `free[..free_len]` are available.
+    free: [u16; MAX_SLOTS],
+    free_len: usize,
+    /// Usable slot count for this device (`qsize / DESC_PER_REQ`, <= MAX_SLOTS).
+    slots: usize,
+}
+
+impl Inflights {
+    /// Build a pool of `slots` usable request slots (caller passes
+    /// `qsize / DESC_PER_REQ`, capped at `MAX_SLOTS`). All slots start free.
+    pub(crate) fn new(slots: usize) -> Self {
+        let slots = slots.min(MAX_SLOTS);
+        let mut free = [0u16; MAX_SLOTS];
+        for i in 0..slots {
+            free[i] = i as u16;
+        }
+        Inflights { routing: [None; MAX_SLOTS], free, free_len: slots, slots }
+    }
+
+    /// Claim a free slot, record its routing, and return the descriptor-chain
+    /// head to post. `None` when the pool is full (in-flight at capacity).
+    pub(crate) fn submit(&mut self, info: Inflight) -> Option<u16> {
+        if self.free_len == 0 {
+            return None;
+        }
+        self.free_len -= 1;
+        let slot = self.free[self.free_len] as usize;
+        self.routing[slot] = Some(info);
+        Some(slot as u16 * DESC_PER_REQ)
+    }
+
+    /// Map a used-ring `id` (a chain head) to its slot, if it is a head we could
+    /// have issued. Rejects a non-chain-aligned or out-of-range id.
+    fn slot_of(&self, head: u16) -> Option<usize> {
+        if head % DESC_PER_REQ != 0 {
+            return None;
+        }
+        let slot = (head / DESC_PER_REQ) as usize;
+        (slot < self.slots).then_some(slot)
+    }
+
+    /// Complete the request at chain `head`: take its routing and return the
+    /// slot to the free pool. `None` if `head` is not a live, kernel-issued head
+    /// (a device/spec violation: an id we never issued or already completed) --
+    /// the caller drops it rather than waking a stale or wrong waiter.
+    pub(crate) fn complete(&mut self, head: u16) -> Option<Inflight> {
+        let slot = self.slot_of(head)?;
+        let info = self.routing[slot].take()?;
+        self.free[self.free_len] = slot as u16;
+        self.free_len += 1;
+        Some(info)
+    }
+
+    /// True if any slot is live. The scheduler treats a process blocked on disk
+    /// as a legitimate idle (not a deadlock) while this holds.
+    pub(crate) fn any_live(&self) -> bool {
+        self.free_len < self.slots
+    }
+}
+
 /// The brought-up device. Holds virtual addresses (and the physical addresses
 /// the device DMAs to/from) as plain integers, so the struct is `Send` and can
 /// live in a static behind a spinlock.
@@ -118,11 +228,14 @@ struct VirtioBlk {
     desc_va: u64,
     avail_va: u64,
     used_va: u64,
-    /// Request header (16 B) and status byte (1 B), in one frame.
-    hdr_va: u64,
-    hdr_phys: u64,
-    status_va: u64,
-    status_phys: u64,
+    /// One frame holding the per-slot request headers (16 B each, slot `i` at
+    /// offset `i*HDR_BYTES`) followed by the per-slot status bytes (1 B each,
+    /// slot `i` at `STATUS_REGION_OFF + i`). Per-slot so concurrent requests do
+    /// not share the device-written status byte.
+    buf_va: u64,
+    buf_phys: u64,
+    /// In-flight free pool + completion-demux routing (Design/async_rings.md s5).
+    inflights: Inflights,
     /// Last used-ring index we have consumed (the ring's idx is free-running).
     last_used: u16,
     /// Device capacity in 512-byte sectors (virtio-blk device-config offset 0).
@@ -142,11 +255,6 @@ struct VirtioBlk {
     /// `irq::apic_mode()`, with a MADT-supplied LAPIC to target). `None` means
     /// this device is on the INTx fallback (`intr_line` instead).
     msix_vector: Option<u8>,
-    /// The process slot blocked waiting for this device's I/O completion, if
-    /// any. One waiter per device (a device's Mutex serialises requests, so at
-    /// most one read is ever outstanding); woken by the completion IRQ. Named by
-    /// the existing BlockRange, so no new capability (S4d).
-    waiter: Option<usize>,
 }
 
 /// One slot per virtio-blk device the kernel tracks (pci::MAX_DEVICES). A
@@ -217,16 +325,45 @@ fn alloc_zeroed(phys_offset: u64) -> Result<(u64, u64), &'static str> {
 }
 
 impl VirtioBlk {
+    // Per-slot header/status addresses in the shared buffer frame. Slot `i`'s
+    // header is at `i*HDR_BYTES`; its status byte follows all the headers, at
+    // `STATUS_REGION_OFF + i`.
+    fn hdr_va(&self, slot: usize) -> u64 {
+        self.buf_va + slot as u64 * HDR_BYTES
+    }
+    fn hdr_phys(&self, slot: usize) -> u64 {
+        self.buf_phys + slot as u64 * HDR_BYTES
+    }
+    fn status_va(&self, slot: usize) -> u64 {
+        self.buf_va + STATUS_REGION_OFF + slot as u64
+    }
+    fn status_phys(&self, slot: usize) -> u64 {
+        self.buf_phys + STATUS_REGION_OFF + slot as u64
+    }
+
     /// Post a 3-descriptor read of `count` 512-byte sectors starting at `sector`
     /// into the buffer at `data_phys` (the device DMAs there; the buffer must
-    /// hold count*512 bytes) and notify the device. Does NOT wait: the caller
-    /// either polls (`completed` + `take_completion`, the boot path) or blocks
-    /// until the completion IRQ (the runtime path). `want_interrupt` sets the
-    /// avail-ring NO_INTERRUPT flag accordingly.
-    fn post_request(&mut self, sector: u64, count: u64, data_phys: u64, want_interrupt: bool) {
+    /// hold count*512 bytes), using the descriptor chain anchored at `head` (a
+    /// slot the caller claimed from `inflights`), and notify the device. Does
+    /// NOT wait: the caller either polls (`drain_completions`, the boot path) or
+    /// blocks until the completion IRQ (the runtime path). `want_interrupt` sets
+    /// the avail-ring NO_INTERRUPT flag accordingly.
+    fn post_request(
+        &mut self,
+        head: u16,
+        sector: u64,
+        count: u64,
+        data_phys: u64,
+        want_interrupt: bool,
+    ) {
+        let slot = (head / DESC_PER_REQ) as usize;
+        let hdr_phys = self.hdr_phys(slot);
+        let status_phys = self.status_phys(slot);
         // SAFETY: all addresses below are kernel-mapped ring/MMIO/buffer
         // addresses set up in `init`; data_phys is a caller-owned frame. The
-        // device touches only what these descriptors name.
+        // descriptor chain [head, head+1, head+2] is within the queue (head <=
+        // (slots-1)*DESC_PER_REQ < qsize). The device touches only what these
+        // descriptors name.
         unsafe {
             // Avail flags (offset 0): tell the device whether to raise a
             // completion interrupt for the requests we publish. Set before the
@@ -234,35 +371,36 @@ impl VirtioBlk {
             let flags = if want_interrupt { 0 } else { VIRTQ_AVAIL_F_NO_INTERRUPT };
             w16(self.avail_va, flags);
 
-            // Request header (device reads it) and a status sentinel.
-            w32(self.hdr_va, VIRTIO_BLK_T_IN);
-            w32(self.hdr_va + 4, 0);
-            w64(self.hdr_va + 8, sector);
-            w8(self.status_va, 0xFF);
+            // This slot's request header (device reads it) and status sentinel.
+            w32(self.hdr_va(slot), VIRTIO_BLK_T_IN);
+            w32(self.hdr_va(slot) + 4, 0);
+            w64(self.hdr_va(slot) + 8, sector);
+            w8(self.status_va(slot), 0xFF);
 
-            // Three chained descriptors (each 16 B: addr, len, flags, next).
-            let d = self.desc_va;
-            w64(d, self.hdr_phys);
+            // Three chained descriptors (each 16 B: addr, len, flags, next) at
+            // this chain's head, linking head -> head+1 -> head+2.
+            let d = self.desc_va + head as u64 * 16;
+            w64(d, hdr_phys);
             w32(d + 8, 16);
             w16(d + 12, VIRTQ_DESC_F_NEXT);
-            w16(d + 14, 1);
+            w16(d + 14, head + 1);
 
             w64(d + 16, data_phys);
             w32(d + 24, (count * SECTOR_SIZE) as u32);
             w16(d + 28, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
-            w16(d + 30, 2);
+            w16(d + 30, head + 2);
 
-            w64(d + 32, self.status_phys);
+            w64(d + 32, status_phys);
             w32(d + 40, 1);
             w16(d + 44, VIRTQ_DESC_F_WRITE);
             w16(d + 46, 0);
 
-            // Publish into the available ring (idx@2, ring@4), then bump idx.
-            // Fence so the descriptors are visible before the index, and the
-            // index before the notify.
+            // Publish this chain head into the available ring (idx@2, ring@4),
+            // then bump idx. Fence so the descriptors are visible before the
+            // index, and the index before the notify.
             let avail_idx = r16(self.avail_va + 2);
             let ring_slot = (avail_idx % self.qsize) as u64;
-            w16(self.avail_va + 4 + ring_slot * 2, 0); // head descriptor = 0
+            w16(self.avail_va + 4 + ring_slot * 2, head);
             fence(Ordering::SeqCst);
             w16(self.avail_va + 2, avail_idx.wrapping_add(1));
             fence(Ordering::SeqCst);
@@ -274,46 +412,91 @@ impl VirtioBlk {
         }
     }
 
-    /// True once the device has completed the outstanding request (its used-ring
-    /// index moved past the one we last consumed). Side-effect free.
-    fn completed(&self) -> bool {
-        // SAFETY: used_va is the mapped used ring; reading its idx@2 is a read.
-        unsafe { r16(self.used_va + 2) != self.last_used }
-    }
+    /// Drain every newly-completed used-ring element (from `last_used` to the
+    /// device's current used idx). For each: read the chain head the device
+    /// echoes in `id`, read that slot's status byte, and route the completion
+    /// through `inflights` (free the slot, take its routing). Records each
+    /// completion's `(target, status)` into `out` for the caller to act on after
+    /// dropping the device lock. Returns how many it recorded.
+    ///
+    /// This is the completion demux (Design/async_rings.md s5): the device's
+    /// echoed head is the routing key, mapping one-to-one to the slot that
+    /// issued it. Call under the device lock.
+    fn drain_completions(&mut self, out: &mut [(Completion, u64)]) -> usize {
+        // SAFETY: used_va is the mapped used ring; idx@2 and the 8-byte elements
+        // at +4 are device-written. The fence orders the status read after the
+        // device advanced the used ring (and thus wrote the status byte).
+        let used_idx = unsafe { r16(self.used_va + 2) };
+        let mut n = 0;
+        while self.last_used != used_idx {
+            fence(Ordering::SeqCst);
+            let ring_slot = (self.last_used % self.qsize) as u64;
+            // Used element: { id: u32, len: u32 }; id is the chain head.
+            let head = unsafe { r32(self.used_va + 4 + ring_slot * 8) } as u16;
 
-    /// Consume one completion: advance our used-ring cursor and check the status
-    /// byte the device wrote. Call exactly once per request the device finished
-    /// (after `completed` is true, or from the completion IRQ handler).
-    fn take_completion(&mut self) -> Result<(), &'static str> {
-        fence(Ordering::SeqCst);
-        self.last_used = self.last_used.wrapping_add(1);
-        // SAFETY: status_va is the mapped status byte; the device wrote it before
-        // advancing the used ring, and the fence orders our read after that.
-        if unsafe { r8(self.status_va) } != VIRTIO_BLK_S_OK {
-            return Err("virtio-blk read failed (device status)");
+            // Read the status byte before returning the slot to the pool. Guard
+            // the address on a valid head so a device that echoes garbage cannot
+            // make us read outside the buffer frame.
+            let status = match self.inflights.slot_of(head) {
+                // SAFETY: status_va(slot) is this slot's mapped status byte.
+                Some(slot) => {
+                    if unsafe { r8(self.status_va(slot)) } == VIRTIO_BLK_S_OK {
+                        BLK_OK
+                    } else {
+                        BLK_E_DEV
+                    }
+                }
+                None => BLK_E_DEV,
+            };
+
+            // Route it. `complete` returns None for an id we never issued or
+            // already completed (a device/spec violation) -- drop it rather than
+            // wake a stale waiter.
+            if let Some(info) = self.inflights.complete(head) {
+                if n < out.len() {
+                    out[n] = (info.target, status);
+                    n += 1;
+                }
+            }
+            self.last_used = self.last_used.wrapping_add(1);
         }
-        Ok(())
+        n
     }
 
     /// Synchronous polled read for the boot path: there is no scheduler yet, so
-    /// nothing can be blocked. Post with the completion interrupt suppressed,
-    /// spin (bounded, faulting on timeout per D6) on the used ring, and consume.
+    /// nothing can be blocked. Claim a slot, post with the completion interrupt
+    /// suppressed, spin (bounded, faulting on timeout per D6) on the used ring,
+    /// then drain the one completion.
     fn read_block_polled(
         &mut self,
         sector: u64,
         count: u64,
         data_phys: u64,
     ) -> Result<(), &'static str> {
-        self.post_request(sector, count, data_phys, false);
+        let head = self
+            .inflights
+            .submit(Inflight { target: Completion::Poll })
+            .ok_or("virtio-blk free pool exhausted")?;
+        self.post_request(head, sector, count, data_phys, false);
         let mut spins = 0u64;
-        while !self.completed() {
+        // SAFETY: used_va is the mapped used ring; reading idx@2 is a read.
+        while unsafe { r16(self.used_va + 2) } == self.last_used {
             spins += 1;
             if spins >= POLL_MAX {
+                self.inflights.complete(head); // do not leak the slot on timeout
                 return Err("virtio-blk read timed out");
             }
             core::hint::spin_loop();
         }
-        self.take_completion()
+        let mut done = [(Completion::Poll, 0u64); 1];
+        if self.drain_completions(&mut done) == 0 {
+            return Err("virtio-blk completion drain found nothing");
+        }
+        if done[0].1 == BLK_OK {
+            Ok(())
+        } else {
+            Err("virtio-blk read failed (device status)")
+        }
     }
 }
 
@@ -490,6 +673,11 @@ pub fn init<W: Write>(
     // SAFETY: device_cfg is the mapped device-config MMIO.
     let capacity = unsafe { r64(device_cfg) };
 
+    // In-flight depth: how many 3-descriptor chains fit the negotiated queue.
+    // One buffer frame holds all the per-slot headers + status bytes (at most
+    // MAX_SLOTS*HDR_BYTES + MAX_SLOTS bytes, well under a 4 KiB frame).
+    let slots = (qsize / DESC_PER_REQ) as usize;
+
     *DEVICES[dev].lock() = Some(VirtioBlk {
         notify,
         notify_mult: info.notify_mult,
@@ -498,17 +686,14 @@ pub fn init<W: Write>(
         desc_va,
         avail_va,
         used_va,
-        // Header at the start of the buffer frame, status byte just past it.
-        hdr_va: buf_va,
-        hdr_phys: buf_phys,
-        status_va: buf_va + 16,
-        status_phys: buf_phys + 16,
+        buf_va,
+        buf_phys,
+        inflights: Inflights::new(slots),
         last_used: 0,
         capacity,
         isr_va: isr,
         intr_line: info.intr_line,
         msix_vector,
-        waiter: None,
     });
 
     let _ = writeln!(
@@ -552,87 +737,35 @@ pub fn read(dev: usize, sector: u64, count: u64, data_phys: u64) -> Result<(), &
     }
 }
 
-/// block_read(range_slot, frame_slot, sector_off, count): read `count` 512-byte
-/// sectors -- starting `sector_off` sectors into the BlockRange capability at
-/// `range_slot` -- into the frame named by `frame_slot`, BLOCKING until the
-/// device completes. Reached from the `int 0x80` dispatch (op 5): a process that
-/// must wait for I/O is parked and resumed by the completion IRQ, exactly like a
-/// blocked IPC receiver -- which is why this needs the gate's resumable trap
-/// frame, not the `syscall` fast path (Stage 4 S4a). `frame_ptr` is this call's
-/// saved trap frame. Returns a status word (BLK_OK or a BLK_E_* code), never a
-/// data value (the data DMAs into the caller's frame).
+/// Post one ring-submitted read into device `dev`: claim an in-flight slot
+/// recording the CQ routing (`ring` + `user_data`), then post the 3-descriptor
+/// chain at the caller's frame physical address with completion interrupts
+/// enabled. Returns `Ok(())` once posted, or `Err(())` when the device's
+/// in-flight pool is full -- the ring drain treats that as backpressure (R6) and
+/// stops, leaving the remaining SQ entries for the libOS to resubmit. The
+/// completion IRQ (`complete_irq`) routes the result to the ring's CQ.
 ///
-/// Two checks make this the exokernel multiplexing surface: the request must
-/// fall inside the holder's range (so a BlockRange cannot read another libOS's
-/// blocks), and the frame must be the holder's with RIGHT_WRITE (so the device
-/// DMAs only into a frame the caller owns). The range start is added by the
-/// kernel -- the holder names sectors relative to its range, never absolute.
-pub fn block_read(
-    range_slot: u64,
-    frame_slot: u64,
-    sector_off: u64,
+/// The device-facing half of `rings::ring_submit`: the caller has already run
+/// the two cap-checks and resolved `abs_sector`/`frame_phys`, so this only owns
+/// the slot claim + virtqueue post. The IF=0 no-lost-wakeup argument lives in
+/// `ring_wait`: the completion IRQ cannot wake a ring before the libOS parks on
+/// it, the same discipline the IPC ops rely on.
+pub fn ring_post(
+    dev: usize,
+    abs_sector: u64,
     count: u64,
-    frame_ptr: u64,
-) -> u64 {
-    // Bound the transfer: at least one sector, and it must fit the I/O frame.
-    if count == 0 || count.saturating_mul(SECTOR_SIZE) > FRAME_SIZE {
-        return BLK_E_BADARG;
-    }
-
-    // Resolve both capabilities under the CURRENT lock, then drop it before
-    // touching the device or blocking -- nothing below needs CURRENT.
-    let (dev, abs_sector, frame_phys) = {
-        let cur = process::current().lock();
-        let Some(proc) = cur.as_ref() else {
-            return BLK_E_RIGHTS;
-        };
-
-        // The BlockRange: RIGHT_READ to read from the disk.
-        let Ok(range) = proc.caps.lookup(range_slot as usize, RIGHT_READ) else {
-            return BLK_E_RIGHTS;
-        };
-        let CapObject::BlockRange { dev, start, count: range_count } = range.object else {
-            return BLK_E_RIGHTS;
-        };
-        // Multiplexing guarantee: [sector_off, sector_off+count) must lie inside
-        // [0, range_count). Checked-add so a huge sector_off cannot wrap past it.
-        let Some(end) = sector_off.checked_add(count) else {
-            return BLK_E_RANGE;
-        };
-        if end > range_count {
-            return BLK_E_RANGE;
-        }
-
-        // The I/O frame: RIGHT_WRITE, since the device DMAs into it.
-        let Ok(frame) = proc.caps.lookup(frame_slot as usize, RIGHT_WRITE) else {
-            return BLK_E_RIGHTS;
-        };
-        let CapObject::Frame { addr } = frame.object else {
-            return BLK_E_RIGHTS;
-        };
-
-        (dev as usize, start + sector_off, addr)
-    };
-
-    // Post the request with completion interrupts enabled and record this
-    // process as the device's waiter, then block. We are IF=0 from the int 0x80
-    // entry, so the completion INTx cannot be delivered between recording the
-    // waiter and blocking -- it stays latched at the PIC until the idle path's
-    // `sti`, by which point this process is already Blocked. No lost wakeup, the
-    // same IF=0 discipline IPC and event_recv rely on. The completion handler
-    // (`complete_irq`) wakes us with BLK_OK / BLK_E_DEV in rax.
-    {
-        let mut guard = match DEVICES.get(dev) {
-            Some(g) => g.lock(),
-            None => return BLK_E_DEV,
-        };
-        let Some(d) = guard.as_mut() else {
-            return BLK_E_DEV;
-        };
-        d.waiter = Some(scheduler::current_slot());
-        d.post_request(abs_sector, count, frame_phys, true);
-    } // drop the device lock BEFORE blocking -- block_current never returns here.
-    scheduler::block_current(frame_ptr)
+    frame_phys: u64,
+    ring: usize,
+    user_data: u64,
+) -> Result<(), ()> {
+    let mut guard = DEVICES.get(dev).ok_or(())?.lock();
+    let d = guard.as_mut().ok_or(())?;
+    let head = d
+        .inflights
+        .submit(Inflight { target: Completion::Ring { ring, user_data } })
+        .ok_or(())?;
+    d.post_request(head, abs_sector, count, frame_phys, true);
+    Ok(())
 }
 
 /// True if any device has a process blocked waiting for I/O completion. The
@@ -640,7 +773,8 @@ pub fn block_read(
 /// blocked on disk as a legitimate idle -- the completion IRQ can still wake it
 /// -- rather than an IPC deadlock (S4e).
 pub fn any_waiter() -> bool {
-    (0..pci::MAX_DEVICES).any(|dev| DEVICES[dev].lock().as_ref().is_some_and(|d| d.waiter.is_some()))
+    (0..pci::MAX_DEVICES)
+        .any(|dev| DEVICES[dev].lock().as_ref().is_some_and(|d| d.inflights.any_live()))
 }
 
 /// Service device `dev`'s completion interrupt, consume the completion, wake
@@ -657,7 +791,10 @@ pub fn any_waiter() -> bool {
 ///   `irq::eoi` already makes under APIC mode for any vector, so passing `0`
 ///   is just "not a PIC line", never read on this path.
 fn complete_irq(dev: usize) {
-    let (woken, eoi_line) = {
+    // One completion IRQ can cover several finished requests; drain them all,
+    // then route each demuxed completion.
+    let mut done = [(Completion::Poll, 0u64); MAX_SLOTS];
+    let (n, eoi_line) = {
         let Some(g) = DEVICES.get(dev) else {
             return;
         };
@@ -674,21 +811,28 @@ fn complete_irq(dev: usize) {
                 d.intr_line
             }
         };
-        let woken = if d.completed() {
-            let status = match d.take_completion() {
-                Ok(()) => BLK_OK,
-                Err(_) => BLK_E_DEV,
-            };
-            d.waiter.take().map(|w| (w, status))
-        } else {
-            None
-        };
-        (woken, eoi_line)
+        (d.drain_completions(&mut done), eoi_line)
     };
-    // Wake outside the device lock (wake_with touches the scheduler table, not
-    // the device). NO_CAP in rdx -- block_read returns a status word only.
-    if let Some((waiter, status)) = woken {
-        scheduler::wake_with(waiter, status, 0, u64::MAX);
+    // Route each completion after dropping the device lock. Posting to a CQ
+    // touches the ring frame + RINGS table, not the device, and the whole IRQ
+    // runs under the BKL (which serialises CQ writes), so the per-device lock is
+    // not needed for it. Collect the ring owners to wake, then wake them last
+    // (wake_with touches the scheduler table).
+    let mut wakes = [0usize; MAX_SLOTS];
+    let mut wn = 0;
+    for &(target, status) in &done[..n] {
+        if let Completion::Ring { ring, user_data } = target {
+            if let Some(owner) = crate::rings::post_completion(ring, user_data, status) {
+                wakes[wn] = owner;
+                wn += 1;
+            }
+        }
+        // Completion::Poll cannot occur here: the boot poller drains its own
+        // request synchronously, before completion IRQs are enabled.
+    }
+    for &w in &wakes[..wn] {
+        // Woken from ring_wait: it just returns 0 and the libOS reaps the CQ.
+        scheduler::wake_with(w, 0, 0, u64::MAX);
     }
     irq::eoi(eoi_line);
 }

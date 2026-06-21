@@ -376,6 +376,11 @@ pub fn teardown(mut proc: Process, boot_frames: &[Option<(u64, u64)>]) {
         if let CapObject::Frame { addr } = cap.object {
             let _ = fa.dealloc(addr);
         }
+        // A ring capability leaving permanently: release its kernel table slot.
+        // The SQ/CQ frames are ordinary Frame caps, reclaimed by the arm above.
+        if let CapObject::Ring { id } = cap.object {
+            crate::rings::release(id);
+        }
         // An endpoint capability leaving permanently: drop its reference and
         // free the endpoint slot if this was the last one able to reach it.
         // This is the single permanent-removal site, so the only place the

@@ -12,11 +12,14 @@
 //! |  8 | fault_return| --                  | (resumes), or ERR        |
 //! |  9 | spawn       | child_id, slot      | child exit code, or ERR  |
 //! | 11 | spawn_buf   | buf_va, len, slot   | wait handle, or ERR      |
+//! | 12 | ring_register | sq_slot, cq_slot, entries | ring cap slot, or ERR |
+//! | 13 | ring_submit | ring                | count posted, or ERR     |
 //!
 //! Nr 10 (block_read) was retired in ABI v2.3: a blocking read must suspend and
 //! resume with a return value, which needs the full resumable trap frame only an
-//! interrupt entry saves -- so block_read moved to the `int 0x80` gate (op 5),
-//! alongside the blocking IPC ops and event_recv. See ipc.rs / virtio_blk.rs.
+//! interrupt entry saves -- so it moved to the `int 0x80` gate. In v2.4 that gate
+//! op was retired too: block I/O is now the async-ring ABI (nr 12/13 here +
+//! ring_wait on the `int 0x80` gate, op 6). See rings.rs / virtio_blk.rs.
 //!
 //! This is the whole kernel interface, and that is the point: memory
 //! arrives as raw frames through capabilities, and everything resembling
@@ -180,9 +183,15 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         8 => sys_fault_return(),
         9 => sys_spawn(a1, a2),
         // nr 10 (block_read) was retired in ABI v2.3: a blocking read needs a
-        // resumable trap frame, so block_read moved to the `int 0x80` gate (op
-        // 5, see ipc.rs / virtio_blk.rs). The number is left unused.
+        // resumable trap frame, so block_read moved to the `int 0x80` gate. That
+        // gate op was itself retired in v2.4 -- block I/O is now the ring ABI
+        // below. The number is left unused.
         11 => sys_spawn_from_buffer(a1, a2, a3),
+        // Async completion rings (ABI v2.4, Design/async_rings.md). register and
+        // submit are non-blocking, so they ride the fast `syscall` path; the
+        // blocking `ring_wait` is on the `int 0x80` gate (op 6, see ipc.rs).
+        12 => crate::rings::ring_register(a1, a2, a3),
+        13 => crate::rings::ring_submit(a1),
         _ => ERR,
     };
     unsafe { bkl::release() };

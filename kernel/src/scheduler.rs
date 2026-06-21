@@ -190,7 +190,6 @@ pub struct TrapFrame {
 /// let the IPC layer read syscall-style args from a trap frame and write the
 /// result back (ipc.rs).
 pub const GP_RAX: usize = 0;
-pub const GP_RCX: usize = 2;
 pub const GP_RDX: usize = 3;
 pub const GP_RSI: usize = 4;
 pub const GP_RDI: usize = 5;

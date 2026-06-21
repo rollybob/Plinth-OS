@@ -62,6 +62,10 @@ mod pci;
 // path, after PCI discovery.
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod virtio_blk;
+// Async completion rings are reached only from the userspace syscall path; the
+// test build stops before userspace, so silence the dead-code noise there.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod rings;
 // process/usermode are driven from the normal boot path only; the test
 // build stops before userspace, so silence their dead-code noise there.
 #[cfg_attr(feature = "tests", allow(dead_code))]

@@ -16,6 +16,7 @@ mod frame_alloc;
 mod input;
 mod ipc;
 mod scheduler;
+mod virtio_blk;
 
 use crate::frame_alloc::FrameAlloc;
 use crate::serial;
@@ -108,6 +109,11 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "ipc::ep_strand_last_side", run: ipc::ep_strand_last_side },
     TestCase { name: "ipc::ep_strand_not_last", run: ipc::ep_strand_not_last },
     TestCase { name: "ipc::ep_strand_no_reference", run: ipc::ep_strand_no_reference },
+    TestCase { name: "virtio_blk::inflight_distinct_heads", run: virtio_blk::inflight_distinct_heads },
+    TestCase { name: "virtio_blk::inflight_complete_routes", run: virtio_blk::inflight_complete_routes },
+    TestCase { name: "virtio_blk::inflight_complete_frees_and_refills", run: virtio_blk::inflight_complete_frees_and_refills },
+    TestCase { name: "virtio_blk::inflight_complete_unissued_none", run: virtio_blk::inflight_complete_unissued_none },
+    TestCase { name: "virtio_blk::inflight_complete_bad_head", run: virtio_blk::inflight_complete_bad_head },
     TestCase { name: "scheduler::picks_next_ready", run: scheduler::picks_next_ready },
     TestCase { name: "scheduler::skips_empty", run: scheduler::skips_empty },
     TestCase { name: "scheduler::wraps_around", run: scheduler::wraps_around },

@@ -36,7 +36,7 @@ use x86_64::{PrivilegeLevel, VirtAddr};
 use crate::bkl;
 use crate::capability::{CapObject, CapTable, Capability, RIGHT_RECV, RIGHT_SEND};
 use crate::process;
-use crate::scheduler::{self, TrapFrame, GP_RAX, GP_RCX, GP_RDI, GP_RDX, GP_RSI};
+use crate::scheduler::{self, TrapFrame, GP_RAX, GP_RDI, GP_RDX, GP_RSI};
 
 /// Software-interrupt vector for blocking IPC. DPL 3 so ring 3 may `int`.
 const IPC_VECTOR: usize = 0x80;
@@ -53,12 +53,14 @@ const IPC_REPLY: u64 = 3;
 /// trap frame, so the dispatch branches by subsystem (the handler lives in
 /// `input`, not here).
 const EVENT_RECV: u64 = 4;
-/// block_read: read disk sectors into a caller frame through a `BlockRange`
-/// capability. Also not IPC -- it shares this gate because a blocking I/O wait
-/// needs the same resumable trap frame (Stage 4 S4a). The handler lives in
-/// `virtio_blk`. It is the one gate op that takes a FOURTH argument (`count`,
-/// in rcx), since the device read needs (range, frame, sector_off, count).
-const BLOCK_READ: u64 = 5;
+/// Op 5 (block_read) was retired in ABI v2.4: block I/O is now the async-ring
+/// ABI, so the blocking wait is `ring_wait` below. The number is left unused.
+///
+/// ring_wait: block until a ring's CQ has an unreaped completion. Not IPC -- it
+/// shares this gate because a blocking wait needs the same resumable trap frame;
+/// the handler lives in `rings`. (register/submit are non-blocking and ride the
+/// `syscall` fast path, nr 12/13.)
+const RING_WAIT: u64 = 6;
 
 /// IPC status, returned in rax -- separate from the message payload (rsi) and
 /// the transferred-cap landing slot (rdx). Splitting status from the payload
@@ -436,11 +438,11 @@ extern "C" fn ipc_dispatch(frame: *mut TrapFrame) -> u64 {
 
     // SAFETY: the stub passes a pointer to the trap frame it built on the
     // current process's kernel stack; valid for this call. rax = op, rdi/rsi =
-    // args, rdx = the optional cap slot to transfer (send only) or block_read's
-    // sector offset, rcx = block_read's 4th arg (count).
-    let (op, a1, a2, a3, a4) = unsafe {
+    // args, rdx = the optional cap slot to transfer (send only). (The retired
+    // block_read also used rcx; no current gate op needs a fourth argument.)
+    let (op, a1, a2, a3) = unsafe {
         let f = &*frame;
-        (f.gp[GP_RAX], f.gp[GP_RDI], f.gp[GP_RSI], f.gp[GP_RDX], f.gp[GP_RCX])
+        (f.gp[GP_RAX], f.gp[GP_RDI], f.gp[GP_RSI], f.gp[GP_RDX])
     };
     let result = match op {
         IPC_SEND => ipc_send(a1, a2, a3, frame as u64),
@@ -450,9 +452,9 @@ extern "C" fn ipc_dispatch(frame: *mut TrapFrame) -> u64 {
         // Shares the gate, dispatched to the input subsystem (a1 = the
         // EventSource capability slot, in rdi).
         EVENT_RECV => crate::input::event_recv(a1, frame as u64),
-        // Shares the gate, dispatched to the storage subsystem. a1/a2/a3/a4 =
-        // range slot, frame slot, sector offset, count (rdi/rsi/rdx/rcx).
-        BLOCK_READ => crate::virtio_blk::block_read(a1, a2, a3, a4, frame as u64),
+        // Shares the gate, dispatched to the async-ring subsystem. a1 = the Ring
+        // capability slot (rdi). Blocks until the ring's CQ is non-empty.
+        RING_WAIT => crate::rings::ring_wait(a1, frame as u64),
         _ => IPC_ERR,
     };
     unsafe { bkl::release() };

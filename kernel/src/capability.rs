@@ -81,6 +81,14 @@ pub enum CapObject {
     /// not a pooled resource the capability owns, so teardown just drops it --
     /// no reference count (consistent with the D3b narrowing).
     EventSource { id: u8 },
+    /// A bound async completion ring (`id` indexes the kernel `rings` table),
+    /// minted by `ring_register` over a caller-owned SQ/CQ frame pair. The
+    /// holder submits (`ring_submit`) and waits (`ring_wait`) on it; it is bound
+    /// to the registering process (ring confinement), so unlike an Endpoint it is
+    /// never transferred and needs no reference count -- a single owner. Owns a
+    /// table slot (like an Endpoint), so teardown releases it via `rings::release`
+    /// (the SQ/CQ frames are ordinary Frame capabilities, freed on their own).
+    Ring { id: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

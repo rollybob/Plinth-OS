@@ -18,8 +18,13 @@
 //! |  7 | fault_reg   | entry, stack | 0, or SYS_ERR            |
 //! |  8 | fault_return| --           | (resumes faulting insn)  |
 //! |  9 | spawn       | child_id, slot| child exit code, or ERR |
-//! | 10 | block_read  | rng,frm,sec,cnt| BLK_OK, or a BLK_E_* code |
 //! | 11 | spawn_buf   | buf_va, len, slot| wait handle, or SYS_ERR |
+//! | 12 | ring_register | sq_slot, cq_slot, entries | ring cap slot, or ERR |
+//! | 13 | ring_submit | ring         | count posted, or SYS_ERR |
+//!
+//! Block I/O is the async-ring ABI (nr 12/13 + `ring_wait` on the `int 0x80`
+//! gate, op 6); `sys_block_read` is a single-in-flight shim over it. The old
+//! block_read syscall (nr 10, then `int 0x80` op 5) was retired in ABI v2.4.
 
 #![no_std]
 
@@ -203,11 +208,120 @@ pub const BLK_E_RIGHTS: u64 = 3;
 /// The device reported an error or is not initialised.
 pub const BLK_E_DEV: u64 = 4;
 
-/// block_read shares the `int 0x80` gate with IPC and event_recv (op 5): the
-/// read BLOCKS until the disk completes, and a blocking call needs the gate's
-/// resumable trap frame, not the `syscall` fast path (ABI v2.3). It is the one
-/// gate op with a FOURTH argument (`count`, in rcx).
-const BLOCK_READ: u64 = 5;
+// --- Async completion rings (ABI v2.4) --------------------------------------
+//
+// The block path is now the ring ABI (Design/async_rings.md). The kernel ships
+// the ring mechanism; this is a *reference* single-in-flight use of it -- the
+// `sys_block_read` shim below. A real library OS may build a many-in-flight
+// async executor over the same three calls instead.
+//
+// ring_register / ring_submit are non-blocking and ride the `syscall` fast path
+// (nr 12/13). ring_wait BLOCKS until the ring's CQ is non-empty, so it is on the
+// `int 0x80` gate (op 6), like the IPC ops -- a blocking call needs the gate's
+// resumable trap frame.
+
+const RING_WAIT: u64 = 6;
+
+/// ring_register(sq_slot, cq_slot, entries): bind two caller-owned frames (both
+/// mapped, read+write) as an SQ/CQ pair and return a ring capability slot, or
+/// SYS_ERR. `entries` must be a power of two that fits one frame (<= 64).
+#[inline]
+pub fn sys_ring_register(sq_slot: u64, cq_slot: u64, entries: u64) -> u64 {
+    syscall3(12, sq_slot, cq_slot, entries)
+}
+
+/// ring_submit(ring): the doorbell -- drain the SQ and post each request to the
+/// device. Returns the number of entries consumed (posted, or completed with an
+/// error status), which may be fewer than queued under backpressure; resubmit
+/// the remainder after reaping. SYS_ERR on a bad ring handle. Non-blocking.
+#[inline]
+pub fn sys_ring_submit(ring: u64) -> u64 {
+    syscall3(13, ring, 0, 0)
+}
+
+/// ring_wait(ring): block until the ring's CQ has at least one unreaped
+/// completion, then return 0 (the caller reaps from the CQ in memory). SYS_ERR
+/// on a bad ring handle.
+#[inline]
+pub fn sys_ring_wait(ring: u64) -> u64 {
+    let ret: u64;
+    // SAFETY: int 0x80 is the kernel's blocking-call gate; its handler saves and
+    // restores every register except the result (rax). The wait may block until
+    // the virtio completion IRQ posts into this ring's CQ and wakes the process.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") RING_WAIT => ret,
+            in("rdi") ring,
+            out("rsi") _, out("rdx") _, out("rcx") _,
+            out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+// --- Block storage: the single-in-flight ring shim --------------------------
+
+// SQ/CQ entry/header layout (Design/async_rings.md s4), as byte offsets.
+const RING_HDR_HEAD: u64 = 0;
+const RING_HDR_TAIL: u64 = 4;
+const RING_HDR_MASK: u64 = 8;
+const RING_HDR_SIZE: u64 = 16;
+const SQ_ENTRY_SIZE: u64 = 32;
+const CQ_ENTRY_SIZE: u64 = 16;
+
+/// The shim's ring is tiny: it submits one request and waits for it, so a depth
+/// of 2 is ample (power of two, fits a frame easily).
+const SHIM_RING_ENTRIES: u64 = 2;
+
+/// SQ and CQ frames sit at the very top of the map window, above where the demos
+/// map their working frames (which grow up from MAP_BASE), so the shim never
+/// collides with the caller's mappings.
+const SHIM_SQ_VA: u64 = MAP_END - 2 * PAGE_SIZE;
+const SHIM_CQ_VA: u64 = MAP_END - PAGE_SIZE;
+
+/// The process's lazily-set-up shim ring handle (None until the first read). A
+/// user process is single-threaded, so this static is touched without races.
+static mut SHIM_RING: u64 = SYS_ERR;
+
+// Volatile accessors for the ring frames (shared with the kernel).
+#[inline]
+unsafe fn ring_r32(a: u64) -> u32 {
+    core::ptr::read_volatile(a as *const u32)
+}
+#[inline]
+unsafe fn ring_w32(a: u64, v: u32) {
+    core::ptr::write_volatile(a as *mut u32, v)
+}
+#[inline]
+unsafe fn ring_w64(a: u64, v: u64) {
+    core::ptr::write_volatile(a as *mut u64, v)
+}
+
+/// Set up the shim's ring once: allocate + map an SQ and a CQ frame, register
+/// them, and cache the handle. Returns the handle, or SYS_ERR if any step fails.
+fn shim_ring() -> u64 {
+    // SAFETY: single-threaded user process; the static is not shared.
+    unsafe {
+        if SHIM_RING != SYS_ERR {
+            return SHIM_RING;
+        }
+        let sq_slot = sys_frame_alloc();
+        if sq_slot == SYS_ERR || sys_frame_map(sq_slot, SHIM_SQ_VA) == SYS_ERR {
+            return SYS_ERR;
+        }
+        let cq_slot = sys_frame_alloc();
+        if cq_slot == SYS_ERR || sys_frame_map(cq_slot, SHIM_CQ_VA) == SYS_ERR {
+            return SYS_ERR;
+        }
+        let handle = sys_ring_register(sq_slot, cq_slot, SHIM_RING_ENTRIES);
+        if handle != SYS_ERR {
+            SHIM_RING = handle;
+        }
+        handle
+    }
+}
 
 /// Read `count` 512-byte sectors -- starting `sector_off` sectors into the
 /// BlockRange capability at `range_slot` -- into the frame named by
@@ -216,28 +330,67 @@ const BLOCK_READ: u64 = 5;
 /// the bytes; the frame cap must carry the write right (frame_alloc grants it).
 /// Sectors are named relative to the range, never absolutely. Returns BLK_OK, or
 /// a BLK_E_* status.
+///
+/// This is a thin shim over the ring ABI: push one submission, ring the
+/// doorbell, then wait and reap the single completion. Behaviourally identical
+/// to a direct blocking read -- one request in flight, same blocking, same
+/// status -- so every caller is unchanged.
 #[inline]
 pub fn sys_block_read(range_slot: u64, frame_slot: u64, sector_off: u64, count: u64) -> u64 {
-    let status: u64;
-    // SAFETY: int 0x80 is the kernel's blocking-call gate; its handler saves and
-    // restores every register except the result (rax = status). The read may
-    // block until the virtio completion IRQ wakes this process. The four args go
-    // in rdi/rsi/rdx/rcx; the kernel reads them from the saved trap frame. rsi
-    // and rdx are also where the gate's wake writes its (unused-here) payload and
-    // cap slots, so they are clobbered; count in rcx is restored on resume.
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            inlateout("rax") BLOCK_READ => status,
-            in("rdi") range_slot,
-            inlateout("rsi") frame_slot => _,
-            inlateout("rdx") sector_off => _,
-            inlateout("rcx") count => _,
-            out("r8") _, out("r9") _, out("r10") _, out("r11") _,
-            options(nostack),
-        );
+    let handle = shim_ring();
+    if handle == SYS_ERR {
+        return BLK_E_DEV;
     }
-    status
+
+    // SAFETY: SHIM_SQ_VA / SHIM_CQ_VA are this process's mapped ring frames; the
+    // single-in-flight shim is the only writer of the SQ and reader of the CQ.
+    unsafe {
+        // Push one submission entry at the SQ tail.
+        let mask = ring_r32(SHIM_SQ_VA + RING_HDR_MASK);
+        let tail = ring_r32(SHIM_SQ_VA + RING_HDR_TAIL);
+        let e = SHIM_SQ_VA + RING_HDR_SIZE + (tail & mask) as u64 * SQ_ENTRY_SIZE;
+        ring_w32(e, 0); // op = RING_OP_READ
+        ring_w32(e + 4, (count & 0xFFFF) as u32); // flags: count in the low 16 bits
+        ring_w32(e + 8, range_slot as u32);
+        ring_w32(e + 12, frame_slot as u32);
+        ring_w64(e + 16, sector_off);
+        ring_w64(e + 24, 0); // user_data: single in flight, cookie unused
+        // Publish: bump the SQ tail so the kernel sees the new entry.
+        ring_w32(SHIM_SQ_VA + RING_HDR_TAIL, tail.wrapping_add(1));
+    }
+
+    if sys_ring_submit(handle) == SYS_ERR {
+        return BLK_E_DEV;
+    }
+
+    // Wait for and reap the single completion.
+    loop {
+        // SAFETY: as above.
+        if let Some(status) = unsafe { shim_reap() } {
+            return status;
+        }
+        if sys_ring_wait(handle) == SYS_ERR {
+            return BLK_E_DEV;
+        }
+    }
+}
+
+/// Reap one completion from the shim CQ, if any: returns its status and advances
+/// the CQ head (this process is the consumer). `None` when the CQ is empty.
+///
+/// SAFETY: the caller guarantees SHIM_CQ_VA is mapped.
+unsafe fn shim_reap() -> Option<u64> {
+    let head = ring_r32(SHIM_CQ_VA + RING_HDR_HEAD);
+    let tail = ring_r32(SHIM_CQ_VA + RING_HDR_TAIL);
+    if head == tail {
+        return None;
+    }
+    let mask = ring_r32(SHIM_CQ_VA + RING_HDR_MASK);
+    let e = SHIM_CQ_VA + RING_HDR_SIZE + (head & mask) as u64 * CQ_ENTRY_SIZE;
+    let status = ring_r32(e + 8) as u64; // user_data at e+0 is unused (single in flight)
+    // Advance the CQ head so the slot is reusable and ring_wait sees it drained.
+    ring_w32(SHIM_CQ_VA + RING_HDR_HEAD, head.wrapping_add(1));
+    Some(status)
 }
 
 // ---------------------------------------------------------------------------
