@@ -19,6 +19,14 @@ const USER_BINARIES: &[&str] = &[
     "share", "rpc", "faultchild", "blk", "fsdemo", "evt", "kbd",
 ];
 
+// Embedded only by the `bench` build (`cargo xtask bench`), matching the
+// feature-gated `include_bytes!` in main.rs. Copying it unconditionally would
+// make every production kernel build require the bench crate's ELF to exist
+// (build.rs panics if a source binary is missing), so gate it on the feature
+// the same way -- Cargo sets CARGO_FEATURE_BENCH for this script when the
+// kernel is built with `--features bench`.
+const BENCH_BINARIES: &[&str] = &["bench"];
+
 fn main() {
     // Read at RUNTIME (std::env::var), not at compile time (env!): a value
     // baked in when this script was compiled is exactly what went stale across
@@ -30,7 +38,12 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
 
-    for name in USER_BINARIES {
+    let bench = std::env::var("CARGO_FEATURE_BENCH").is_ok();
+    let binaries = USER_BINARIES
+        .iter()
+        .chain(if bench { BENCH_BINARIES } else { &[] });
+
+    for name in binaries {
         let src = workspace_root.join(format!("target/x86_64-unknown-none/release/{name}-user"));
         let dst = out_dir.join(format!("{name}-user"));
         // Re-copy (and rebuild the kernel) whenever a user binary changes.

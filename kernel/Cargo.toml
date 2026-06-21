@@ -17,3 +17,7 @@ spin = "0.9"
 # Compile the in-kernel test suite; the kernel runs it and exits instead
 # of booting normally. Driven by `cargo xtask test`.
 tests = []
+# Instrument the big kernel lock and run a kernel-entry contention hammer
+# (bench-user) after the demos, then report. Driven by `cargo xtask bench`.
+# Off by default, so the production kernel is byte-identical.
+bench = []

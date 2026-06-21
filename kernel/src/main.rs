@@ -509,6 +509,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_kbd} frames free after kbd");
         }
 
+        // BKL contention micro-benchmark (broader-hardware "SMP -- scaling"
+        // decision: is splitting the lock, roadmap item B3, even justified?).
+        // Saturate every core with the cheapest kernel-entry hammer there is
+        // (bench-user: a tight cpu_charge(0) loop) and measure how often the
+        // single big kernel lock is actually contended. Reset the counters
+        // first so the report reflects only the hammer, not the demo traffic
+        // above. Compiled in only by the `bench` feature (`cargo xtask bench`);
+        // the production kernel never builds or runs this.
+        #[cfg(feature = "bench")]
+        {
+            const BENCH_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bench-user"));
+            // The scheduler table holds MAX_PROCESSES (4); run exactly that, so
+            // -smp 4 puts one hammer on every core (maximal contention) and
+            // -smp 2/3 oversubscribes.
+            const BENCH_PROCS: usize = scheduler::MAX_PROCESSES;
+            bkl::bench_reset();
+            let _ = writeln!(serial, "plinth: bkl bench: {BENCH_PROCS} procs x cpu_charge(0) hammer");
+            let bins: [&[u8]; BENCH_PROCS] = [BENCH_BIN; BENCH_PROCS];
+            let caps: [Option<Capability>; BENCH_PROCS] = [None; BENCH_PROCS];
+            scheduler::run("bkl bench", &bins, phys_offset, &caps);
+            bkl::bench_report(&mut serial);
+        }
+
         // The tick count is proof the timer fired during ring-3 execution.
         // It is nondeterministic under wall-clock timing (it varies with how
         // long the demos took) and deterministic only under -icount; nothing

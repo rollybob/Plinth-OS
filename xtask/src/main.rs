@@ -12,6 +12,10 @@
 //!                        be, since cross-core interleaving isn't deterministic
 //! `cargo xtask test`  -- build with --features tests, run the in-kernel
 //!                        suite, parse [PASS]/[FAIL]/[SUITE] tags
+//! `cargo xtask bench` -- build with --features bench, run the BKL contention
+//!                        hammer under -smp 1/2/3/4, print the per-core report
+//!                        (decides roadmap item B3 -- is splitting the lock
+//!                        justified?)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,6 +32,7 @@ fn main() {
         "run-gdb" => { let img = build_all(); run(&img, true); }
         "smoke"   => { let img = build_all(); smoke(&img); }
         "smoke-smp" => { let img = build_all(); smoke_smp(&img); }
+        "bench"   => { let img = build_bench(); bench(&img); }
         "test"    => { let img = build_test(); run_tests(&img); }
         "check"   => { check_clobbers(); }
         other     => { eprintln!("unknown subcommand: {other}"); std::process::exit(1); }
@@ -41,7 +46,7 @@ fn main() {
 /// embedded or booted.
 const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "share", "rpc", "faultchild", "blk", "fsdemo", "diskhello", "evt", "kbd", "template",
+    "share", "rpc", "faultchild", "blk", "fsdemo", "diskhello", "evt", "kbd", "template", "bench",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -846,6 +851,76 @@ fn smoke_smp(uefi_path: &Path) {
         println!("smoke-smp: -smp {cores}");
         std::env::set_var("PLINTH_SMP", cores.to_string());
         run_smoke_checks(uefi_path, false);
+    }
+    std::env::remove_var("PLINTH_SMP");
+}
+
+/// Core counts `bench` runs the BKL contention hammer under. 1 is the
+/// no-contention baseline (a single core can never contend with itself -- a
+/// sanity check on the instrumentation); 2/3/4 show whether, and how much, the
+/// single big kernel lock contends as cores are added.
+const BENCH_CORE_COUNTS: &[u32] = &[1, 2, 3, 4];
+
+/// Build the kernel with the BKL instrumentation + contention hammer compiled
+/// in (`--features bench`). Like `build_all` -- it runs the full demo battery
+/// before the hammer, so it needs every user crate and the boot archive -- but
+/// writes a separate image so it never clobbers the smoke/run image.
+fn build_bench() -> PathBuf {
+    for name in USER_CRATES {
+        build_user_crate(name);
+    }
+    archive_image();
+
+    let root = workspace_root();
+    let kernel_dir = root.join("kernel");
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(&cargo)
+        .current_dir(&kernel_dir)
+        .args(["build", "--features", "bench"])
+        .status()
+        .expect("failed to invoke cargo for kernel bench build");
+    assert!(status.success(), "kernel bench build failed");
+
+    let kernel_bin = root.join("target/x86_64-unknown-none/debug/kernel");
+    let out_dir = root.join("target/disk-images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let uefi_path = out_dir.join("uefi-bench.img");
+    bootloader::UefiBoot::new(&kernel_bin)
+        .create_disk_image(&uefi_path)
+        .unwrap();
+
+    println!("bench disk image: {}", uefi_path.display());
+    uefi_path
+}
+
+/// Run the BKL contention micro-benchmark once per core count and print the
+/// kernel's report lines. The question it answers: is roadmap item B3 (splitting
+/// the single big kernel lock) justified? If a pathological all-cores
+/// kernel-entry hammer barely contends even at -smp 4, it is not.
+fn bench(uefi_path: &Path) {
+    // Default to the full 1/2/3/4 progression; PLINTH_BENCH_SMP (e.g. "3", or a
+    // comma list) overrides it, so the residency sweep can pin one core count
+    // and keep each step to a single boot.
+    let counts: Vec<u32> = match std::env::var("PLINTH_BENCH_SMP") {
+        Ok(s) => s.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+        Err(_) => BENCH_CORE_COUNTS.to_vec(),
+    };
+    for &cores in &counts {
+        println!("bench: -smp {cores}");
+        std::env::set_var("PLINTH_SMP", cores.to_string());
+        let out = run_capture(uefi_path);
+        let mut saw_report = false;
+        for line in out.lines() {
+            if let Some(rest) = line.trim_end().strip_prefix("plinth: bkl bench: ") {
+                println!("  {rest}");
+                saw_report = true;
+            }
+        }
+        if !saw_report {
+            eprintln!("  (no bkl bench report captured -- the run may have hung; check serial)");
+        }
     }
     std::env::remove_var("PLINTH_SMP");
 }
