@@ -48,6 +48,13 @@
 //! generic `x86-assembly-boot`/`cpu-topology-osdev` OSdev references, not from
 //! any other kernel's SMP/bring-up code.
 
+// The trampoline's `global_asm!` (below) deliberately switches assembler syntax
+// for the two AT&T-only far jumps, tripping `bad_asm_style`. The directives are
+// the only way to express a two-instruction syntax switch (`options(att_syntax)`
+// is whole-block), so allow the lint for this module -- an item-level allow on
+// the `global_asm!` itself is not honored for this particular lint.
+#![allow(bad_asm_style)]
+
 use core::fmt::Write;
 use core::ptr::addr_of;
 
@@ -119,6 +126,14 @@ const GDT_CODE64: u64 = (1 << 41) | (1 << 43) | (1 << 44) | (1 << 47) | (1 << 53
 // must come from a relocation the COMPILER resolves correctly (an ordinary
 // Rust `fn` pointer cast, written into the param block in
 // `install_trampoline`) rather than one hand-assembled here.
+//
+// The blob is Intel syntax (the default), but the two far jumps below must
+// switch to AT&T (`.att_syntax prefix`) and back: GAS only accepts the
+// immediate far-jump form `ljmp $sel, $off` in AT&T mode. `options(att_syntax)`
+// is all-or-nothing for the whole block, so it cannot express a two-instruction
+// switch -- the local `.att_syntax`/`.intel_syntax` directives are deliberate.
+// The `bad_asm_style` lint they trip is allowed at module level above (an
+// item-level allow on `global_asm!` is not honored for this lint).
 core::arch::global_asm!(
     r#"
 .global ap_trampoline16_start
