@@ -441,6 +441,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_blk} frames free after blk");
         }
 
+        // Async block demo (Stage 3): depth made observable. The kernel grants a
+        // BlockRange over device 0 sectors [0, 4); asyncblk issues four reads
+        // that overlap on the device through the libos reference executor (a
+        // futures executor over the completion rings) and asserts each landed in
+        // its own frame -- the many-in-flight path the single-shot block_read
+        // could not express. Frame counts bracket the demo: its four I/O frames
+        // and two ring frames are all reclaimed at teardown.
+        if virtio_blk::ready(0) {
+            const ASYNCBLK_BIN: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/asyncblk-user"));
+            let before_async = free_frames();
+            let _ = writeln!(serial, "plinth: {before_async} frames free before asyncblk");
+            // Sectors [0, 4): the demo reads relative sectors 0..3, one per
+            // overlapping request. Read-only, like the other block grants.
+            let range = Capability {
+                object: CapObject::BlockRange { dev: 0, start: 0, count: 4 },
+                rights: capability::RIGHT_READ,
+            };
+            scheduler::run("asyncblk demo", &[ASYNCBLK_BIN], phys_offset, &[Some(range)]);
+            let after_async = free_frames();
+            let _ = writeln!(serial, "plinth: {after_async} frames free after asyncblk");
+        }
+
         // Phase 2 storage, load-from-disk: the filesystem library-OS demo. The
         // kernel grants fsdemo one capability -- a BlockRange over the whole
         // archive device (device 1) -- and nothing else. fsdemo uses libfs to

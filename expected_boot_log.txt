@@ -163,6 +163,16 @@ blk: read ok b0=1 b1=2 b5=6
 blk: out-of-range rejected
 plinth: blk demo: all done
 
+# Async block demo (Stage 3): depth made observable. asyncblk issues four reads
+# that overlap on the device through the libos reference futures-executor over
+# the completion rings, then asserts each landed in its own frame. The "ok" line
+# is the only deterministic output -- completion ORDER is the device's to choose,
+# so correctness is asserted inside the demo, never transcript-matched. Frame
+# counts around it must match (its I/O + ring frames are reclaimed at teardown).
+plinth: asyncblk demo: 1 processes
+asyncblk: ok (4 reads overlapped, each frame verified)
+plinth: asyncblk demo: all done
+
 # Phase 2 storage, load-from-disk: the FS library-OS demo. The kernel grants
 # fsdemo a BlockRange over the archive device; fsdemo uses libfs to parse the
 # on-disk archive, find "diskhello" by name, read its ELF off the disk, and

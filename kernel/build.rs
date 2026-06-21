@@ -16,7 +16,7 @@ use std::path::PathBuf;
 // boot archive, so running it proves the load-from-disk path.
 const USER_BINARIES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "share", "rpc", "faultchild", "blk", "fsdemo", "evt", "kbd",
+    "share", "rpc", "faultchild", "blk", "asyncblk", "fsdemo", "evt", "kbd",
 ];
 
 // Embedded only by the `bench` build (`cargo xtask bench`), matching the
