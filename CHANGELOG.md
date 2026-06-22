@@ -3,11 +3,13 @@
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
 follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
-current contract is **v2.3**. v2 added IPC and revised `spawn`, breaking v1 --
+current contract is **v2.4**. v2 added IPC and revised `spawn`, breaking v1 --
 the one incompatible ABI change so far; v2.1 added `spawn_from_buffer` (the
 load-from-disk path), v2.2 added console input (`event_recv` + `EventSource`),
-both additive over v2; v2.3 moves `block_read` to the `int 0x80` gate so it can
-block (hidden behind the `libplinth` wrapper).
+both additive over v2; v2.3 moved `block_read` to the `int 0x80` gate so it can
+block (hidden behind the `libplinth` wrapper); v2.4 replaces `block_read`
+entirely with async completion rings (`ring_register`/`ring_submit`/`ring_wait`),
+additive but for the retirement of the now-unused `block_read` op.
 
 ## [Unreleased]
 
@@ -45,6 +47,29 @@ block (hidden behind the `libplinth` wrapper).
   Boot-time selftests stay polled (no process exists to block yet); the scheduler
   treats a process blocked on disk as a legitimate idle, not a deadlock. Output
   is byte-identical and verified under the `PLINTH_ICOUNT` determinism tripwire.
+- Async completion rings for block I/O (ABI v2.4). Block I/O moves off a kernel
+  entry per read onto shared-memory **submission/completion queues** the library
+  OS shares with the kernel (io_uring-shaped). A new `kernel/src/rings.rs` adds a
+  bound-ring capability (`CapObject::Ring`) and three calls: **`ring_register`**
+  and **`ring_submit`** on the `syscall` fast path (nr 12/13), **`ring_wait`** on
+  the `int 0x80` gate (op 6). The libOS writes logical, capability-named requests
+  (a `BlockRange` slot, a frame slot, a sector offset -- never a physical
+  address); `ring_submit` rings a doorbell and the kernel drains the queue in the
+  submitter's context, running the same two cap-checks, translating each request
+  into a virtqueue descriptor chain, and posting completions back from the MSI-X
+  IRQ. The kernel stays the only writer of physical descriptor addresses, so the
+  device is multiplexed across tenants with no IOMMU. Many reads can be in flight
+  at once (depth `floor(qsize/3)`); the completion handler demuxes each back to
+  its request by the descriptor head the device echoes. The internals were proved
+  first as host-side unit tests of the demux, then under smoke one-in-flight.
+- Reference async executor + many-in-flight demo. `libos` gains `ring`, a minimal
+  `no_std` futures executor over the ring ABI (a read is a `Future`; the reactor
+  matches completions to futures by an opaque cookie; `block_on` is the one place
+  it blocks) -- library-OS *policy* over the kernel's *mechanism*, replaceable. A
+  new `asyncblk-user` demo issues several reads that overlap on the device and
+  asserts each landed in its own frame, the depth the single-shot `block_read`
+  could not express. Completion order is the device's, so it is asserted, never
+  transcript-matched.
 
 ### Changed
 - **`block_read` moved from syscall nr 10 to the `int 0x80` gate (op 5), ABI
@@ -54,6 +79,12 @@ block (hidden behind the `libplinth` wrapper).
   `BLK_OK`/`BLK_E_*` status are unchanged, and the `libplinth::sys_block_read`
   wrapper hides the move -- only the entry mechanism and the now-asynchronous
   wait differ. Syscall nr 10 is retired.
+- **`block_read` retired entirely (ABI v2.4).** With block I/O now the ring ABI,
+  the kernel `block_read` op (`int 0x80` op 5) and its in-kernel routing are
+  gone; `libplinth::sys_block_read` is reimplemented as a single-in-flight shim
+  over `ring_register`/`ring_submit`/`ring_wait`, so its signature and `BLK_*`
+  status are unchanged and every existing caller (`blk-user`, `fsdemo-user`,
+  `libfs`) is untouched at the source level. Op 5 is left unused.
 - Console input, first stages (`event_recv` + an `EventSource` capability). The
   kernel takes the i8042 keyboard's IRQ behind a new interrupt-controller seam
   (`irq`, the one module an APIC port later swaps), queues raw scancodes in a

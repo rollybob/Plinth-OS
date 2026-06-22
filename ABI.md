@@ -1,4 +1,4 @@
-# Plinth ABI v2.3
+# Plinth ABI v2.4
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -67,6 +67,24 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   entry mechanism (and the now-asynchronous wait) differ. A caller that used
   `libplinth::sys_block_read` is unaffected -- the wrapper hides the change.
 
+### v2.4 (block I/O becomes async completion rings)
+
+- **Block I/O is now the ring ABI; the `block_read` gate op is retired.** A
+  library OS registers a shared-memory submission/completion queue pair with
+  `ring_register`, writes logical, capability-named requests into the SQ, rings
+  a doorbell with `ring_submit`, and reaps results from the CQ -- blocking in
+  `ring_wait` only when there is nothing left to reap. The kernel is on the path
+  only for the doorbell and the completion IRQ, with many requests in flight at
+  once. `ring_register`/`ring_submit` are non-blocking and ride the `syscall`
+  fast path (nr 12/13); `ring_wait` blocks and is on the `int 0x80` gate (op 6).
+  A new `Ring` capability binds the queue pair to the registering process.
+- **`block_read` (gate op 5) is retired (unused).** `libplinth::sys_block_read`
+  is reimplemented as a single-in-flight shim over the ring calls, with its
+  signature, relative-sector addressing, and `BLK_OK`/`BLK_E_*` status all
+  unchanged -- so every existing caller is unaffected. The status codes now ride
+  the CQ entry rather than `RAX`.
+- Additive but for the op-5 retirement: every other call is unchanged.
+
 ## Syscall interface
 
 The non-blocking calls use the `syscall`/`sysretq` instructions:
@@ -91,9 +109,12 @@ The non-blocking calls use the `syscall`/`sysretq` instructions:
 | 8  | fault_return | --                    | resumes the faulting instruction |
 | 9  | spawn        | child_id, transfer    | wait handle, or `SYS_ERR`        |
 | 11 | spawn_from_buffer | buf_va, len, transfer | wait handle, or `SYS_ERR`   |
+| 12 | ring_register | sq_slot, cq_slot, entries | ring cap slot, or `SYS_ERR` |
+| 13 | ring_submit  | ring                  | entries consumed, or `SYS_ERR`   |
 
-(Nr 10, `block_read`, was retired in v2.3: it is now a blocking op on the
-`int 0x80` gate -- see the IPC interface table below.)
+(Nr 10, `block_read`, was retired in v2.3 -- moved to the `int 0x80` gate --
+and that gate op was itself retired in v2.4: block I/O is the ring ABI. The
+blocking half, `ring_wait`, is on the gate -- see the IPC interface table.)
 
 Notes:
 
@@ -169,12 +190,14 @@ convention mirrors the syscall one:
 | 2        | call  | ep_slot, req              | status; reply word in RSI              |
 | 3        | reply | reply_slot, msg           | status                                 |
 | 4        | event_recv | source_slot          | status; packed event in RSI            |
-| 5        | block_read | range, frame, sec, count | status (`BLK_OK` / `BLK_E_*`)     |
+| 6        | ring_wait  | ring                 | status (woken; reap the CQ in memory)  |
 
-`event_recv` (console input) and `block_read` (block storage) are not IPC, but
-they share this gate because a blocking read needs the same resumable trap frame
-the IPC ops do. `block_read` is the one gate op with a fourth argument, `count`
-in `RCX`. They are documented under "Console input" and "Block storage" below.
+`event_recv` (console input) and `ring_wait` (block I/O) are not IPC, but they
+share this gate because a blocking wait needs the same resumable trap frame the
+IPC ops do. (Op 5, `block_read`, was retired in v2.4 -- block I/O is the ring
+ABI; its non-blocking `ring_register`/`ring_submit` are on the `syscall` fast
+path, nr 12/13.) They are documented under "Console input" and "Block storage"
+below.
 
 Notes:
 
@@ -235,28 +258,55 @@ as IPC (a blocking read needs the resumable trap frame) under op selector 4.
   capability to. Fanning input out to many consumers is itself a library OS
   over this primitive.
 
-## Block storage
+## Block storage (async completion rings)
 
-A `BlockRange` capability (`RIGHT_READ`) names a run of `(dev, start, count)`
-512-byte sectors on a block device; `block_read` reads from it into a frame the
-device DMAs into. The call enters through the same `int 0x80` gate as IPC under
-op selector 5 (a blocking read needs the resumable trap frame), with the one
-fourth argument the gate ever takes, `count`, in `RCX`.
+Block I/O is shared-memory submission/completion queues, io_uring-shaped. A
+`BlockRange` capability (`RIGHT_READ`) names a run of `(dev, start, count)`
+512-byte sectors on a block device; the library OS submits read requests against
+it and reaps results from memory, the kernel on the path only for a batched
+doorbell and the completion interrupt. The kernel is the sole writer of the
+physical descriptor addresses the device DMAs from, so the device is multiplexed
+across tenants with no IOMMU; a request names capability *slots*, never
+addresses.
 
-- **block_read(range, frame, sector_off, count)** reads `count` 512-byte sectors
-  -- starting `sector_off` sectors into the `BlockRange` capability at slot
-  `range` -- into the frame named by slot `frame`. It **blocks** until the device
-  completes the I/O (other processes run meanwhile; the disk completion interrupt
-  wakes the caller). The device DMAs the data into the frame, so map that frame
-  (`frame_map`) to read the bytes; the frame capability must carry `RIGHT_WRITE`
-  (`frame_alloc` grants it). Sectors are named **relative** to the range -- the
-  kernel adds the range's start -- so a holder can never address blocks outside
-  its grant. The result is a *status* word in `RAX`, not a data value (the data
-  is in the frame): `BLK_OK = 0` on success, or `BLK_E_BADARG = 1` (zero count or
-  a count larger than one frame), `BLK_E_RANGE = 2` (the request falls outside
-  the range -- the multiplexing guarantee), `BLK_E_RIGHTS = 3` (bad slot, wrong
-  kind, or missing right), or `BLK_E_DEV = 4` (device error). A `block_write`
-  counterpart is not yet part of the ABI -- the first filesystem is read-only.
+The library OS allocates two frames (`frame_alloc` + `frame_map`, both
+`READ|WRITE`) for the submission queue (SQ) and completion queue (CQ), then:
+
+- **ring_register(sq_slot, cq_slot, entries)** (`syscall` nr 12) binds the two
+  frames as an SQ/CQ pair and returns a `Ring` capability slot, or `SYS_ERR`.
+  `entries` is a power of two that fits one frame (<= 64). The ring is bound to
+  the calling process -- another process cannot submit or wait on it.
+- **ring_submit(ring)** (`syscall` nr 13) is the doorbell: the kernel drains the
+  SQ, running the two cap-checks on each entry and posting it to the device, and
+  returns the number of entries consumed (which may be fewer than queued under
+  backpressure -- resubmit the rest after reaping). Non-blocking.
+- **ring_wait(ring)** (`int 0x80` gate, op 6) blocks until the CQ has at least
+  one unreaped completion, then returns; the caller reaps from the CQ in memory.
+
+Each ring is a small header (free-running `head`/`tail` `u32` indices + a `mask`)
+followed by fixed-size entries; the slot for an index is `index & mask`.
+
+- **SQ entry (32 bytes)**: `op` (`u32`, 0 = read), `flags` (`u32`; the low 16
+  bits are the sector count), `range_slot` (`u32`), `frame_slot` (`u32`),
+  `sector_off` (`u64`), `user_data` (`u64`, an opaque cookie echoed back).
+- **CQ entry (16 bytes)**: `user_data` (`u64`, the submission's cookie verbatim),
+  `status` (`i32`), reserved (`u32`).
+
+The two cap-checks are the multiplexing surface: the request must lie inside the
+holder's `BlockRange` (sectors named **relative** to it -- the kernel adds the
+range start -- so a holder can never address blocks outside its grant), and the
+I/O frame must be the holder's with `RIGHT_WRITE` (the device DMAs into it; map
+it to read the bytes). The data lands in the frame, so the CQ carries only a
+*status*, never a data value: `BLK_OK = 0`, or `BLK_E_BADARG = 1` (zero count or
+larger than one frame), `BLK_E_RANGE = 2` (outside the range), `BLK_E_RIGHTS = 3`
+(bad slot, wrong kind, or missing right), `BLK_E_DEV = 4` (device error).
+
+`libplinth::sys_block_read(range, frame, sector_off, count)` is a single-in-
+flight shim over these calls with the same signature and status as before, so a
+caller that only needs one read at a time is unchanged. Many-in-flight is the
+new capability: `libos`'s `ring` module is a reference `no_std` async executor
+that overlaps reads and matches each completion to its future by `user_data`. A
+write path is not yet part of the ABI -- the first filesystem is read-only.
 
 ## Capabilities
 
@@ -272,6 +322,7 @@ index into a per-process table; the records never leave the kernel. Kinds:
 | Reply      | one-shot authority to reply once | (none -- holding it suffices) |
 | BlockRange | `count` sectors on a device      | `READ`, `WRITE`            |
 | EventSource | one input device's event stream | `READ`                     |
+| Ring       | a bound SQ/CQ pair for block I/O | `READ`, `WRITE`            |
 
 Rights are checked at use, not at transfer. `Reply` capabilities are minted by
 the kernel (on receiving a `call`) and consumed on use; you cannot create one. A
@@ -281,7 +332,9 @@ sector of the grant), and the kernel refuses any access beyond `count` or onto
 another device -- so disjoint ranges handed to different library OSes cannot
 reach each other's blocks, and a range on one disk cannot read another. An
 `EventSource` names one input device (id 0 = keyboard); a holder reads only the
-source it was granted, never another.
+source it was granted, never another. A `Ring` is minted by `ring_register` over
+a caller-owned SQ/CQ frame pair and bound to that process: it cannot be submitted
+or waited on by anyone else, and it is released when the process exits.
 
 ### Well-known initial capabilities
 

@@ -250,12 +250,13 @@ Plinth implements the minimum machinery that makes the argument concrete:
         |    libplinth: syscall shim + int 0x80 gate shim    |
   ======+======+============+=============+============+======+======
   syscall/sysret  |              int 0x80 gate              |
-   write exit      | send recv call reply event_recv block_read
+   write exit      | send recv call reply event_recv ring_wait
    frame_alloc/map/free cpu_charge fault_reg/return spawn spawn_from_buffer
+   ring_register ring_submit
   +----------------------------------------------------------------+
   |                        plinth kernel                           |
   |  capabilities | frames | CPU budgets | endpoints | block ranges|
-  |  event sources | scheduler + timer | per-process address spaces|
+  |  event sources | async rings | scheduler + timer | addr spaces |
   |  fault upcall  | virtio-blk | i8042 keyboard | irq seam        |
   |  LAPIC + I/O APIC | MSI-X | SMP: AP trampoline + BKL + per-CPU |
   +----------------------------------------------------------------+
@@ -263,9 +264,11 @@ Plinth implements the minimum machinery that makes the argument concrete:
 ```
 
 Two entry mechanisms: the non-blocking calls use `syscall`/`sysretq`; the
-blocking ones (IPC, `event_recv`, `block_read`) enter through an `int 0x80`
+blocking ones (IPC, `event_recv`, `ring_wait`) enter through an `int 0x80`
 gate, because suspending and resuming a call needs the full resumable trap
-frame the fast path does not save.
+frame the fast path does not save. Block I/O is the async-ring ABI:
+`ring_register`/`ring_submit` are non-blocking doorbell calls on the fast path,
+and a process parks in `ring_wait` only when it has nothing left to reap.
 
 ```text
 kernel/      the exokernel (no_std, x86_64-unknown-none)
@@ -274,7 +277,9 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
                    endpoints, reply caps, block ranges, event sources)
   syscall.rs       the non-blocking calls, syscall/sysret entry
   ipc.rs           the int 0x80 gate: endpoints, send/recv/call/reply,
-                   plus event_recv and block_read (blocking ops share it)
+                   plus event_recv and ring_wait (blocking ops share it)
+  rings.rs         async completion rings: SQ drain + completion demux,
+                   ring_register/ring_submit/ring_wait
   scheduler.rs     preemptive round-robin, per-process kernel stacks,
                    core-agnostic claim-and-run across CPUs
   timer.rs         100 Hz preemption tick: per-CPU LAPIC timer (PIT fallback)
@@ -297,10 +302,11 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
   input.rs         event sources + bounded per-source event ring
   gdt.rs           GDT/TSS, sysret-compatible selector layout
   serial.rs        serial console
-  tests/           in-kernel test suite (65 tests, run in QEMU)
+  tests/           in-kernel test suite (70 tests, run in QEMU)
 
 libplinth/   user-side syscall + gate shim -- deliberately NOT a library OS
-libos/       two allocator library OSes: BumpAlloc and FreeListAlloc
+libos/       allocator library OSes (BumpAlloc, FreeListAlloc) + ring, a
+             reference no_std async block-I/O executor over the ring ABI
 libfs/       a read-only boot-archive parser -- the filesystem as a libOS
 libinput/    a Set-1 keymap (with shift) and line reader -- input as a libOS
 demo-app/    the shared allocator workload, generic over the memory policy
@@ -316,6 +322,7 @@ user programs (ring 3, each its own crate):
                  transfer, call/reply RPC)
   spawner-user/ grantee-user/   spawn a child and transfer it a capability
   blk-user/      read disk sectors through a bounded BlockRange
+  asyncblk-user/ several overlapping reads via the libos async executor
   fsdemo-user/   load a program off disk with libfs + spawn_from_buffer
   diskhello-user/   lives only in the boot archive, never embedded
   evt-user/      read a raw keyboard event through an EventSource
@@ -366,12 +373,20 @@ xtask/       build orchestration: user binaries, disk images, QEMU,
   `fault_reg`/`fault_return` (a process cannot deliver a hardware fault to
   itself), `spawn`/`spawn_from_buffer` (a process cannot create an isolated
   address space) -- or a blocking operation that needs the kernel to suspend
-  and resume it, which is why IPC, `event_recv`, and `block_read` enter
+  and resume it, which is why IPC, `event_recv`, and `ring_wait` enter
   through the `int 0x80` gate rather than the fast path. Everything those calls
   *do* with the mechanism -- spend policy, paging policy, the filesystem
-  format, the keymap -- is still application code.
+  format, the keymap, the async I/O executor -- is still application code.
+- **Block I/O is async completion rings, and the executor is just policy.** A
+  library OS submits capability-named requests into a shared-memory queue and
+  reaps results from another, the kernel on the path only for a batched doorbell
+  (`ring_submit`) and the completion IRQ -- never a kernel entry per read, and
+  many reads in flight at once. The kernel ships only the *mechanism* (it stays
+  the sole writer of physical DMA addresses, so the device is multiplexed with
+  no IOMMU); the `no_std` async executor that turns a completion into a woken
+  future lives in `libos`, replaceable like every other policy.
 - **Status is split from payload on every blocking call.** IPC, `event_recv`,
-  and `block_read` return a *status* word in `RAX` separate from their payload
+  and the ring's completions return a *status* word separate from their payload
   (the message/event in `RSI`, the disk data in the DMA'd frame). A
   peer-controlled or device-controlled value can never be mistaken for an
   error -- not even `u64::MAX` -- including the `IPC_PEER_DIED` status that
@@ -429,7 +444,7 @@ your line through `libinput`.
 
 Plinth runs your code in ring 3 over a stable syscall interface.
 [ABI.md](ABI.md) is the contract -- syscalls, the IPC and device gate, the
-executable format, and entry state, versioned as **v2.3** -- and
+executable format, and entry state, versioned as **v2.4** -- and
 [GUIDE.md](GUIDE.md) is the walkthrough: copy `template-user/` to start a
 program, and see how memory policy goes in a library OS rather than the
 kernel. Where the project is headed is in [ROADMAP.md](ROADMAP.md); how to
@@ -462,7 +477,7 @@ Three layers, all in CI on every push:
 ## Current limitations
 
 These are where Plinth is today, not where it stops. The syscall interface is
-a documented, versioned contract ([ABI.md](ABI.md), v2.3), so you can write
+a documented, versioned contract ([ABI.md](ABI.md), v2.4), so you can write
 your own programs and library OSes against it; growing Plinth toward a
 genuinely usable general-purpose exokernel is the ongoing direction
 ([ROADMAP.md](ROADMAP.md)).
@@ -485,8 +500,8 @@ genuinely usable general-purpose exokernel is the ongoing direction
   -- layered over preemptive scheduling, not a deadline or priority system.
 - **Self-paging is demand-zero only.** One fault in flight per process, a
   single fixed lazy window, and the handler maps fresh zeroed frames. It does
-  not page from disk -- the disk has its own explicit, blocking `block_read`
-  path -- so it demonstrates the upcall and the resume, not a full unified
+  not page from disk -- the disk has its own explicit async-ring read path --
+  so it demonstrates the upcall and the resume, not a full unified
   virtual-memory system.
 - **Storage is read-only, one filesystem.** A virtio-blk driver and a
   read-only boot archive parsed by `libfs`; there is no `block_write` in the
@@ -533,7 +548,7 @@ Hard-won, possibly useful to other no_std kernel people:
 - **A blocking call needs a different door than a fast one.** The `syscall`
   fast path saves only `rcx`/`r11`; it cannot suspend a caller and resume it
   later with its registers intact. Every Plinth call that blocks -- IPC,
-  `event_recv`, `block_read` -- goes through the `int 0x80` gate instead,
+  `event_recv`, `ring_wait` -- goes through the `int 0x80` gate instead,
   whose interrupt entry saves the full resumable trap frame. Several arrived as
   `syscall` calls and had to move once they learned to block.
 

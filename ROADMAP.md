@@ -20,12 +20,14 @@ capability transfer into an isolated child. A 100 Hz timer preemptively
 multiplexes the CPU across several processes (round-robin); synchronous IPC
 connects them; a virtio-blk disk multiplexed by a `BlockRange` capability
 backs a read-only filesystem and load-from-disk; and the i8042 keyboard
-delivers raw events behind an `EventSource` capability. Interrupts run
-through the Local APIC + I/O APIC (MSI-X for the disk, a per-CPU LAPIC
-timer), and the kernel boots and schedules on every CPU the ACPI MADT
-reports, serialized by a single big kernel lock. No network yet, and SMP is
-not scaled past that lock (per-CPU run queues are the next step). See the
-[README](README.md) for the full demo.
+delivers raw events behind an `EventSource` capability. Block I/O is async
+completion rings (io_uring-shaped shared-memory queues), with a reference
+`no_std` async executor in `libos` driving many reads in flight at once.
+Interrupts run through the Local APIC + I/O APIC (MSI-X for the disk, a
+per-CPU LAPIC timer), and the kernel boots and schedules on every CPU the
+ACPI MADT reports, serialized by a single big kernel lock. No network yet,
+and SMP is not scaled past that lock. See the [README](README.md) for the
+full demo.
 
 ## Phase 1 -- an adoptable reference
 
@@ -65,6 +67,19 @@ against the cost to determinism rather than taken for granted.
   embedded at build time. Block reads are interrupt-driven and blocking -- the
   CPU runs other processes while the disk DMA is in flight, woken by the
   completion IRQ through the same interrupt-controller seam the keyboard uses.
+- [x] **Async block I/O (completion rings).** Block I/O moved off a kernel
+  entry per read onto io_uring-shaped shared-memory submission/completion
+  queues. A library OS submits capability-named requests (never physical
+  addresses) and reaps results from memory; the kernel is on the path only for
+  a batched doorbell (`ring_submit`) and the completion IRQ, with many reads in
+  flight at once. The kernel ships only the mechanism -- it stays the sole
+  writer of physical DMA descriptors, so the device is multiplexed across
+  tenants with no IOMMU -- and a reference `no_std` async executor in `libos`
+  turns completions into woken futures (replaceable policy). `block_read` is
+  retired in favour of the ring ABI (v2.4); the throughput lever for a
+  kernel-light workload is taking the kernel off the I/O fast path, which is why
+  this, not per-CPU run-queue splitting, was the next step after the SMP boot
+  model.
 - [x] **Console input.** The i8042 keyboard's IRQ feeds raw scancodes into a
   bounded event ring behind an interrupt-controller seam; an `EventSource`
   capability multiplexes the device, and a blocking `event_recv` (on the IPC
@@ -89,20 +104,23 @@ against the cost to determinism rather than taken for granted.
     `cargo xtask smoke-smp` lane reruns the assertion battery on 2-4 cores; an
     `-smp 1` lane keeps the deterministic contract as a regression net.
   - [ ] **SMP -- scaling.** Per-CPU run queues and work stealing, so cores add
-    kernel throughput instead of contending on the one lock. The direction is
-    share-nothing -- per-CPU (eventually per-NUMA) state coordinated by message
-    passing -- with the single lock and shared queues as on-ramps, not the
-    destination.
+    kernel throughput instead of contending on the one lock. Deferred on
+    evidence: a benchmark showed the single lock only contends near 100% kernel
+    residency, a regime real workloads do not occupy -- so the throughput lever
+    was taking the kernel off the I/O fast path (the async rings above), not
+    splitting the lock. Lock-splitting waits for a workload that actually
+    contends. The long-run direction stays share-nothing -- per-CPU (eventually
+    per-NUMA) state coordinated by message passing.
   - [ ] **Real-machine hardware.** Leaving QEMU's comfortable defaults: real
     ACPI quirks, MMIO cache attributes, PCIe ECAM, a NIC. Its own milestone,
     once the concurrency model is scaled.
 
 ## Stability
 
-The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.3**.
+The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.4**.
 v2 added IPC and revised `spawn`, the one incompatible change from v1 (made
 while Phase 2 is still pre-release); v2.1 (`spawn_from_buffer`), v2.2
-(console input), and v2.3 (`block_read` moved to the blocking gate) are all
-additive over v2. Within a major series, new capabilities are added without
+(console input), v2.3 (`block_read` moved to the blocking gate), and v2.4
+(async completion rings, retiring `block_read`) are all additive over v2. Within a major series, new capabilities are added without
 breaking existing programs. Anything not in ABI.md is an implementation
 detail and may move.
