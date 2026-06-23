@@ -333,6 +333,7 @@ user programs (ring 3, each its own crate):
   diskhello-user/   lives only in the boot archive, never embedded
   evt-user/      read a raw keyboard event through an EventSource
   evtstream-user/  subscribe and reap a multishot event stream (libos)
+  unified-user/  one ring_wait drives a block read AND a key stream (join2)
   kbd-user/      read a line through libinput
   faultchild-user/  a child that faults, for liveness testing
   template-user/    minimal skeleton to copy for a new program (see GUIDE.md)

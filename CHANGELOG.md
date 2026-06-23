@@ -90,7 +90,12 @@ ring, one `ring_wait`, now multiplexes block reads and input.
   once and in order (assertion-based, never transcript-matched), then cancels.
   CQ-full backpressure -- drop the newest event + a drop flag the reader observes
   -- is the one rule the block path never needed (its CQ is sized to in-flight
-  depth).
+  depth). The unified payoff: `libos` adds `join2` (a heterogeneous two-future
+  join) and `EventStream::collect`, and a `unified-user` demo registers ONE ring,
+  issues a block read AND a keyboard subscription on it, and drives both to
+  completion in a single `block_on`/`ring_wait` loop -- the event loop a real OS
+  is built on, with the kernel demuxing disk completions and key events back to
+  their futures by `user_data` in one CQ.
 
 ### Changed
 - **`block_read` moved from syscall nr 10 to the `int 0x80` gate (op 5), ABI
