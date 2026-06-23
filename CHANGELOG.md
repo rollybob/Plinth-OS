@@ -3,13 +3,16 @@
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
 follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
-current contract is **v2.4**. v2 added IPC and revised `spawn`, breaking v1 --
+current contract is **v2.5**. v2 added IPC and revised `spawn`, breaking v1 --
 the one incompatible ABI change so far; v2.1 added `spawn_from_buffer` (the
 load-from-disk path), v2.2 added console input (`event_recv` + `EventSource`),
 both additive over v2; v2.3 moved `block_read` to the `int 0x80` gate so it can
 block (hidden behind the `libplinth` wrapper); v2.4 replaces `block_read`
 entirely with async completion rings (`ring_register`/`ring_submit`/`ring_wait`),
-additive but for the retirement of the now-unused `block_read` op.
+additive but for the retirement of the now-unused `block_read` op; v2.5 ports
+input onto the same rings as multishot subscriptions (`RING_OP_EVENT_SUB`/
+`RING_OP_CANCEL` SQ ops), retiring the `event_recv` gate op behind a shim -- one
+ring, one `ring_wait`, now multiplexes block reads and input.
 
 ## [Unreleased]
 
@@ -70,6 +73,24 @@ additive but for the retirement of the now-unused `block_read` op.
   asserts each landed in its own frame, the depth the single-shot `block_read`
   could not express. Completion order is the device's, so it is asserted, never
   transcript-matched.
+- Input on the completion rings -- multishot event subscriptions (ABI v2.5).
+  Input is *producer-initiated* (a keystroke answers no request), so it rides the
+  ring as a **multishot subscription**, not a one-shot request: a new
+  `RING_OP_EVENT_SUB` SQ op names an `EventSource` + a `user_data` cookie and arms
+  a standing subscription, every event then posting a CQ completion (the packed
+  event in `status`, the cookie in `user_data`) until `RING_OP_CANCEL`. The
+  subscription-routing + CQ-full-backpressure core (`rings.rs` `Subscriptions`) is
+  pure logic over a fixed pool, proved first as host unit tests
+  (`tests/event_rings.rs`: source/cookie routing, drop-newest + sticky count,
+  cancel, release, pool limits). One ring drained by one `ring_wait` now
+  multiplexes block reads and input -- the unified event loop a real OS is built
+  on. `libos`'s `ring` gains an event-stream adapter (a multishot stream over the
+  same reactor, alongside the one-shot read future), and an `evtstream-user` demo
+  subscribes and reaps a scripted scancode sequence, asserting each event arrives
+  once and in order (assertion-based, never transcript-matched), then cancels.
+  CQ-full backpressure -- drop the newest event + a drop flag the reader observes
+  -- is the one rule the block path never needed (its CQ is sized to in-flight
+  depth).
 
 ### Changed
 - **`block_read` moved from syscall nr 10 to the `int 0x80` gate (op 5), ABI
@@ -85,6 +106,17 @@ additive but for the retirement of the now-unused `block_read` op.
   over `ring_register`/`ring_submit`/`ring_wait`, so its signature and `BLK_*`
   status are unchanged and every existing caller (`blk-user`, `fsdemo-user`,
   `libfs`) is untouched at the source level. Op 5 is left unused.
+- **`event_recv` retired entirely (ABI v2.5).** With input now the ring ABI, the
+  kernel `event_recv` op (`int 0x80` op 4), the in-kernel per-source `EventRing`
+  staging buffer, and the boot keyboard selftest that depended on it are gone;
+  `input::record` reroutes through `rings::deliver_event` to subscriptions, and
+  `libplinth::sys_event_recv` is reimplemented as a single-subscription shim over
+  the ring (subscribe once, reap one event per call), so its signature and
+  `EVENT_OK`/`EVENT_ERR` status are unchanged and every existing caller
+  (`evt-user`, `kbd-user`, `libinput`) is untouched at the source level. Op 4 is
+  left unused. The subscriber's CQ is now the only event buffer, so an event
+  arriving before any subscription exists is dropped rather than briefly staged
+  (immaterial for input).
 - Console input, first stages (`event_recv` + an `EventSource` capability). The
   kernel takes the i8042 keyboard's IRQ behind a new interrupt-controller seam
   (`irq`, the one module an APIC port later swaps), queues raw scancodes in a

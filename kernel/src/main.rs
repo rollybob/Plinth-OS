@@ -514,6 +514,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_evt} frames free after evt");
         }
 
+        // Phase 2 console input (Stage 3): a multishot event STREAM. The kernel
+        // grants evtstream-user the same keyboard EventSource; the process opens
+        // one multishot subscription through the libos async executor and reaps a
+        // SEQUENCE of events from it (one RING_OP_EVENT_SUB, many completions
+        // demuxed by the subscription cookie), asserting each scancode arrives
+        // once and in order -- the many-event path the single-shot event_recv
+        // shim cannot express. A scripted scancode sequence is injected to drive
+        // it deterministically (a real keyboard would otherwise). Frame counts
+        // bracket the demo (no leak: its ring frames and the subscription slot are
+        // all reclaimed at teardown).
+        {
+            const EVTSTREAM_BIN: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/evtstream-user"));
+            let before_es = free_frames();
+            let _ = writeln!(serial, "plinth: {before_es} frames free before evtstream");
+            let source = Capability {
+                object: CapObject::EventSource { id: 0 },
+                rights: capability::RIGHT_READ,
+            };
+            // Set-1 make codes for 'a','b','c','d' -- must match evtstream-user's
+            // SEQUENCE. Delivered one per block as the reader idles on input.
+            input::arm_synthetic(&[0x1E, 0x30, 0x2E, 0x20]);
+            scheduler::run("evtstream demo", &[EVTSTREAM_BIN], phys_offset, &[Some(source)]);
+            let after_es = free_frames();
+            let _ = writeln!(serial, "plinth: {after_es} frames free after evtstream");
+        }
+
         // Phase 2 console input (Stage 3): a line read through a library OS. The
         // kernel grants kbd-user the same keyboard EventSource; the process uses
         // libinput (an unprivileged keymap + line reader) to turn raw scancodes

@@ -198,6 +198,19 @@ evt: non-source rejected
 evt: got scancode 0x1e
 plinth: evt demo: all done
 
+# Phase 2 console input (Stage 3): a multishot event STREAM. The kernel grants
+# evtstream-user the same keyboard EventSource; the process opens one multishot
+# subscription through the libos async executor (a stream future over the
+# completion-ring reactor) and reaps a SEQUENCE of events -- one RING_OP_EVENT_SUB,
+# many completions demuxed by the subscription cookie. A scripted scancode
+# sequence ('a','b','c','d' make codes) is injected to drive it; the demo asserts
+# each event arrived once and in order (not transcript-matched), then cancels the
+# subscription. Frame counts around the demo must match (check_frames_baseline).
+plinth: evtstream demo: 1 processes
+evtstream: start
+evtstream: ok (4 events in order)
+plinth: evtstream demo: all done
+
 # Phase 2 console input (Stage 3): a line read through a library OS. kbd-user
 # uses libinput (an unprivileged keymap + line reader) to turn raw scancodes
 # into a line and echo it -- "input is output-only" retired, the keymap as libOS

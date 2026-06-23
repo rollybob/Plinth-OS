@@ -20,9 +20,10 @@ capability transfer into an isolated child. A 100 Hz timer preemptively
 multiplexes the CPU across several processes (round-robin); synchronous IPC
 connects them; a virtio-blk disk multiplexed by a `BlockRange` capability
 backs a read-only filesystem and load-from-disk; and the i8042 keyboard
-delivers raw events behind an `EventSource` capability. Block I/O is async
-completion rings (io_uring-shaped shared-memory queues), with a reference
-`no_std` async executor in `libos` driving many reads in flight at once.
+delivers raw events behind an `EventSource` capability. Block I/O and input are
+both async completion rings (io_uring-shaped shared-memory queues) -- reads as
+one-shot requests, input as multishot subscriptions -- with a reference `no_std`
+async executor in `libos` driving many reads in flight and event streams at once.
 Interrupts run through the Local APIC + I/O APIC (MSI-X for the disk, a
 per-CPU LAPIC timer), and the kernel boots and schedules on every CPU the
 ACPI MADT reports, serialized by a single big kernel lock. No network yet,
@@ -80,12 +81,16 @@ against the cost to determinism rather than taken for granted.
   kernel-light workload is taking the kernel off the I/O fast path, which is why
   this, not per-CPU run-queue splitting, was the next step after the SMP boot
   model.
-- [x] **Console input.** The i8042 keyboard's IRQ feeds raw scancodes into a
-  bounded event ring behind an interrupt-controller seam; an `EventSource`
-  capability multiplexes the device, and a blocking `event_recv` (on the IPC
-  gate) delivers events. A process blocked on input is not a deadlock -- the
-  kernel idles waiting for a keystroke. Keymaps and line editing are a library
-  OS (`libinput`); the kernel ships only raw events.
+- [x] **Console input.** The i8042 keyboard's IRQ feeds raw scancodes behind an
+  interrupt-controller seam; an `EventSource` capability multiplexes the device.
+  Input rides the **same completion rings as block I/O**: a keystroke answers no
+  request, so it is a *multishot subscription* (`RING_OP_EVENT_SUB`, then a
+  stream of completions until cancel), and one `ring_wait` loop multiplexes disk
+  and input (v2.5, retiring the standalone `event_recv` gate op behind a shim). A
+  process blocked on input is not a deadlock -- the kernel idles waiting for a
+  keystroke. The `libos` async executor turns the stream into an event stream
+  alongside the read future; keymaps and line editing are a library OS
+  (`libinput`); the kernel ships only raw events.
 - **Broader hardware.** SMP and real-machine device support, each taken on its
   own merits. Split into stages, because adding a second CPU ends the
   single-core invariant the no-lock kernel rested on -- a concurrency redesign,
@@ -117,10 +122,12 @@ against the cost to determinism rather than taken for granted.
 
 ## Stability
 
-The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.4**.
+The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.5**.
 v2 added IPC and revised `spawn`, the one incompatible change from v1 (made
 while Phase 2 is still pre-release); v2.1 (`spawn_from_buffer`), v2.2
-(console input), v2.3 (`block_read` moved to the blocking gate), and v2.4
-(async completion rings, retiring `block_read`) are all additive over v2. Within a major series, new capabilities are added without
-breaking existing programs. Anything not in ABI.md is an implementation
+(console input), v2.3 (`block_read` moved to the blocking gate), v2.4
+(async completion rings, retiring `block_read`), and v2.5 (input as multishot
+ring subscriptions, retiring `event_recv`) are all additive over v2 but for the
+two retired-and-shimmed ops. Within a major series, new capabilities are added
+without breaking existing programs. Anything not in ABI.md is an implementation
 detail and may move.

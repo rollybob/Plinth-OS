@@ -1,4 +1,4 @@
-# Plinth ABI v2.4
+# Plinth ABI v2.5
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -84,6 +84,31 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   unchanged -- so every existing caller is unaffected. The status codes now ride
   the CQ entry rather than `RAX`.
 - Additive but for the op-5 retirement: every other call is unchanged.
+
+### v2.5 (input becomes multishot subscriptions on the ring; `event_recv` retired)
+
+- **Console input is now the same ring ABI as block I/O; the `event_recv` gate op
+  is retired.** Input is *producer-initiated* -- a keystroke answers no request --
+  so it rides the ring as a **multishot subscription**, not a request/response: a
+  library OS writes a `RING_OP_EVENT_SUB` entry into the SQ naming an
+  `EventSource` capability and a `user_data` cookie, and from then on every event
+  on that source posts a CQ completion tagged with that cookie, until a
+  `RING_OP_CANCEL`. One ring, drained by one `ring_wait`, now multiplexes block
+  reads *and* input -- the unified event loop a real OS is built on. No new
+  syscall and no new gate op: the two new ops are SQ entries drained by the
+  existing `ring_submit`.
+- **`event_recv` (gate op 4) is retired (unused).** `libplinth::sys_event_recv`
+  is reimplemented as a single-subscription shim over the ring -- subscribe once,
+  then `ring_wait`/reap one event per call -- with its signature and
+  `EVENT_OK`/`EVENT_ERR` status unchanged, so every existing caller is
+  unaffected. The packed event now rides the CQ entry's `status` rather than
+  `RSI`.
+- **CQ-full backpressure** is the one new rule the block path never needed: an
+  unbounded event stream can outrun a slow reader, so on a full CQ the kernel
+  drops the *newest* event and sets a drop flag (bit 31 of `status`) on the next
+  admitted completion, rather than overwriting an unreaped entry. A block read
+  never hits this (its CQ is sized to in-flight depth).
+- Additive but for the op-4 retirement: every other call is unchanged.
 
 ## Syscall interface
 
@@ -189,15 +214,14 @@ convention mirrors the syscall one:
 | 1        | recv  | ep_slot                   | status; msg in RSI; cap slot/`NO_CAP` RDX |
 | 2        | call  | ep_slot, req              | status; reply word in RSI              |
 | 3        | reply | reply_slot, msg           | status                                 |
-| 4        | event_recv | source_slot          | status; packed event in RSI            |
 | 6        | ring_wait  | ring                 | status (woken; reap the CQ in memory)  |
 
-`event_recv` (console input) and `ring_wait` (block I/O) are not IPC, but they
-share this gate because a blocking wait needs the same resumable trap frame the
-IPC ops do. (Op 5, `block_read`, was retired in v2.4 -- block I/O is the ring
-ABI; its non-blocking `ring_register`/`ring_submit` are on the `syscall` fast
-path, nr 12/13.) They are documented under "Console input" and "Block storage"
-below.
+`ring_wait` is not IPC, but it shares this gate because a blocking wait needs the
+same resumable trap frame the IPC ops do. It now serves both block I/O and input,
+which both ride the ring ABI. (Op 5, `block_read`, was retired in v2.4 and op 4,
+`event_recv`, in v2.5 -- both became the ring ABI; the non-blocking
+`ring_register`/`ring_submit` are on the `syscall` fast path, nr 12/13.)
+`ring_wait` is documented under "Async completion rings" below.
 
 Notes:
 
@@ -234,79 +258,87 @@ A program creates its own endpoints only indirectly so far: the kernel makes
 one per `spawn` (the result channel) and may grant one at launch. A
 process-facing endpoint-create call is not yet part of the ABI.
 
-## Console input
+## Async completion rings (block I/O and input)
 
-Input is delivered as raw events from capability-named **event sources**. An
-`EventSource` capability (`RIGHT_READ`) names one input device; `event_recv`
-reads the next event from it. The call enters through the same `int 0x80` gate
-as IPC (a blocking read needs the resumable trap frame) under op selector 4.
-
-- **event_recv(source_slot)** requires `RIGHT_READ` on the `EventSource`
-  capability at `source_slot`. It returns the next event from that source --
-  immediately if one is queued, otherwise blocking until one arrives (the kernel
-  idles waiting for input). Returns `EVENT_OK = 0` in `RAX` with the **packed
-  event in `RSI`**, or `EVENT_ERR = 1` (bad slot, not an event source, or
-  missing read right). The status/payload split means no event word can be
-  mistaken for an error.
-- The event is **raw**: `RSI` packs the kind in bits 0..8, a device code in
-  8..24, and a value in 24..32. For the keyboard (the only source today, id 0),
-  the kind is `EVENT_KEY`, the code is the raw Set-1 scancode byte, and the
-  value is the make/break bit (1 = press). The kernel does no keymap
-  translation -- turning scancodes into characters and handling layouts,
-  modifiers, and line editing is library-OS policy.
-- One reader per source today: the process the kernel grants the source
-  capability to. Fanning input out to many consumers is itself a library OS
-  over this primitive.
-
-## Block storage (async completion rings)
-
-Block I/O is shared-memory submission/completion queues, io_uring-shaped. A
-`BlockRange` capability (`RIGHT_READ`) names a run of `(dev, start, count)`
-512-byte sectors on a block device; the library OS submits read requests against
-it and reaps results from memory, the kernel on the path only for a batched
-doorbell and the completion interrupt. The kernel is the sole writer of the
-physical descriptor addresses the device DMAs from, so the device is multiplexed
-across tenants with no IOMMU; a request names capability *slots*, never
-addresses.
-
-The library OS allocates two frames (`frame_alloc` + `frame_map`, both
-`READ|WRITE`) for the submission queue (SQ) and completion queue (CQ), then:
+Block I/O and input are the **same** shared-memory submission/completion queue
+mechanism, io_uring-shaped. A library OS allocates two frames (`frame_alloc` +
+`frame_map`, both `READ|WRITE`) for the submission queue (SQ) and completion queue
+(CQ), registers them, writes capability-named requests into the SQ, rings a
+doorbell, and reaps results from memory -- the kernel on the path only for a
+batched doorbell and the completion interrupt. The kernel is the sole writer of
+the physical descriptor addresses the device DMAs from, so devices are
+multiplexed across tenants with no IOMMU; a request names capability *slots*,
+never addresses.
 
 - **ring_register(sq_slot, cq_slot, entries)** (`syscall` nr 12) binds the two
   frames as an SQ/CQ pair and returns a `Ring` capability slot, or `SYS_ERR`.
   `entries` is a power of two that fits one frame (<= 64). The ring is bound to
   the calling process -- another process cannot submit or wait on it.
 - **ring_submit(ring)** (`syscall` nr 13) is the doorbell: the kernel drains the
-  SQ, running the two cap-checks on each entry and posting it to the device, and
-  returns the number of entries consumed (which may be fewer than queued under
-  backpressure -- resubmit the rest after reaping). Non-blocking.
+  SQ, running the per-entry cap-checks and posting each to the device (or, for a
+  subscription, arming it), and returns the number of entries consumed (which may
+  be fewer than queued under backpressure -- resubmit the rest after reaping).
+  Non-blocking.
 - **ring_wait(ring)** (`int 0x80` gate, op 6) blocks until the CQ has at least
   one unreaped completion, then returns; the caller reaps from the CQ in memory.
+  One `ring_wait` covers block completions and events alike -- the library OS
+  demuxes by `user_data`.
 
 Each ring is a small header (free-running `head`/`tail` `u32` indices + a `mask`)
-followed by fixed-size entries; the slot for an index is `index & mask`.
+followed by fixed-size entries; the slot for an index is `index & mask`. The SQ
+entry's `op` field selects the operation; the CQ entry layout is identical for
+every op (an event packs into the same 16 bytes a block completion uses).
 
-- **SQ entry (32 bytes)**: `op` (`u32`, 0 = read), `flags` (`u32`; the low 16
-  bits are the sector count), `range_slot` (`u32`), `frame_slot` (`u32`),
-  `sector_off` (`u64`), `user_data` (`u64`, an opaque cookie echoed back).
-- **CQ entry (16 bytes)**: `user_data` (`u64`, the submission's cookie verbatim),
-  `status` (`i32`), reserved (`u32`).
+- **SQ entry (32 bytes)**: `op` (`u32`), `flags` (`u32`), `range_slot` (`u32`),
+  `frame_slot` (`u32`), `sector_off` (`u64`), `user_data` (`u64`, an opaque
+  cookie echoed back). The op selectors:
+  - **`op = 0` (read)** -- `flags` low 16 bits are the sector count, `range_slot`
+    a `BlockRange`, `frame_slot` the I/O frame, `sector_off` the relative sector.
+  - **`op = 1` (event_sub)** -- open a multishot subscription: `range_slot` names
+    an `EventSource` capability (`RIGHT_READ`), `user_data` is the stream cookie.
+    The other fields are reserved 0. Arming posts no completion; events arrive
+    later. A bad source cap posts a zero-`status` error completion the shim reads.
+  - **`op = 2` (cancel)** -- cancel the live subscription named by `user_data` on
+    this ring. Other fields reserved 0. No completion.
+- **CQ entry (16 bytes)**: `user_data` (`u64`, the submission's / subscription's
+  cookie verbatim), `status` (`u32`), reserved (`u32`). For a read, `status` is a
+  `BLK_*` code. For an event, `status` is the **packed event** (see below), with
+  bit 31 the drop flag.
 
-The two cap-checks are the multiplexing surface: the request must lie inside the
-holder's `BlockRange` (sectors named **relative** to it -- the kernel adds the
-range start -- so a holder can never address blocks outside its grant), and the
-I/O frame must be the holder's with `RIGHT_WRITE` (the device DMAs into it; map
-it to read the bytes). The data lands in the frame, so the CQ carries only a
-*status*, never a data value: `BLK_OK = 0`, or `BLK_E_BADARG = 1` (zero count or
-larger than one frame), `BLK_E_RANGE = 2` (outside the range), `BLK_E_RIGHTS = 3`
-(bad slot, wrong kind, or missing right), `BLK_E_DEV = 4` (device error).
+**Block reads.** A `BlockRange` capability (`RIGHT_READ`) names a run of
+`(dev, start, count)` 512-byte sectors. The two cap-checks are the multiplexing
+surface: the request must lie inside the holder's range (sectors named
+**relative** to it -- the kernel adds the range start -- so a holder can never
+address blocks outside its grant), and the I/O frame must be the holder's with
+`RIGHT_WRITE` (the device DMAs into it; map it to read the bytes). The data lands
+in the frame, so the CQ carries only a *status*: `BLK_OK = 0`, or
+`BLK_E_BADARG = 1` (zero count or larger than one frame), `BLK_E_RANGE = 2`
+(outside the range), `BLK_E_RIGHTS = 3` (bad slot, wrong kind, or missing right),
+`BLK_E_DEV = 4` (device error). `libplinth::sys_block_read(range, frame,
+sector_off, count)` is a single-in-flight shim over these calls with the same
+signature and status as before.
 
-`libplinth::sys_block_read(range, frame, sector_off, count)` is a single-in-
-flight shim over these calls with the same signature and status as before, so a
-caller that only needs one read at a time is unchanged. Many-in-flight is the
-new capability: `libos`'s `ring` module is a reference `no_std` async executor
-that overlaps reads and matches each completion to its future by `user_data`. A
-write path is not yet part of the ABI -- the first filesystem is read-only.
+**Input events.** An `EventSource` capability (`RIGHT_READ`) names one input
+device. `event_sub` arms a standing subscription (the cap-check -- you may
+subscribe only to a source you hold -- is the multiplexing gate); from then on
+every event on that source posts a CQ completion tagged with the subscription's
+cookie, until `cancel` or process exit. The event in `status` is **raw**: kind in
+bits 0..8, device code in 8..24, value in 24..32, and bit 31 a **drop flag** the
+kernel sets after it dropped one or more events on a full CQ (it drops the newest
+rather than overwrite an unreaped slot -- input's correct failure mode under a
+slow reader). For the keyboard (the only source today, id 0) the kind is
+`EVENT_KEY = 1`, the code is the raw Set-1 scancode byte, and the value is the
+make/break bit (1 = press). The kernel does no keymap translation -- characters,
+layouts, modifiers, and line editing are library-OS policy.
+`libplinth::sys_event_recv(source)` is a single-subscription shim (subscribe
+once, reap one event per call) with `EVENT_OK`/`EVENT_ERR` unchanged.
+
+**The async capability.** `libos`'s `ring` module is a reference `no_std` async
+executor over these calls: a one-shot future for a read (overlapping many in
+flight, each matched to its future by `user_data`) and a multishot stream for a
+subscription (one cookie yielding a sequence of events in arrival order). One
+reactor, one `ring_wait` loop, both kinds of completion. A block *write* path is
+not yet part of the ABI -- the first filesystem is read-only.
 
 ## Capabilities
 
@@ -322,7 +354,7 @@ index into a per-process table; the records never leave the kernel. Kinds:
 | Reply      | one-shot authority to reply once | (none -- holding it suffices) |
 | BlockRange | `count` sectors on a device      | `READ`, `WRITE`            |
 | EventSource | one input device's event stream | `READ`                     |
-| Ring       | a bound SQ/CQ pair for block I/O | `READ`, `WRITE`            |
+| Ring       | a bound SQ/CQ pair (block I/O + input) | `READ`, `WRITE`      |
 
 Rights are checked at use, not at transfer. `Reply` capabilities are minted by
 the kernel (on receiving a `call`) and consumed on use; you cannot create one. A
@@ -342,13 +374,13 @@ A few slots are well-known, the way file descriptor 0 is on Unix:
 
 - `CPU_CAP_SLOT = 0` -- the CPU-time budget minted for every process. Pass it
   to `cpu_charge`.
-- `GRANT_SLOT = ENDPOINT_SLOT = BLOCK_SLOT = 1` -- the first capability the
-  kernel grants a process after its CPU budget. For a spawned child this is the
-  **send** capability on its parent's result channel (use it to report a
-  result); for a process the kernel launches with an endpoint, it is that
-  endpoint capability; for one launched with disk access, it is a `BlockRange`.
-  A capability moved in via `spawn`'s `transfer` argument lands in the next slot
-  after this one.
+- `GRANT_SLOT = ENDPOINT_SLOT = BLOCK_SLOT = EVENT_SOURCE_SLOT = 1` -- the first
+  capability the kernel grants a process after its CPU budget. For a spawned child
+  this is the **send** capability on its parent's result channel (use it to report
+  a result); for a process the kernel launches with an endpoint, it is that
+  endpoint capability; for one launched with disk access, a `BlockRange`; for one
+  launched with input, an `EventSource`. A capability moved in via `spawn`'s
+  `transfer` argument lands in the next slot after this one.
 
 All other slots start empty.
 

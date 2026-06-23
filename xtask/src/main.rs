@@ -46,8 +46,8 @@ fn main() {
 /// embedded or booted.
 const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
-    "share", "rpc", "faultchild", "blk", "asyncblk", "fsdemo", "diskhello", "evt", "kbd",
-    "template", "bench",
+    "share", "rpc", "faultchild", "blk", "asyncblk", "fsdemo", "diskhello", "evt", "evtstream",
+    "kbd", "template", "bench",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -833,6 +833,7 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     check_frames_baseline(&actual, "asyncblk");
     check_frames_baseline(&actual, "fs");
     check_frames_baseline(&actual, "evt");
+    check_frames_baseline(&actual, "evtstream");
     check_frames_baseline(&actual, "kbd");
 }
 

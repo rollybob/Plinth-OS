@@ -193,11 +193,15 @@ end.
 
 **Input is raw events; the keymap is policy.** evt-demo is granted an
 `EventSource` capability on the keyboard, is denied reading through a
-non-source capability, and blocks on `event_recv` until a keystroke wakes it
-(the kernel idles on input rather than treating the block as a deadlock). The
-kernel ships raw Set-1 scancodes and nothing more. kbd-demo turns those
-scancodes into a line with `libinput`, an unprivileged library OS holding the
-keymap, shift handling, and line editor -- so the echoed `Hi` is policy the
+non-source capability, and blocks until a keystroke wakes it (the kernel idles
+on input rather than treating the block as a deadlock). Input rides the same
+completion rings as block I/O: a keystroke answers no request, so it is a
+*multishot subscription* (one `RING_OP_EVENT_SUB`, then a stream of completions),
+and evtstream-demo subscribes once and reaps a sequence of events through the
+`libos` async executor -- one ring and one `ring_wait` now multiplex disk and
+input. The kernel ships raw Set-1 scancodes and nothing more. kbd-demo turns
+those scancodes into a line with `libinput`, an unprivileged library OS holding
+the keymap, shift handling, and line editor -- so the echoed `Hi` is policy the
 kernel never sees.
 
 ## Why exokernels
@@ -250,7 +254,7 @@ Plinth implements the minimum machinery that makes the argument concrete:
         |    libplinth: syscall shim + int 0x80 gate shim    |
   ======+======+============+=============+============+======+======
   syscall/sysret  |              int 0x80 gate              |
-   write exit      | send recv call reply event_recv ring_wait
+   write exit      | send recv call reply ring_wait
    frame_alloc/map/free cpu_charge fault_reg/return spawn spawn_from_buffer
    ring_register ring_submit
   +----------------------------------------------------------------+
@@ -264,11 +268,12 @@ Plinth implements the minimum machinery that makes the argument concrete:
 ```
 
 Two entry mechanisms: the non-blocking calls use `syscall`/`sysretq`; the
-blocking ones (IPC, `event_recv`, `ring_wait`) enter through an `int 0x80`
-gate, because suspending and resuming a call needs the full resumable trap
-frame the fast path does not save. Block I/O is the async-ring ABI:
+blocking ones (IPC, `ring_wait`) enter through an `int 0x80` gate, because
+suspending and resuming a call needs the full resumable trap frame the fast path
+does not save. Block I/O *and input* are the async-ring ABI:
 `ring_register`/`ring_submit` are non-blocking doorbell calls on the fast path,
-and a process parks in `ring_wait` only when it has nothing left to reap.
+and a process parks in `ring_wait` only when it has nothing left to reap -- one
+ring multiplexes disk reads and a multishot input subscription alike.
 
 ```text
 kernel/      the exokernel (no_std, x86_64-unknown-none)
@@ -277,8 +282,9 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
                    endpoints, reply caps, block ranges, event sources)
   syscall.rs       the non-blocking calls, syscall/sysret entry
   ipc.rs           the int 0x80 gate: endpoints, send/recv/call/reply,
-                   plus event_recv and ring_wait (blocking ops share it)
+                   plus ring_wait (the blocking ops share it)
   rings.rs         async completion rings: SQ drain + completion demux,
+                   block reads + multishot event subscriptions,
                    ring_register/ring_submit/ring_wait
   scheduler.rs     preemptive round-robin, per-process kernel stacks,
                    core-agnostic claim-and-run across CPUs
@@ -299,7 +305,7 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
   virtio_blk.rs    virtio-blk (virtio-pci) driver: one virtqueue, DMA,
                    interrupt-driven completion
   keyboard.rs      i8042 keyboard: IRQ1 -> raw scancodes
-  input.rs         event sources + bounded per-source event ring
+  input.rs         event sources: route keystrokes to ring subscriptions
   gdt.rs           GDT/TSS, sysret-compatible selector layout
   serial.rs        serial console
   tests/           in-kernel test suite (70 tests, run in QEMU)
@@ -326,6 +332,7 @@ user programs (ring 3, each its own crate):
   fsdemo-user/   load a program off disk with libfs + spawn_from_buffer
   diskhello-user/   lives only in the boot archive, never embedded
   evt-user/      read a raw keyboard event through an EventSource
+  evtstream-user/  subscribe and reap a multishot event stream (libos)
   kbd-user/      read a line through libinput
   faultchild-user/  a child that faults, for liveness testing
   template-user/    minimal skeleton to copy for a new program (see GUIDE.md)
@@ -373,24 +380,30 @@ xtask/       build orchestration: user binaries, disk images, QEMU,
   `fault_reg`/`fault_return` (a process cannot deliver a hardware fault to
   itself), `spawn`/`spawn_from_buffer` (a process cannot create an isolated
   address space) -- or a blocking operation that needs the kernel to suspend
-  and resume it, which is why IPC, `event_recv`, and `ring_wait` enter
-  through the `int 0x80` gate rather than the fast path. Everything those calls
-  *do* with the mechanism -- spend policy, paging policy, the filesystem
-  format, the keymap, the async I/O executor -- is still application code.
-- **Block I/O is async completion rings, and the executor is just policy.** A
-  library OS submits capability-named requests into a shared-memory queue and
-  reaps results from another, the kernel on the path only for a batched doorbell
-  (`ring_submit`) and the completion IRQ -- never a kernel entry per read, and
-  many reads in flight at once. The kernel ships only the *mechanism* (it stays
-  the sole writer of physical DMA addresses, so the device is multiplexed with
-  no IOMMU); the `no_std` async executor that turns a completion into a woken
-  future lives in `libos`, replaceable like every other policy.
-- **Status is split from payload on every blocking call.** IPC, `event_recv`,
-  and the ring's completions return a *status* word separate from their payload
-  (the message/event in `RSI`, the disk data in the DMA'd frame). A
-  peer-controlled or device-controlled value can never be mistaken for an
-  error -- not even `u64::MAX` -- including the `IPC_PEER_DIED` status that
-  frees a process blocked on a counterpart that died.
+  and resume it, which is why IPC and `ring_wait` enter through the `int 0x80`
+  gate rather than the fast path. Everything those calls *do* with the
+  mechanism -- spend policy, paging policy, the filesystem format, the keymap,
+  the async I/O executor -- is still application code.
+- **Block I/O and input are async completion rings, and the executor is just
+  policy.** A library OS submits capability-named requests into a shared-memory
+  queue and reaps results from another, the kernel on the path only for a batched
+  doorbell (`ring_submit`) and the completion IRQ -- never a kernel entry per
+  read, and many reads in flight at once. Input rides the same ring as a
+  *multishot subscription* (a keystroke answers no request), so one `ring_wait`
+  loop multiplexes disk and input. The kernel ships only the *mechanism* (it
+  stays the sole writer of physical DMA addresses, so the device is multiplexed
+  with no IOMMU); the `no_std` async executor that turns a completion into a
+  woken future or an event stream lives in `libos`, replaceable like every other
+  policy.
+- **Status is split from payload on every blocking call.** IPC returns a
+  *status* word separate from its message (the message in `RSI`), and a ring
+  block completion separates its status from the disk data (which lands in the
+  DMA'd frame). A peer-controlled or device-controlled value can never be
+  mistaken for an error -- not even `u64::MAX` -- including the `IPC_PEER_DIED`
+  status that frees a process blocked on a counterpart that died. An input event
+  is small enough to ride the completion's `status` field directly; the kernel
+  reserves a zero status as the unambiguous subscribe-error signal (a real event
+  always carries a nonzero kind byte).
 - **One interrupt-controller seam.** The keyboard IRQ and the virtio-blk
   completion IRQ both route through a single `irq` module, built as the one
   place an interrupt-controller swap has to touch -- and that swap has since
@@ -444,7 +457,7 @@ your line through `libinput`.
 
 Plinth runs your code in ring 3 over a stable syscall interface.
 [ABI.md](ABI.md) is the contract -- syscalls, the IPC and device gate, the
-executable format, and entry state, versioned as **v2.4** -- and
+executable format, and entry state, versioned as **v2.5** -- and
 [GUIDE.md](GUIDE.md) is the walkthrough: copy `template-user/` to start a
 program, and see how memory policy goes in a library OS rather than the
 kernel. Where the project is headed is in [ROADMAP.md](ROADMAP.md); how to
@@ -454,9 +467,10 @@ contribute is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Three layers, all in CI on every push:
 
-1. `cargo xtask test` -- 65 in-kernel unit tests (frame allocator, capability
+1. `cargo xtask test` -- 73 in-kernel unit tests (frame allocator, capability
    table, CPU-budget charging, the ELF loader/validator, the scheduler's
-   `pick_next` policy, the IPC wait queue, and the input event ring) executed
+   `pick_next` policy, the IPC wait queue, the block-completion demux, and the
+   event-subscription routing + CQ-full backpressure) executed
    inside QEMU, reported over a serial protocol (`[PASS]`/`[FAIL]`/`[SUITE]`)
    that xtask parses. Pure library-OS logic that does not need the kernel --
    the `libfs` archive parser and the `libinput` keymap -- is host-unit-tested
@@ -477,7 +491,7 @@ Three layers, all in CI on every push:
 ## Current limitations
 
 These are where Plinth is today, not where it stops. The syscall interface is
-a documented, versioned contract ([ABI.md](ABI.md), v2.4), so you can write
+a documented, versioned contract ([ABI.md](ABI.md), v2.5), so you can write
 your own programs and library OSes against it; growing Plinth toward a
 genuinely usable general-purpose exokernel is the ongoing direction
 ([ROADMAP.md](ROADMAP.md)).
@@ -547,10 +561,11 @@ Hard-won, possibly useful to other no_std kernel people:
   appears far from the cause. `cargo xtask check` machine-checks the contract.
 - **A blocking call needs a different door than a fast one.** The `syscall`
   fast path saves only `rcx`/`r11`; it cannot suspend a caller and resume it
-  later with its registers intact. Every Plinth call that blocks -- IPC,
-  `event_recv`, `ring_wait` -- goes through the `int 0x80` gate instead,
-  whose interrupt entry saves the full resumable trap frame. Several arrived as
-  `syscall` calls and had to move once they learned to block.
+  later with its registers intact. Every Plinth call that blocks -- IPC and
+  `ring_wait` (which now covers block I/O and input alike) -- goes through the
+  `int 0x80` gate instead, whose interrupt entry saves the full resumable trap
+  frame. Several arrived as `syscall` calls and had to move once they learned to
+  block.
 
 ## License
 

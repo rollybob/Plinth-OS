@@ -19,9 +19,10 @@
 
 #![no_std]
 
-/// A reference async block-I/O executor over the kernel's completion rings -- a
-/// second piece of library-OS policy (alongside the allocators), built entirely
-/// in unprivileged code over the ring ABI. See `ring`.
+/// A reference async executor over the kernel's completion rings -- block reads
+/// and input event streams on one ring -- a second piece of library-OS policy
+/// (alongside the allocators), built entirely in unprivileged code over the ring
+/// ABI. See `ring`.
 pub mod ring;
 
 use libplinth::{sys_frame_alloc, sys_frame_map, MAP_BASE, PAGE_SIZE, SYS_ERR};

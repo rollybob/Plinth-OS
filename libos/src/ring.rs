@@ -1,11 +1,26 @@
-//! A reference async block-I/O executor over the kernel's completion rings.
+//! A reference async executor over the kernel's completion rings -- block I/O
+//! and input events on one ring.
 //!
-//! This is the library-OS half of Design/async_rings.md: the kernel ships the
-//! ring *mechanism* (register/submit/wait + the in-flight demux); this is one
-//! *policy* built on it -- a minimal `no_std` futures executor a real library OS
-//! may replace. It is what makes depth observable: a caller issues several reads
-//! that overlap on the device, then awaits them all, the kernel demuxing each
-//! completion back by its `user_data` cookie.
+//! This is the library-OS half of Design/async_rings.md and Design/event_rings.md:
+//! the kernel ships the ring *mechanism* (register/submit/wait + the in-flight
+//! demux); this is one *policy* built on it -- a minimal `no_std` futures executor
+//! a real library OS may replace. It is what makes depth observable: a caller
+//! issues several reads that overlap on the device, then awaits them all, the
+//! kernel demuxing each completion back by its `user_data` cookie.
+//!
+//! Two future shapes ride the same reactor (event_rings.md s2/s6):
+//!
+//!   - A block `read` is a *one-shot* future: a unique cookie that retires when
+//!     its single completion is reaped.
+//!   - An event `subscribe` is a *multishot* stream: one `RING_OP_EVENT_SUB`
+//!     arms a standing subscription, and a persistent cookie yields a *sequence*
+//!     of event completions (each `next()` reaps one) until `cancel`. Input is
+//!     producer-initiated -- a keystroke answers no request -- so it is a stream,
+//!     not a request/response. The reactor (drain CQ, `ring_wait` when empty) is
+//!     reused unchanged; only the future on top differs.
+//!
+//! Because both are demuxed by `user_data` in the same CQ, one `ring_wait` loop
+//! multiplexes reads and events -- the unified event loop a real OS is built on.
 //!
 //! Design choices, deliberately minimal (complexity must earn its place):
 //!
@@ -59,6 +74,19 @@ const HDR_SIZE: u64 = 16;
 const SQ_ENTRY: u64 = 32;
 const CQ_ENTRY: u64 = 16;
 
+// SQ entry `op` selectors (Design/async_rings.md s4, event_rings.md s4).
+const RING_OP_READ: u32 = 0;
+const RING_OP_EVENT_SUB: u32 = 1;
+const RING_OP_CANCEL: u32 = 2;
+
+/// Drop-flag bit in an event completion's `status` (event_rings.md s5): the
+/// kernel sets it on the first event posted after one or more were dropped on a
+/// full CQ. The stream masks it off the returned event word; a reader that needs
+/// it can compare consecutive events. (No demo overruns the CQ, so it never
+/// fires here, but the adapter must not pass the flag bit through as event data
+/// -- it overlays the packed event's `value` field.)
+const EVENT_DROPPED: u32 = 1 << 31;
+
 #[inline]
 unsafe fn r32(a: u64) -> u32 {
     core::ptr::read_volatile(a as *const u32)
@@ -103,15 +131,27 @@ fn reactor() -> &'static mut Reactor {
 }
 
 impl Reactor {
-    /// Take the reaped completion for `ud`, if present. Removes it (each
+    /// Take the oldest reaped completion for `ud`, if present. Removes it (each
     /// completion is consumed exactly once).
+    ///
+    /// `reap` appends in CQ (delivery) order, so the lowest-index match is the
+    /// oldest, and removal shifts the tail down to preserve that order. A one-shot
+    /// `Read` has a unique `ud` (at most one match), so order is irrelevant to it;
+    /// but a multishot `EventStream` reuses one cookie across a *sequence* of
+    /// events, and a keystroke stream must surface in arrival order -- so the
+    /// shared reactor keeps the `done` table FIFO per cookie rather than
+    /// swap-removing. The shift is O(done_len) over a CAP=16 table: negligible.
     fn take(&mut self, ud: u64) -> Option<u64> {
         let mut i = 0;
         while i < self.done_len {
             if self.done[i].0 == ud {
                 let status = self.done[i].1;
-                // Swap-remove: order does not matter, completions are unordered.
-                self.done[i] = self.done[self.done_len - 1];
+                // Order-preserving remove: shift the rest down one.
+                let mut j = i;
+                while j + 1 < self.done_len {
+                    self.done[j] = self.done[j + 1];
+                    j += 1;
+                }
                 self.done_len -= 1;
                 return Some(status);
             }
@@ -175,11 +215,30 @@ unsafe fn push_sq(ud: u64, range_slot: u64, frame_slot: u64, sector_off: u64, co
     let mask = r32(SQ_VA + HDR_MASK);
     let tail = r32(SQ_VA + HDR_TAIL);
     let e = SQ_VA + HDR_SIZE + (tail & mask) as u64 * SQ_ENTRY;
-    w32(e, 0); // op = RING_OP_READ
+    w32(e, RING_OP_READ);
     w32(e + 4, (count & 0xFFFF) as u32); // flags: count in the low 16 bits
     w32(e + 8, range_slot as u32);
     w32(e + 12, frame_slot as u32);
     w64(e + 16, sector_off);
+    w64(e + 24, ud);
+    w32(SQ_VA + HDR_TAIL, tail.wrapping_add(1));
+}
+
+/// Push one event-control entry (EVENT_SUB or CANCEL) into the SQ at its tail.
+/// For EVENT_SUB, `source_slot` names the EventSource cap (it reuses the read
+/// path's `range_slot` field, event_rings.md s4) and `ud` is the subscription
+/// cookie echoed in every event completion; for CANCEL, `ud` names the live
+/// subscription and `source_slot` is ignored. SAFETY: SQ_VA is this process's
+/// mapped SQ frame.
+unsafe fn push_ctrl(op: u32, ud: u64, source_slot: u64) {
+    let mask = r32(SQ_VA + HDR_MASK);
+    let tail = r32(SQ_VA + HDR_TAIL);
+    let e = SQ_VA + HDR_SIZE + (tail & mask) as u64 * SQ_ENTRY;
+    w32(e, op);
+    w32(e + 4, 0); // flags: unused for control ops
+    w32(e + 8, source_slot as u32); // range_slot field = EventSource cap (EVENT_SUB)
+    w32(e + 12, 0); // frame_slot: unused
+    w64(e + 16, 0); // sector_off: unused
     w64(e + 24, ud);
     w32(SQ_VA + HDR_TAIL, tail.wrapping_add(1));
 }
@@ -219,6 +278,83 @@ impl Future for Read {
         }
         match reactor().take(me.ud) {
             Some(status) => Poll::Ready(status),
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// A multishot event subscription over the ring (event_rings.md s6). Unlike a
+/// one-shot `Read`, its `user_data` cookie persists across completions: one
+/// `RING_OP_EVENT_SUB` arms a standing subscription on an `EventSource`, and
+/// every event on that source posts a completion the kernel tags with this
+/// cookie, until `cancel`. `next()` reaps one event; the stream yields them in
+/// arrival order (the reactor keeps the `done` table FIFO per cookie).
+pub struct EventStream {
+    ud: u64,
+    source_slot: u64,
+    /// The EVENT_SUB entry is posted lazily on the first `next().poll()`, so a
+    /// just-created stream holds the source cap without yet touching the ring.
+    armed: bool,
+}
+
+/// Open an event-stream subscription on the `EventSource` capability at
+/// `source_slot`. Nothing is submitted until the first `next()` is polled (so the
+/// subscribe rides the same doorbell as anything else enqueued). The stream draws
+/// a unique cookie, so it coexists with reads and other streams on one ring.
+pub fn subscribe(source_slot: u64) -> EventStream {
+    let r = reactor();
+    let ud = r.next_ud;
+    r.next_ud = r.next_ud.wrapping_add(1);
+    EventStream { ud, source_slot, armed: false }
+}
+
+impl EventStream {
+    /// A future for the next event on this stream. Borrows the stream so the
+    /// subscription's lazy-arm bookkeeping is shared across calls; `block_on` it
+    /// to read one event (the demos' "subscribe, then reap N" loop).
+    pub fn next(&mut self) -> NextEvent<'_> {
+        NextEvent { stream: self }
+    }
+
+    /// Cancel the subscription: post a `RING_OP_CANCEL` naming this cookie, so the
+    /// kernel stops routing events here. After this, `next()` will re-arm a fresh
+    /// subscription on the next poll. Idempotent on an unarmed stream (a CANCEL
+    /// for an unknown cookie is a no-op drain in the kernel). The doorbell rings
+    /// on the next `block_on`; teardown (process exit) also drops the
+    /// subscription, so an explicit cancel is only needed to stop a *live* stream
+    /// early.
+    pub fn cancel(&mut self) {
+        if self.armed {
+            // SAFETY: the ring is set up (init) before any stream is used.
+            unsafe { push_ctrl(RING_OP_CANCEL, self.ud, 0) };
+            let handle = reactor().handle;
+            let _ = sys_ring_submit(handle);
+            self.armed = false;
+        }
+    }
+}
+
+/// The future returned by `EventStream::next`: on its first poll it arms the
+/// subscription (once per stream), then reports `Ready(event)` as soon as one
+/// event for this cookie has been reaped, `Pending` until then. The event word
+/// is the packed `Event` (kind/code/value, unpack with libplinth's
+/// `event_code`/`event_kind`/`event_value`); the CQ drop flag is masked off.
+pub struct NextEvent<'a> {
+    stream: &'a mut EventStream,
+}
+
+impl Future for NextEvent<'_> {
+    type Output = u64;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u64> {
+        let me = self.get_mut(); // NextEvent is Unpin (it holds only a &mut)
+        if !me.stream.armed {
+            // SAFETY: the ring is set up (init) before any stream is polled.
+            unsafe { push_ctrl(RING_OP_EVENT_SUB, me.stream.ud, me.stream.source_slot) };
+            me.stream.armed = true;
+        }
+        match reactor().take(me.stream.ud) {
+            Some(status) => Poll::Ready(status & !(EVENT_DROPPED as u64)),
             None => Poll::Pending,
         }
     }
