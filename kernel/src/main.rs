@@ -211,13 +211,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let _ = writeln!(serial, "plinth: timer armed (100 Hz)");
 
         // Bring up the i8042 keyboard (the first input event source) and unmask
-        // IRQ1. The synthetic selftest proves the scancode -> ring -> reader
-        // wiring without a real keypress; live keys flow once a process blocks
-        // on the source (Stage 2). Input is raw scancodes -- the keymap is libOS
-        // policy, so nothing here turns a scancode into a character.
+        // IRQ1. Scancodes flow through `input::record`, which routes them to any
+        // ring subscribed to the source (event_rings.md); the evt/kbd demos
+        // below prove that producer -> subscription -> reader path end to end.
+        // Input is raw scancodes -- the keymap is libOS policy, so nothing here
+        // turns a scancode into a character.
         keyboard::init();
         let _ = writeln!(serial, "plinth: keyboard ready (i8042, IRQ1)");
-        keyboard::selftest(&mut serial);
 
         // Stage 1 storage bring-up: discover the virtio-blk device over legacy
         // PCI config space, then bring up the modern device (map its BAR,

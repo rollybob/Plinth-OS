@@ -19,12 +19,11 @@ plinth: acpi: 1 cpu(s), 1 ioapic(s)
 plinth: timer armed
 
 # Console input bring-up (Stage 1): the i8042 keyboard comes up as the first
-# event source and IRQ1 is unmasked. The selftest pushes a known scancode
-# through the same record path the IRQ handler uses and reads it back from the
-# event ring -- proving the scancode -> ring -> reader wiring without a real
-# keypress (the scripted-keystroke smoke arrives with the keymap libOS).
+# event source and IRQ1 is unmasked. Scancodes flow through input::record, which
+# routes them to any ring subscribed to the source (event_rings.md); the evt/kbd
+# demos below prove that producer -> subscription -> reader path end to end, so
+# there is no separate boot selftest line.
 plinth: keyboard ready (i8042, IRQ1)
-plinth: keyboard selftest ok
 
 # Storage bring-up: discover virtio-blk over legacy PCI config space and bring
 # up every device. Two disks are attached: device 0 (slot 3) is the 1 MiB

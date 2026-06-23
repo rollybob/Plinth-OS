@@ -48,11 +48,11 @@ const IPC_RECV: u64 = 1;
 /// caller named by a one-shot reply capability.
 const IPC_CALL: u64 = 2;
 const IPC_REPLY: u64 = 3;
-/// event_recv: read the next input event from an `EventSource` capability. Not
-/// IPC, but it shares this gate -- a blocking read needs the same resumable
-/// trap frame, so the dispatch branches by subsystem (the handler lives in
-/// `input`, not here).
-const EVENT_RECV: u64 = 4;
+/// Op 4 (event_recv) was retired in ABI v2.5: input is now the multishot
+/// event-ring path (`RING_OP_EVENT_SUB` + `ring_wait`, event_rings.md), and
+/// `libplinth::sys_event_recv` is a single-subscription shim over it -- exactly
+/// as block_read became a ring shim. The number is left unused.
+///
 /// Op 5 (block_read) was retired in ABI v2.4: block I/O is now the async-ring
 /// ABI, so the blocking wait is `ring_wait` below. The number is left unused.
 ///
@@ -449,9 +449,6 @@ extern "C" fn ipc_dispatch(frame: *mut TrapFrame) -> u64 {
         IPC_RECV => ipc_recv(a1, frame as u64),
         IPC_CALL => ipc_call(a1, a2, frame as u64),
         IPC_REPLY => ipc_reply(a1, a2),
-        // Shares the gate, dispatched to the input subsystem (a1 = the
-        // EventSource capability slot, in rdi).
-        EVENT_RECV => crate::input::event_recv(a1, frame as u64),
         // Shares the gate, dispatched to the async-ring subsystem. a1 = the Ring
         // capability slot (rdi). Blocks until the ring's CQ is non-empty.
         RING_WAIT => crate::rings::ring_wait(a1, frame as u64),

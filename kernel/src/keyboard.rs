@@ -12,8 +12,6 @@
 //! switches processes (D7); a blocked reader is woken (in a later stage) and
 //! runs at the next scheduler tick.
 
-use core::fmt::Write;
-
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
@@ -78,26 +76,6 @@ pub fn init() {
         write_command(CMD_ENABLE_PORT1);
     }
     irq::unmask(1); // IRQ1 (the keyboard line)
-}
-
-/// Synthetic bring-up proof: push a known scancode through the exact `record`
-/// path the IRQ handler uses, then drain it from the ring and check it. This
-/// exercises the producer -> ring -> consumer wiring deterministically, without
-/// depending on a real keypress (the scripted-keystroke smoke arrives with the
-/// keymap libOS, Design/input.md D6). Leaves the ring as it found it.
-pub fn selftest<W: Write>(out: &mut W) -> bool {
-    const PROBE: u8 = 0x1E; // Set-1 make code for 'A'
-    input::record(input::SOURCE_KEYBOARD, Event::key(PROBE));
-    let ok = matches!(
-        input::poll(input::SOURCE_KEYBOARD),
-        Some(ev) if ev.code == PROBE as u16 && ev.value == 1
-    );
-    if ok {
-        let _ = writeln!(out, "plinth: keyboard selftest ok");
-    } else {
-        let _ = writeln!(out, "plinth: keyboard selftest FAILED");
-    }
-    ok
 }
 
 /// IRQ1 handler: read the scancode and record it. An interrupt gate clears IF,

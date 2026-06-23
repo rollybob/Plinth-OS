@@ -12,6 +12,7 @@
 
 mod capability;
 mod elf;
+mod event_rings;
 mod frame_alloc;
 mod input;
 mod ipc;
@@ -89,10 +90,6 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "elf::phoff_overflow", run: elf::phoff_overflow },
     TestCase { name: "elf::segment_file_offset_overflow", run: elf::segment_file_offset_overflow },
     TestCase { name: "elf::segment_vaddr_overflow", run: elf::segment_vaddr_overflow },
-    TestCase { name: "input::fifo_order", run: input::fifo_order },
-    TestCase { name: "input::empty_pop_is_none", run: input::empty_pop_is_none },
-    TestCase { name: "input::overflow_drops_newest", run: input::overflow_drops_newest },
-    TestCase { name: "input::wraps_after_drain", run: input::wraps_after_drain },
     TestCase { name: "input::key_event_encoding", run: input::key_event_encoding },
     TestCase { name: "ipc::wq_fifo_order", run: ipc::wq_fifo_order },
     TestCase { name: "ipc::wq_single", run: ipc::wq_single },
@@ -109,6 +106,13 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "ipc::ep_strand_last_side", run: ipc::ep_strand_last_side },
     TestCase { name: "ipc::ep_strand_not_last", run: ipc::ep_strand_not_last },
     TestCase { name: "ipc::ep_strand_no_reference", run: ipc::ep_strand_no_reference },
+    TestCase { name: "event_rings::routes_by_source_and_cookie", run: event_rings::routes_by_source_and_cookie },
+    TestCase { name: "event_rings::no_subscription_drops", run: event_rings::no_subscription_drops },
+    TestCase { name: "event_rings::overflow_drops_newest_and_counts", run: event_rings::overflow_drops_newest_and_counts },
+    TestCase { name: "event_rings::drop_flag_on_next_admitted", run: event_rings::drop_flag_on_next_admitted },
+    TestCase { name: "event_rings::cancel_stops_delivery", run: event_rings::cancel_stops_delivery },
+    TestCase { name: "event_rings::release_ring_clears_all", run: event_rings::release_ring_clears_all },
+    TestCase { name: "event_rings::pool_full_and_duplicates_rejected", run: event_rings::pool_full_and_duplicates_rejected },
     TestCase { name: "virtio_blk::inflight_distinct_heads", run: virtio_blk::inflight_distinct_heads },
     TestCase { name: "virtio_blk::inflight_complete_routes", run: virtio_blk::inflight_complete_routes },
     TestCase { name: "virtio_blk::inflight_complete_frees_and_refills", run: virtio_blk::inflight_complete_frees_and_refills },

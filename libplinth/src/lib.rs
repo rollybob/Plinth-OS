@@ -560,45 +560,163 @@ pub fn spawn_and_wait(child_id: u64, transfer_slot: u64) -> (u64, u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Input events
+// Input events: the single-subscription event-ring shim
 // ---------------------------------------------------------------------------
-// event_recv shares the int 0x80 gate with IPC (a blocking read needs the same
-// resumable trap frame), under its own op selector. Status in rax, the packed
-// event in rsi -- the same status/payload split as IPC, so no event value can
-// be mistaken for an error.
+// Input is the multishot event-ring path (Design/event_rings.md): a
+// RING_OP_EVENT_SUB arms a standing subscription on an EventSource, and every
+// event posts a completion into the ring's CQ. The old blocking `event_recv`
+// int 0x80 op was retired in ABI v2.5; `sys_event_recv` is now a thin shim --
+// subscribe once to the source, then ring_wait/reap one event per call --
+// behaviourally identical to the old blocking read (one event at a time), so
+// libinput and the input demos are unchanged. The async, many-event,
+// multi-source path is the new capability layered on the same primitive (the
+// block-read story, for input).
 
-const EVENT_RECV: u64 = 4;
-
-/// event_recv status (rax). `EVENT_OK` means an event is in the returned word;
-/// `EVENT_ERR` a bad slot, wrong capability kind, or a missing read right.
+/// event_recv status. `EVENT_OK` means an event is in the returned word;
+/// `EVENT_ERR` a bad slot, wrong capability kind, a missing read right, or a
+/// ring-setup failure.
 pub const EVENT_OK: u64 = 0;
 pub const EVENT_ERR: u64 = 1;
 
 /// Event kind (EVENT_KEY = 1, ...), the low byte of a packed event.
 pub const EVENT_KEY: u8 = 1;
 
+// SQ op selectors for the event-ring control entries (event_rings.md s4).
+const RING_OP_EVENT_SUB: u32 = 1;
+const RING_OP_CANCEL: u32 = 2;
+
+/// Drop-flag bit in an event completion's status (event_rings.md s5): set when
+/// the kernel dropped events on a full CQ. The shim reaps one event at a time so
+/// it never overflows, but it masks the flag off defensively before returning.
+const EVT_DROPPED: u32 = 1 << 31;
+
+/// The event ring is tiny -- one subscription, one event reaped at a time -- so
+/// a depth of 4 is ample (power of two, fits a frame easily).
+const EVT_RING_ENTRIES: u64 = 4;
+
+/// The event ring's SQ/CQ frames sit just below the block shim's, at the top of
+/// the map window, above where the demos map working frames (which grow up from
+/// MAP_BASE), so neither shim collides with the caller's mappings.
+const EVT_SQ_VA: u64 = MAP_END - 4 * PAGE_SIZE;
+const EVT_CQ_VA: u64 = MAP_END - 3 * PAGE_SIZE;
+
+/// The single subscription's cookie. Nonzero so it is never confused with an
+/// all-zero subscribe-error status; the shim keys "is this an event?" off the
+/// status kind byte, not the cookie.
+const EVT_COOKIE: u64 = 1;
+
+/// Lazily-set-up event ring handle, and the source slot the live subscription
+/// names (SYS_ERR = none). A user process is single-threaded, so these statics
+/// are touched without races.
+static mut EVT_RING: u64 = SYS_ERR;
+static mut EVT_SUB_SOURCE: u64 = SYS_ERR;
+
+/// Set up the event ring once: allocate + map an SQ and a CQ frame, register
+/// them, and cache the handle. Returns the handle, or SYS_ERR on any failure.
+fn evt_ring() -> u64 {
+    // SAFETY: single-threaded user process; the static is not shared.
+    unsafe {
+        if EVT_RING != SYS_ERR {
+            return EVT_RING;
+        }
+        let sq_slot = sys_frame_alloc();
+        if sq_slot == SYS_ERR || sys_frame_map(sq_slot, EVT_SQ_VA) == SYS_ERR {
+            return SYS_ERR;
+        }
+        let cq_slot = sys_frame_alloc();
+        if cq_slot == SYS_ERR || sys_frame_map(cq_slot, EVT_CQ_VA) == SYS_ERR {
+            return SYS_ERR;
+        }
+        let handle = sys_ring_register(sq_slot, cq_slot, EVT_RING_ENTRIES);
+        if handle != SYS_ERR {
+            EVT_RING = handle;
+        }
+        handle
+    }
+}
+
+/// Push one control entry (EVENT_SUB or CANCEL) onto the event ring's SQ and ring
+/// the doorbell. For EVENT_SUB, `source_slot` names the EventSource cap; for
+/// CANCEL it is unused. `cookie` is the subscription's user_data. Returns whether
+/// the submit succeeded.
+///
+/// SAFETY: the caller guarantees EVT_SQ_VA is mapped (evt_ring succeeded).
+unsafe fn evt_submit_op(handle: u64, op: u32, source_slot: u64, cookie: u64) -> bool {
+    let mask = ring_r32(EVT_SQ_VA + RING_HDR_MASK);
+    let tail = ring_r32(EVT_SQ_VA + RING_HDR_TAIL);
+    let e = EVT_SQ_VA + RING_HDR_SIZE + (tail & mask) as u64 * SQ_ENTRY_SIZE;
+    ring_w32(e, op);
+    ring_w32(e + 4, 0); // flags
+    ring_w32(e + 8, source_slot as u32); // range_slot field = EventSource cap (EVENT_SUB)
+    ring_w32(e + 12, 0); // frame_slot
+    ring_w64(e + 16, 0); // sector_off
+    ring_w64(e + 24, cookie); // user_data = subscription cookie
+    ring_w32(EVT_SQ_VA + RING_HDR_TAIL, tail.wrapping_add(1));
+    sys_ring_submit(handle) != SYS_ERR
+}
+
+/// Reap one completion from the event CQ, if any: returns its raw 32-bit status
+/// and advances the CQ head. `None` when the CQ is empty.
+///
+/// SAFETY: the caller guarantees EVT_CQ_VA is mapped.
+unsafe fn evt_reap() -> Option<u32> {
+    let head = ring_r32(EVT_CQ_VA + RING_HDR_HEAD);
+    let tail = ring_r32(EVT_CQ_VA + RING_HDR_TAIL);
+    if head == tail {
+        return None;
+    }
+    let mask = ring_r32(EVT_CQ_VA + RING_HDR_MASK);
+    let e = EVT_CQ_VA + RING_HDR_SIZE + (head & mask) as u64 * CQ_ENTRY_SIZE;
+    let status = ring_r32(e + 8); // user_data at e+0 ignored (single subscription)
+    ring_w32(EVT_CQ_VA + RING_HDR_HEAD, head.wrapping_add(1));
+    Some(status)
+}
+
 /// Read the next input event from the EventSource capability at `source_slot`,
 /// blocking until one arrives. Returns `(status, event)`: on `EVENT_OK` the
 /// event is the packed word, unpacked with `event_kind` / `event_code` /
 /// `event_value`. The kernel delivers raw scancodes; turning them into
 /// characters is the caller's (library OS's) job.
+///
+/// Shim over the event-ring ABI: ensure a single subscription on `source_slot`
+/// (lazily, re-subscribing if the caller switches sources), then ring_wait/reap
+/// one event. A subscribe failure (e.g. a non-EventSource cap) surfaces as
+/// `EVENT_ERR`: the kernel posts a zero-kind error completion the reap detects.
 #[inline]
 pub fn sys_event_recv(source_slot: u64) -> (u64, u64) {
-    let status: u64;
-    let event: u64;
-    // SAFETY: int 0x80 is the kernel's blocking-call gate; its handler saves and
-    // restores every register except the result regs (rax = status, rsi = event).
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            inlateout("rax") EVENT_RECV => status,
-            in("rdi") source_slot,
-            out("rsi") event,
-            out("rdx") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
-            options(nostack),
-        );
+    let handle = evt_ring();
+    if handle == SYS_ERR {
+        return (EVENT_ERR, 0);
     }
-    (status, event)
+    // SAFETY: the statics are this single-threaded process's; the ring frames are
+    // mapped (evt_ring succeeded), and the shim is their only writer/reader.
+    unsafe {
+        if EVT_SUB_SOURCE != source_slot {
+            // Switching sources: drop the old subscription before arming the new.
+            if EVT_SUB_SOURCE != SYS_ERR {
+                evt_submit_op(handle, RING_OP_CANCEL, 0, EVT_COOKIE);
+                EVT_SUB_SOURCE = SYS_ERR;
+            }
+            if !evt_submit_op(handle, RING_OP_EVENT_SUB, source_slot, EVT_COOKIE) {
+                return (EVENT_ERR, 0);
+            }
+            EVT_SUB_SOURCE = source_slot;
+        }
+        loop {
+            if let Some(status) = evt_reap() {
+                // A real event always has a nonzero kind byte; a zero status is
+                // the kernel's subscribe-error signal -> not actually subscribed.
+                if status & 0xFF == 0 {
+                    EVT_SUB_SOURCE = SYS_ERR;
+                    return (EVENT_ERR, 0);
+                }
+                return (EVENT_OK, (status & !EVT_DROPPED) as u64);
+            }
+            if sys_ring_wait(handle) == SYS_ERR {
+                return (EVENT_ERR, 0);
+            }
+        }
+    }
 }
 
 /// Unpack a packed event's kind. For a key event this is `EVENT_KEY`.
