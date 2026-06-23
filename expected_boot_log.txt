@@ -222,4 +222,18 @@ kbd: type a line
 kbd: read 'Hi'
 plinth: kbd demo: all done
 
+# Phase 2 console input (Stage 4): the unified loop -- ONE ring multiplexes block
+# I/O and input. The kernel grants unified-user a BlockRange over device 0 (slot
+# 1) and the keyboard EventSource (slot 2); the process registers a single ring,
+# issues a block read AND a multishot keyboard subscription on it, and drives both
+# to completion in one block_on/ring_wait loop (join2). The disk completion
+# arrives via the virtio IRQ; a scripted scancode sequence ('x','y','z' make
+# codes) drives the input side. The demo asserts the read landed sector 0's ramp
+# bytes and each event arrived in order, then cancels. Frame counts around the
+# demo must match (check_frames_baseline).
+plinth: unified demo: 1 processes
+unified: start
+unified: ok (1 read + 3 events on one ring)
+plinth: unified demo: all done
+
 plinth: boot ok

@@ -563,6 +563,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_kbd} frames free after kbd");
         }
 
+        // Phase 2 console input (Stage 4): the unified loop -- ONE ring multiplexes
+        // block I/O and input. The kernel grants unified-user two capabilities, a
+        // BlockRange over device 0 (slot 1) and the keyboard EventSource (slot 2);
+        // the process registers a single ring, issues a block read AND a multishot
+        // keyboard subscription on it, and drives both to completion in one
+        // block_on/ring_wait loop -- the end-goal event-loop shape a real OS is
+        // built on. The disk completion arrives via the virtio MSI-X IRQ; the
+        // scripted scancodes ('x','y','z' make codes) drive the input side, one per
+        // block as the reader idles on input (the same idle the kbd demo uses, but
+        // now with a disk read in flight on the same ring). Frame counts bracket
+        // the demo (no leak: the ring frames, the I/O frame, and the subscription
+        // slot are all reclaimed at teardown).
+        if virtio_blk::ready(0) {
+            const UNIFIED_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unified-user"));
+            let before_uni = free_frames();
+            let _ = writeln!(serial, "plinth: {before_uni} frames free before unified");
+            // Grants mint in order after the CPU budget: BlockRange -> slot 1,
+            // EventSource -> slot 2 (the demo's BLOCK_SLOT and EVENT_SLOT).
+            let range = Capability {
+                object: CapObject::BlockRange { dev: 0, start: 0, count: 1 },
+                rights: capability::RIGHT_READ,
+            };
+            let source = Capability {
+                object: CapObject::EventSource { id: 0 },
+                rights: capability::RIGHT_READ,
+            };
+            // Set-1 make codes for 'x','y','z' -- must match unified-user's SEQUENCE.
+            input::arm_synthetic(&[0x2D, 0x15, 0x2C]);
+            scheduler::run("unified demo", &[UNIFIED_BIN], phys_offset, &[Some(range), Some(source)]);
+            let after_uni = free_frames();
+            let _ = writeln!(serial, "plinth: {after_uni} frames free after unified");
+        }
+
         // BKL contention micro-benchmark (broader-hardware "SMP -- scaling"
         // decision: is splitting the lock, roadmap item B3, even justified?).
         // Saturate every core with the cheapest kernel-entry hammer there is

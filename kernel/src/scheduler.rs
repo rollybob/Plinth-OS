@@ -569,8 +569,18 @@ pub fn run(label: &str, binaries: &[&[u8]], phys_offset: u64, extra: &[Option<Ca
     bkl::acquire();
 
     for (id, binary) in binaries.iter().take(count).enumerate() {
-        let grant = extra.get(id).copied().flatten();
-        if let Err(e) = setup_process(id, binary, phys_offset, &[grant], false) {
+        // Grant assignment: a SINGLE-process run hands that process EVERY entry in
+        // `extra` (so a demo can be given several capabilities -- the unified
+        // block+input loop needs a BlockRange and an EventSource, which mint into
+        // consecutive slots after the CPU budget). A MULTI-process run is one grant
+        // per process, `extra[id]` (the common case: an endpoint per peer, a
+        // BlockRange per reader). `setup_process` mints the whole slice in order.
+        let grants: &[Option<Capability>] = if count == 1 {
+            extra
+        } else {
+            extra.get(id).map(core::slice::from_ref).unwrap_or(&[])
+        };
+        if let Err(e) = setup_process(id, binary, phys_offset, grants, false) {
             let _ = writeln!(serial, "plinth: {label}: setup of process {id} failed: {e}");
             // Reclaim whatever was set up before aborting the demo.
             teardown_all();

@@ -309,11 +309,31 @@ pub fn subscribe(source_slot: u64) -> EventStream {
 }
 
 impl EventStream {
+    /// Arm the subscription on first use: post the one `RING_OP_EVENT_SUB` that
+    /// turns this stream live. Idempotent -- every `next`/`collect` poll calls it,
+    /// but only the first touches the ring. SAFETY: the ring is set up (`init`)
+    /// before any stream is polled.
+    fn arm(&mut self) {
+        if !self.armed {
+            unsafe { push_ctrl(RING_OP_EVENT_SUB, self.ud, self.source_slot) };
+            self.armed = true;
+        }
+    }
+
     /// A future for the next event on this stream. Borrows the stream so the
     /// subscription's lazy-arm bookkeeping is shared across calls; `block_on` it
     /// to read one event (the demos' "subscribe, then reap N" loop).
     pub fn next(&mut self) -> NextEvent<'_> {
         NextEvent { stream: self }
+    }
+
+    /// A future that reaps the next `N` events into an array, in arrival order.
+    /// Like `next` but batched: `block_on(stream.collect::<N>())` resolves once
+    /// `N` events have arrived. Used by the unified-loop demo, where it is joined
+    /// (`join2`) with a block read so one `ring_wait` drives both -- the payoff of
+    /// carrying input and block I/O on a single ring.
+    pub fn collect<const N: usize>(&mut self) -> Collect<'_, N> {
+        Collect { stream: self, events: [0; N], count: 0 }
     }
 
     /// Cancel the subscription: post a `RING_OP_CANCEL` naming this cookie, so the
@@ -348,14 +368,44 @@ impl Future for NextEvent<'_> {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u64> {
         let me = self.get_mut(); // NextEvent is Unpin (it holds only a &mut)
-        if !me.stream.armed {
-            // SAFETY: the ring is set up (init) before any stream is polled.
-            unsafe { push_ctrl(RING_OP_EVENT_SUB, me.stream.ud, me.stream.source_slot) };
-            me.stream.armed = true;
-        }
+        me.stream.arm();
         match reactor().take(me.stream.ud) {
             Some(status) => Poll::Ready(status & !(EVENT_DROPPED as u64)),
             None => Poll::Pending,
+        }
+    }
+}
+
+/// The future returned by `EventStream::collect`: arms the subscription on first
+/// poll, then drains every available event for this cookie into `events` (in
+/// arrival order -- the reactor's `done` table is FIFO per cookie), reporting
+/// `Ready([N events])` once `N` have accumulated. The drop flag is masked off
+/// each event word.
+pub struct Collect<'a, const N: usize> {
+    stream: &'a mut EventStream,
+    events: [u64; N],
+    count: usize,
+}
+
+impl<const N: usize> Future for Collect<'_, N> {
+    type Output = [u64; N];
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<[u64; N]> {
+        let me = self.get_mut(); // Collect is Unpin (plain data + a &mut)
+        me.stream.arm();
+        while me.count < N {
+            match reactor().take(me.stream.ud) {
+                Some(status) => {
+                    me.events[me.count] = status & !(EVENT_DROPPED as u64);
+                    me.count += 1;
+                }
+                None => break,
+            }
+        }
+        if me.count == N {
+            Poll::Ready(me.events)
+        } else {
+            Poll::Pending
         }
     }
 }
@@ -395,6 +445,63 @@ impl<const N: usize> Future for JoinReads<N> {
         }
         if all {
             Poll::Ready(me.status)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// Await two *different* futures together. Where `join` is homogeneous (`N`
+/// reads), this joins two unlike futures -- the unified-loop case: a block `Read`
+/// and an event `Collect` driven on one ring, one `ring_wait`. Each child is
+/// polled until it resolves; its output is held until the other catches up, then
+/// both return as a pair.
+pub struct Join2<A: Future, B: Future> {
+    a: A,
+    b: B,
+    a_out: Option<A::Output>,
+    b_out: Option<B::Output>,
+}
+
+/// Join two unlike futures. `block_on(join2(read, stream.collect::<N>()))` issues
+/// both onto the same ring and resolves once each has completed, returning
+/// `(read_output, events)`. The outputs must be `Unpin` (they are held in an
+/// `Option` until both finish); every output this module produces -- `u64`,
+/// `[u64; N]` -- is.
+pub fn join2<A, B>(a: A, b: B) -> Join2<A, B>
+where
+    A: Future + Unpin,
+    B: Future + Unpin,
+    A::Output: Unpin,
+    B::Output: Unpin,
+{
+    Join2 { a, b, a_out: None, b_out: None }
+}
+
+impl<A, B> Future for Join2<A, B>
+where
+    A: Future + Unpin,
+    B: Future + Unpin,
+    A::Output: Unpin,
+    B::Output: Unpin,
+{
+    type Output = (A::Output, B::Output);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut(); // all fields Unpin, so Join2 is Unpin
+        if me.a_out.is_none() {
+            if let Poll::Ready(v) = Pin::new(&mut me.a).poll(cx) {
+                me.a_out = Some(v);
+            }
+        }
+        if me.b_out.is_none() {
+            if let Poll::Ready(v) = Pin::new(&mut me.b).poll(cx) {
+                me.b_out = Some(v);
+            }
+        }
+        if me.a_out.is_some() && me.b_out.is_some() {
+            // Both done: take the held outputs and resolve as a pair.
+            Poll::Ready((me.a_out.take().unwrap(), me.b_out.take().unwrap()))
         } else {
             Poll::Pending
         }
