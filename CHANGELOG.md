@@ -118,6 +118,23 @@ write half of the block ring ABI (`RING_OP_WRITE`), purely additive.
   content -- proving the write reached the device. It also holds a second,
   `RIGHT_READ`-only `BlockRange` and asserts a write through it is rejected
   with `BLK_E_RIGHTS` -- the negative case for the rights-direction check.
+- A read-write filesystem library OS, `librwfs` (Design/readwrite_fs.md),
+  built entirely on the block write path with **zero kernel or ABI change**
+  -- every decision in it is library-OS policy over `block_read`/`block_write`,
+  the exokernel argument applied one layer up from the read-only archive. A
+  bitmap allocator (`bitmap.rs`, first-fit over a byte slice) and a
+  fixed-maximum-entry mutable directory (`directory.rs`, the archive's
+  zeroed-name-means-free convention, but now reusable) are both pure logic,
+  host-tested like `libfs::archive`. `format.rs` wires them to real sectors
+  via `libos::ring` (async-native from the start, no polled shim): the
+  on-disk layout is a superblock + bitmap + directory metadata region
+  (rewritten as one unit after every mutation) followed by a single-extent,
+  fixed-size-at-creation data area, formatted fresh every run. A new
+  `rwfs-user` demo creates two files, reads each back, deletes one, creates a
+  third sized to need exactly the freed run, and asserts it landed at the
+  deleted file's exact former sector -- proving the bitmap reclaims freed
+  space rather than just hiding it -- then re-verifies the surviving file is
+  untouched by the cycle.
 
 ### Changed
 - **`block_read` moved from syscall nr 10 to the `int 0x80` gate (op 5), ABI

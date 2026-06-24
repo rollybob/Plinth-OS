@@ -236,11 +236,11 @@ Plinth implements the minimum machinery that makes the argument concrete:
   which resolves it with ordinary syscalls and resumes the faulting
   instruction -- self-paging, the exokernel's signature move. The kernel's
   mechanism is delivery and resume; the policy is the application's.
-- **Policy lives in library OSes, not the kernel**: allocation (`libos`), the
-  on-disk filesystem format (`libfs`), and the keyboard keymap and line editor
-  (`libinput`) are all unprivileged code linked into the programs that want
-  them. The kernel ships frames, sectors, and raw scancodes; what those *mean*
-  is decided above the kernel.
+- **Policy lives in library OSes, not the kernel**: allocation (`libos`), two
+  on-disk filesystem formats (`libfs` read-only, `librwfs` read-write), and
+  the keyboard keymap and line editor (`libinput`) are all unprivileged code
+  linked into the programs that want them. The kernel ships frames, sectors,
+  and raw scancodes; what those *mean* is decided above the kernel.
 
 ## Architecture
 
@@ -316,6 +316,8 @@ libplinth/   user-side syscall + gate shim -- deliberately NOT a library OS
 libos/       allocator library OSes (BumpAlloc, FreeListAlloc) + ring, a
              reference no_std async block-I/O executor over the ring ABI
 libfs/       a read-only boot-archive parser -- the filesystem as a libOS
+librwfs/     a bitmap allocator + mutable directory -- a second, writable
+             filesystem as a libOS, over the same block ring ABI
 libinput/    a Set-1 keymap (with shift) and line reader -- input as a libOS
 demo-app/    the shared allocator workload, generic over the memory policy
 
@@ -334,6 +336,7 @@ user programs (ring 3, each its own crate):
   blkwrite-user/ write a pattern, read it back, verify the round-trip
   fsdemo-user/   load a program off disk with libfs + spawn_from_buffer
   diskhello-user/   lives only in the boot archive, never embedded
+  rwfs-user/     create/read/delete/reuse over librwfs (the read-write FS)
   evt-user/      read a raw keyboard event through an EventSource
   evtstream-user/  subscribe and reap a multishot event stream (libos)
   unified-user/  one ring_wait drives a block read AND a key stream (join2)
@@ -523,9 +526,14 @@ genuinely usable general-purpose exokernel is the ongoing direction
   not page from disk -- the disk has its own explicit async-ring read path --
   so it demonstrates the upcall and the resume, not a full unified
   virtual-memory system.
-- **Storage is read-only, one filesystem.** A virtio-blk driver and a
-  read-only boot archive parsed by `libfs`; there is no `block_write` in the
-  ABI yet, and the archive format is the only filesystem. No network.
+- **Two filesystems, both minimal by design.** A virtio-blk driver backs
+  `libfs`'s read-only boot archive (the permanent initramfs/boot-image role)
+  and `librwfs`'s read-write filesystem (a bitmap allocator, a flat mutable
+  directory, single-extent fixed-size files) over the block ring ABI's write
+  half (`RING_OP_WRITE`, v2.6). The writable format has no crash consistency,
+  no nested directories, and no append/truncate/rename -- delete-then-recreate
+  covers what the demo needs; a real journaling filesystem is a different,
+  much larger project. No network.
 - **Input is two i8042 devices, raw events only.** The kernel ships raw Set-1
   scancodes from the keyboard and raw dx/dy/button packets from the mouse;
   one reader per source. Keymaps, layouts, line editing, and cursor/click

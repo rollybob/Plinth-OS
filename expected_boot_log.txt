@@ -268,4 +268,20 @@ mouse: start
 mouse: ok (3 packets in order)
 plinth: mouse demo: all done
 
+# Read-write filesystem (Design/readwrite_fs.md S6): the librwfs library OS
+# over the block write path. rwfs-user formats its granted range fresh,
+# creates two files, reads each back, deletes one, creates a third sized to
+# need exactly the freed run, and asserts it landed at the deleted file's
+# exact former sector -- proving the bitmap reclaims freed space -- then
+# re-verifies the surviving file. Frame counts around it must match
+# (check_frames_baseline).
+plinth: rwfs demo: 1 processes
+rwfs: start
+rwfs: formatted
+rwfs: a.txt and b.txt verified
+rwfs: a.txt deleted
+rwfs: bitmap reclaim verified (c.txt reused a.txt's sector)
+rwfs: ok (create/read/delete/reuse verified)
+plinth: rwfs demo: all done
+
 plinth: boot ok

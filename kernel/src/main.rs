@@ -679,6 +679,31 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_mouse} frames free after mouse");
         }
 
+        // Read-write filesystem (Design/readwrite_fs.md S6): the librwfs
+        // library OS over the block write path. The kernel grants rwfs-user a
+        // BlockRange over device 0 sectors [32, 96) -- clear of every other
+        // demo's range on this device -- minted RIGHT_READ | RIGHT_WRITE (a
+        // round-tripping cap needs both, same lesson blkwrite-user's build
+        // caught). The process formats the range fresh every run (S5),
+        // creates two files, reads each back, deletes one, creates a third
+        // sized to need exactly the freed run, and asserts it landed at the
+        // exact sector the deleted file held -- proving the bitmap allocator
+        // actually reclaims freed space rather than just hiding it -- then
+        // re-verifies the surviving file is untouched. Frame counts bracket
+        // the demo (no leak).
+        if virtio_blk::ready(0) {
+            const RWFS_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rwfs-user"));
+            let before_rwfs = free_frames();
+            let _ = writeln!(serial, "plinth: {before_rwfs} frames free before rwfs");
+            let range = Capability {
+                object: CapObject::BlockRange { dev: 0, start: 32, count: 64 },
+                rights: capability::RIGHT_READ | capability::RIGHT_WRITE,
+            };
+            scheduler::run("rwfs demo", &[RWFS_BIN], phys_offset, &[Some(range)]);
+            let after_rwfs = free_frames();
+            let _ = writeln!(serial, "plinth: {after_rwfs} frames free after rwfs");
+        }
+
         // BKL contention micro-benchmark (broader-hardware "SMP -- scaling"
         // decision: is splitting the lock, roadmap item B3, even justified?).
         // Saturate every core with the cheapest kernel-entry hammer there is

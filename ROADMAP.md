@@ -19,9 +19,10 @@ application-level page-fault handling (self-paging), and `spawn` with
 capability transfer into an isolated child. A 100 Hz timer preemptively
 multiplexes the CPU across several processes (round-robin); synchronous IPC
 connects them; a virtio-blk disk multiplexed by a `BlockRange` capability
-backs a read-only filesystem and load-from-disk, plus a block write path with
-no filesystem above it yet; and the i8042 keyboard and PS/2 mouse deliver raw
-events behind `EventSource` capabilities. Block I/O and input are both async
+backs two filesystems over the same block ring ABI -- a read-only boot
+archive (load-from-disk) and a read-write filesystem (create/read/delete) --
+and the i8042 keyboard and PS/2 mouse deliver raw events behind `EventSource`
+capabilities. Block I/O and input are both async
 completion rings (io_uring-shaped shared-memory queues) -- block reads and
 writes as one-shot requests, input as multishot subscriptions -- with a
 reference `no_std` async executor in `libos` driving many requests in flight
@@ -99,6 +100,19 @@ against the cost to determinism rather than taken for granted.
   the i8042 mouse on IRQ12, raw dx/dy/button packets -- proved the mechanism
   generalizes past one device with zero ABI or ring changes
   (Design/mouse_input.md).
+- [x] **A read-write filesystem.** `librwfs` (Design/readwrite_fs.md), a
+  second library OS over the same block ring ABI, with **zero kernel or ABI
+  change** -- the write path already proved the mechanism generalized; this
+  is the policy built on top. A bitmap allocator and a fixed-maximum-entry
+  mutable directory are pure logic, host-tested like the read-only archive's
+  parser; a superblock + bitmap + directory metadata region is formatted
+  fresh every run and rewritten as one unit after every create/delete. The
+  read-only archive is unchanged and remains the boot/initramfs format --
+  this is a second, separate format for runtime-mutable files, the same
+  "additive, not a rewrite" shape `filesystem.md` used to defer a hypothetical
+  FAT libOS. A `rwfs-user` demo proves the bitmap actually reclaims freed
+  space, not just hides it: a file created after a delete lands at the exact
+  sector the deleted file held.
 - **Broader hardware.** SMP and real-machine device support, each taken on its
   own merits. Split into stages, because adding a second CPU ends the
   single-core invariant the no-lock kernel rested on -- a concurrency redesign,
