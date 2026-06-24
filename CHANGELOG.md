@@ -3,7 +3,7 @@
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
 follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
-current contract is **v2.5**. v2 added IPC and revised `spawn`, breaking v1 --
+current contract is **v2.6**. v2 added IPC and revised `spawn`, breaking v1 --
 the one incompatible ABI change so far; v2.1 added `spawn_from_buffer` (the
 load-from-disk path), v2.2 added console input (`event_recv` + `EventSource`),
 both additive over v2; v2.3 moved `block_read` to the `int 0x80` gate so it can
@@ -12,7 +12,8 @@ entirely with async completion rings (`ring_register`/`ring_submit`/`ring_wait`)
 additive but for the retirement of the now-unused `block_read` op; v2.5 ports
 input onto the same rings as multishot subscriptions (`RING_OP_EVENT_SUB`/
 `RING_OP_CANCEL` SQ ops), retiring the `event_recv` gate op behind a shim -- one
-ring, one `ring_wait`, now multiplexes block reads and input.
+ring, one `ring_wait`, now multiplexes block reads and input; v2.6 adds the
+write half of the block ring ABI (`RING_OP_WRITE`), purely additive.
 
 ## [Unreleased]
 
@@ -96,6 +97,25 @@ ring, one `ring_wait`, now multiplexes block reads and input.
   completion in a single `block_on`/`ring_wait` loop -- the event loop a real OS
   is built on, with the kernel demuxing disk completions and key events back to
   their futures by `user_data` in one CQ.
+- A second `EventSource` -- the PS/2 mouse on IRQ12 (`kernel/src/mouse.rs`),
+  raw `dx`/`dy`/button packets as one packed `EVENT_MOUSE_MOVE` event -- proved
+  the event-rings mechanism generalizes past one device with zero changes to
+  `rings.rs` or the CQ-full backpressure logic. A `mouse-user` demo subscribes
+  and reaps a scripted packet sequence, asserting each decodes correctly and in
+  order, then cancels.
+- Block writes -- the write half of the ring ABI (ABI v2.6). A new
+  `RING_OP_WRITE` SQ op mirrors `RING_OP_READ`'s shape exactly, but with the
+  two cap-checks' direction reversed: the `BlockRange` must carry `RIGHT_WRITE`
+  (not `RIGHT_READ`), and the I/O frame must carry `RIGHT_READ` (not
+  `RIGHT_WRITE`) -- the kernel reads the frame's existing contents to hand to
+  the device, rather than writing into it. `virtio_blk::post_request` gained a
+  `Direction` parameter selecting `VIRTIO_BLK_T_IN`/`VIRTIO_BLK_T_OUT` and
+  whether the data descriptor is device-writable; `drain_completions` and the
+  in-flight demux are unchanged (direction-agnostic). `libos`'s `ring` gains a
+  `write` future mirroring `read`. A new `blkwrite-user` demo writes a fixed
+  pattern to a granted range, reads the same range back into a separate frame,
+  and asserts the bytes match what was written -- not the disk's original ramp
+  content -- proving the write reached the device.
 
 ### Changed
 - **`block_read` moved from syscall nr 10 to the `int 0x80` gate (op 5), ABI

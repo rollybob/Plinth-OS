@@ -482,6 +482,31 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_async} frames free after asyncblk");
         }
 
+        // Block write path (Design/block_write.md): the write half of the ring
+        // ABI. The kernel grants blkwrite-user a BlockRange over device 0
+        // sectors [8, 12) -- clear of every other demo's range on this device --
+        // minted with RIGHT_READ | RIGHT_WRITE, since the demo round-trips
+        // through the SAME range (write a pattern, then read the same sectors
+        // back to verify it landed): post_write's RIGHT_WRITE check and
+        // post_read's RIGHT_READ check (rings.rs) both gate this one cap. The
+        // process writes a fixed pattern, reads the range back into a separate
+        // frame, and asserts the bytes match what it wrote (not the disk's
+        // original ramp content) -- proving the write actually reached the
+        // device. Frame counts bracket the demo (no leak).
+        if virtio_blk::ready(0) {
+            const BLKWRITE_BIN: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/blkwrite-user"));
+            let before_blkwrite = free_frames();
+            let _ = writeln!(serial, "plinth: {before_blkwrite} frames free before blkwrite");
+            let range = Capability {
+                object: CapObject::BlockRange { dev: 0, start: 8, count: 4 },
+                rights: capability::RIGHT_READ | capability::RIGHT_WRITE,
+            };
+            scheduler::run("blkwrite demo", &[BLKWRITE_BIN], phys_offset, &[Some(range)]);
+            let after_blkwrite = free_frames();
+            let _ = writeln!(serial, "plinth: {after_blkwrite} frames free after blkwrite");
+        }
+
         // Phase 2 storage, load-from-disk: the filesystem library-OS demo. The
         // kernel grants fsdemo one capability -- a BlockRange over the whole
         // archive device (device 1) -- and nothing else. fsdemo uses libfs to

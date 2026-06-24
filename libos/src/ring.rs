@@ -74,10 +74,12 @@ const HDR_SIZE: u64 = 16;
 const SQ_ENTRY: u64 = 32;
 const CQ_ENTRY: u64 = 16;
 
-// SQ entry `op` selectors (Design/async_rings.md s4, event_rings.md s4).
+// SQ entry `op` selectors (Design/async_rings.md s4, event_rings.md s4,
+// Design/block_write.md S1).
 const RING_OP_READ: u32 = 0;
 const RING_OP_EVENT_SUB: u32 = 1;
 const RING_OP_CANCEL: u32 = 2;
+const RING_OP_WRITE: u32 = 3;
 
 /// Drop-flag bit in an event completion's `status` (event_rings.md s5): the
 /// kernel sets it on the first event posted after one or more were dropped on a
@@ -209,13 +211,15 @@ pub fn init() -> bool {
     true
 }
 
-/// Push one submission entry into the SQ at its tail (the kernel reads it on the
-/// next doorbell). SAFETY: SQ_VA is this process's mapped SQ frame.
-unsafe fn push_sq(ud: u64, range_slot: u64, frame_slot: u64, sector_off: u64, count: u64) {
+/// Push one block I/O submission entry into the SQ at its tail (the kernel
+/// reads it on the next doorbell). `op` selects `RING_OP_READ` or
+/// `RING_OP_WRITE` (Design/block_write.md S1) -- same entry shape either way.
+/// SAFETY: SQ_VA is this process's mapped SQ frame.
+unsafe fn push_sq(op: u32, ud: u64, range_slot: u64, frame_slot: u64, sector_off: u64, count: u64) {
     let mask = r32(SQ_VA + HDR_MASK);
     let tail = r32(SQ_VA + HDR_TAIL);
     let e = SQ_VA + HDR_SIZE + (tail & mask) as u64 * SQ_ENTRY;
-    w32(e, RING_OP_READ);
+    w32(e, op);
     w32(e + 4, (count & 0xFFFF) as u32); // flags: count in the low 16 bits
     w32(e + 8, range_slot as u32);
     w32(e + 12, frame_slot as u32);
@@ -273,7 +277,53 @@ impl Future for Read {
         let me = self.get_mut(); // Read is Unpin
         if !me.posted {
             // SAFETY: the ring is set up (init) before any read is polled.
-            unsafe { push_sq(me.ud, me.range_slot, me.frame_slot, me.sector_off, me.count) };
+            unsafe {
+                push_sq(RING_OP_READ, me.ud, me.range_slot, me.frame_slot, me.sector_off, me.count)
+            };
+            me.posted = true;
+        }
+        match reactor().take(me.ud) {
+            Some(status) => Poll::Ready(status),
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// A pending block write -- the write half of `Read` (Design/block_write.md
+/// S1). Same shape and lifecycle: nothing is submitted until first polled,
+/// `Ready(status)` once the completion is reaped.
+pub struct Write {
+    ud: u64,
+    posted: bool,
+    range_slot: u64,
+    frame_slot: u64,
+    sector_off: u64,
+    count: u64,
+}
+
+/// Create a write future: `count` 512-byte sectors at `sector_off` of the
+/// BlockRange at `range_slot`, DMA'd out of the frame at `frame_slot`. The
+/// `BlockRange` cap must carry `RIGHT_WRITE` and the frame cap `RIGHT_READ`
+/// (the kernel reads the frame's existing contents to hand to the device) --
+/// the flipped direction from `read` (Design/block_write.md S3).
+pub fn write(range_slot: u64, frame_slot: u64, sector_off: u64, count: u64) -> Write {
+    let r = reactor();
+    let ud = r.next_ud;
+    r.next_ud = r.next_ud.wrapping_add(1);
+    Write { ud, posted: false, range_slot, frame_slot, sector_off, count }
+}
+
+impl Future for Write {
+    /// The block status word (BLK_OK or a BLK_E_*).
+    type Output = u64;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u64> {
+        let me = self.get_mut(); // Write is Unpin
+        if !me.posted {
+            // SAFETY: the ring is set up (init) before any write is polled.
+            unsafe {
+                push_sq(RING_OP_WRITE, me.ud, me.range_slot, me.frame_slot, me.sector_off, me.count)
+            };
             me.posted = true;
         }
         match reactor().take(me.ud) {

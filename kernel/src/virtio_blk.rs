@@ -66,7 +66,20 @@ const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 
 // --- virtio-blk request (virtio 1.x, 5.2.6) ---
 const VIRTIO_BLK_T_IN: u32 = 0; // read: device -> memory
+const VIRTIO_BLK_T_OUT: u32 = 1; // write: memory -> device
 const VIRTIO_BLK_S_OK: u8 = 0;
+
+/// Which way data flows between the device and the caller's frame for one
+/// request (Design/block_write.md S2). Controls the request-header type and
+/// whether the data descriptor is device-writable: a read has the device DMA
+/// *into* the frame (device-writable descriptor), a write has it DMA *out of*
+/// the frame (device-readable descriptor, the same as the header/status
+/// descriptors the device only ever reads or writes wholesale).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    Read,
+    Write,
+}
 
 /// virtio block I/O is always in 512-byte units, independent of any device
 /// logical block size. This is the sector unit `BlockRange` will count (D3a).
@@ -341,13 +354,14 @@ impl VirtioBlk {
         self.buf_phys + STATUS_REGION_OFF + slot as u64
     }
 
-    /// Post a 3-descriptor read of `count` 512-byte sectors starting at `sector`
-    /// into the buffer at `data_phys` (the device DMAs there; the buffer must
-    /// hold count*512 bytes), using the descriptor chain anchored at `head` (a
-    /// slot the caller claimed from `inflights`), and notify the device. Does
-    /// NOT wait: the caller either polls (`drain_completions`, the boot path) or
-    /// blocks until the completion IRQ (the runtime path). `want_interrupt` sets
-    /// the avail-ring NO_INTERRUPT flag accordingly.
+    /// Post a 3-descriptor request of `count` 512-byte sectors starting at
+    /// `sector`, against the buffer at `data_phys` (the device DMAs into it for
+    /// `Direction::Read`, out of it for `Direction::Write`; the buffer must hold
+    /// count*512 bytes either way), using the descriptor chain anchored at
+    /// `head` (a slot the caller claimed from `inflights`), and notify the
+    /// device. Does NOT wait: the caller either polls (`drain_completions`, the
+    /// boot path) or blocks until the completion IRQ (the runtime path).
+    /// `want_interrupt` sets the avail-ring NO_INTERRUPT flag accordingly.
     fn post_request(
         &mut self,
         head: u16,
@@ -355,10 +369,18 @@ impl VirtioBlk {
         count: u64,
         data_phys: u64,
         want_interrupt: bool,
+        dir: Direction,
     ) {
         let slot = (head / DESC_PER_REQ) as usize;
         let hdr_phys = self.hdr_phys(slot);
         let status_phys = self.status_phys(slot);
+        let (req_type, data_flags) = match dir {
+            // Device-writable: the device DMAs the read result into the frame.
+            Direction::Read => (VIRTIO_BLK_T_IN, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE),
+            // Device-readable: the device DMAs the frame's existing contents
+            // out to the disk, so it must not also be marked device-writable.
+            Direction::Write => (VIRTIO_BLK_T_OUT, VIRTQ_DESC_F_NEXT),
+        };
         // SAFETY: all addresses below are kernel-mapped ring/MMIO/buffer
         // addresses set up in `init`; data_phys is a caller-owned frame. The
         // descriptor chain [head, head+1, head+2] is within the queue (head <=
@@ -372,7 +394,7 @@ impl VirtioBlk {
             w16(self.avail_va, flags);
 
             // This slot's request header (device reads it) and status sentinel.
-            w32(self.hdr_va(slot), VIRTIO_BLK_T_IN);
+            w32(self.hdr_va(slot), req_type);
             w32(self.hdr_va(slot) + 4, 0);
             w64(self.hdr_va(slot) + 8, sector);
             w8(self.status_va(slot), 0xFF);
@@ -387,7 +409,7 @@ impl VirtioBlk {
 
             w64(d + 16, data_phys);
             w32(d + 24, (count * SECTOR_SIZE) as u32);
-            w16(d + 28, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
+            w16(d + 28, data_flags);
             w16(d + 30, head + 2);
 
             w64(d + 32, status_phys);
@@ -466,7 +488,13 @@ impl VirtioBlk {
     /// Synchronous polled read for the boot path: there is no scheduler yet, so
     /// nothing can be blocked. Claim a slot, post with the completion interrupt
     /// suppressed, spin (bounded, faulting on timeout per D6) on the used ring,
-    /// then drain the one completion.
+    /// then drain the one completion. Read-only: no boot-time path needs a
+    /// polled write, so this stays the shape it always was rather than
+    /// generalizing over `Direction` for a caller that does not exist
+    /// (Design/block_write.md S2 sketched a polled `write` sibling, but nothing
+    /// in this milestone calls it -- the real write path is the ring path
+    /// below, `ring_post`, which is direction-aware and exercised by
+    /// `blkwrite-user`).
     fn read_block_polled(
         &mut self,
         sector: u64,
@@ -477,7 +505,7 @@ impl VirtioBlk {
             .inflights
             .submit(Inflight { target: Completion::Poll })
             .ok_or("virtio-blk free pool exhausted")?;
-        self.post_request(head, sector, count, data_phys, false);
+        self.post_request(head, sector, count, data_phys, false, Direction::Read);
         let mut spins = 0u64;
         // SAFETY: used_va is the mapped used ring; reading idx@2 is a read.
         while unsafe { r16(self.used_va + 2) } == self.last_used {
@@ -737,26 +765,28 @@ pub fn read(dev: usize, sector: u64, count: u64, data_phys: u64) -> Result<(), &
     }
 }
 
-/// Post one ring-submitted read into device `dev`: claim an in-flight slot
+/// Post one ring-submitted request into device `dev`: claim an in-flight slot
 /// recording the CQ routing (`ring` + `user_data`), then post the 3-descriptor
 /// chain at the caller's frame physical address with completion interrupts
-/// enabled. Returns `Ok(())` once posted, or `Err(())` when the device's
-/// in-flight pool is full -- the ring drain treats that as backpressure (R6) and
-/// stops, leaving the remaining SQ entries for the libOS to resubmit. The
-/// completion IRQ (`complete_irq`) routes the result to the ring's CQ.
+/// enabled. `dir` selects read vs. write (Design/block_write.md S2). Returns
+/// `Ok(())` once posted, or `Err(())` when the device's in-flight pool is full
+/// -- the ring drain treats that as backpressure (R6) and stops, leaving the
+/// remaining SQ entries for the libOS to resubmit. The completion IRQ
+/// (`complete_irq`) routes the result to the ring's CQ.
 ///
 /// The device-facing half of `rings::ring_submit`: the caller has already run
 /// the two cap-checks and resolved `abs_sector`/`frame_phys`, so this only owns
 /// the slot claim + virtqueue post. The IF=0 no-lost-wakeup argument lives in
 /// `ring_wait`: the completion IRQ cannot wake a ring before the libOS parks on
 /// it, the same discipline the IPC ops rely on.
-pub fn ring_post(
+pub(crate) fn ring_post(
     dev: usize,
     abs_sector: u64,
     count: u64,
     frame_phys: u64,
     ring: usize,
     user_data: u64,
+    dir: Direction,
 ) -> Result<(), ()> {
     let mut guard = DEVICES.get(dev).ok_or(())?.lock();
     let d = guard.as_mut().ok_or(())?;
@@ -764,7 +794,7 @@ pub fn ring_post(
         .inflights
         .submit(Inflight { target: Completion::Ring { ring, user_data } })
         .ok_or(())?;
-    d.post_request(head, abs_sector, count, frame_phys, true);
+    d.post_request(head, abs_sector, count, frame_phys, true, dir);
     Ok(())
 }
 

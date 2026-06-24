@@ -1,4 +1,4 @@
-# Plinth ABI v2.5
+# Plinth ABI v2.6
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -109,6 +109,20 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   admitted completion, rather than overwriting an unreaped entry. A block read
   never hits this (its CQ is sized to in-flight depth).
 - Additive but for the op-4 retirement: every other call is unchanged.
+
+### v2.6 (block writes -- the write half of the ring ABI)
+
+- **New: `RING_OP_WRITE` (SQ op 3).** Same entry shape as a read (`range_slot`,
+  `frame_slot`, `sector_off`, the sector count in `flags`), but the direction
+  -- and the two cap-checks' direction -- is reversed: the `BlockRange` must
+  carry `RIGHT_WRITE` (not `RIGHT_READ`), and the I/O frame must carry
+  `RIGHT_READ` (not `RIGHT_WRITE`) -- the kernel reads the frame's existing
+  contents to hand to the device, rather than writing into it. The CQ
+  completion is the same `BLK_*` status a read returns.
+- Purely additive: no syscall, no gate op, and no existing call's behavior
+  changed. `libplinth` gains no new shim -- there is no retired blocking
+  `block_write` to be backward-compatible with, unlike `block_read`'s v2.4
+  retirement.
 
 ## Syscall interface
 
@@ -300,45 +314,56 @@ every op (an event packs into the same 16 bytes a block completion uses).
     later. A bad source cap posts a zero-`status` error completion the shim reads.
   - **`op = 2` (cancel)** -- cancel the live subscription named by `user_data` on
     this ring. Other fields reserved 0. No completion.
+  - **`op = 3` (write, v2.6)** -- same fields as a read, but `range_slot` must
+    carry `RIGHT_WRITE` and `frame_slot` must carry `RIGHT_READ` -- the
+    direction reversed from a read (the kernel reads the frame to hand to the
+    device, rather than writing into it).
 - **CQ entry (16 bytes)**: `user_data` (`u64`, the submission's / subscription's
-  cookie verbatim), `status` (`u32`), reserved (`u32`). For a read, `status` is a
-  `BLK_*` code. For an event, `status` is the **packed event** (see below), with
-  bit 31 the drop flag.
+  cookie verbatim), `status` (`u32`), reserved (`u32`). For a read or write,
+  `status` is a `BLK_*` code. For an event, `status` is the **packed event**
+  (see below), with bit 31 the drop flag.
 
-**Block reads.** A `BlockRange` capability (`RIGHT_READ`) names a run of
-`(dev, start, count)` 512-byte sectors. The two cap-checks are the multiplexing
-surface: the request must lie inside the holder's range (sectors named
-**relative** to it -- the kernel adds the range start -- so a holder can never
-address blocks outside its grant), and the I/O frame must be the holder's with
-`RIGHT_WRITE` (the device DMAs into it; map it to read the bytes). The data lands
-in the frame, so the CQ carries only a *status*: `BLK_OK = 0`, or
-`BLK_E_BADARG = 1` (zero count or larger than one frame), `BLK_E_RANGE = 2`
-(outside the range), `BLK_E_RIGHTS = 3` (bad slot, wrong kind, or missing right),
-`BLK_E_DEV = 4` (device error). `libplinth::sys_block_read(range, frame,
-sector_off, count)` is a single-in-flight shim over these calls with the same
-signature and status as before.
+**Block I/O.** A `BlockRange` capability names a run of `(dev, start, count)`
+512-byte sectors; `RIGHT_READ` gates a read request through it, `RIGHT_WRITE`
+a write (v2.6) -- a range minted with only one direction's right correctly
+rejects the other. The two cap-checks are the multiplexing surface: the
+request must lie inside the holder's range (sectors named **relative** to it
+-- the kernel adds the range start -- so a holder can never address blocks
+outside its grant), and the I/O frame must be the holder's with the opposite
+right from the range: `RIGHT_WRITE` for a read (the device DMAs into the
+frame; map it to read the bytes), `RIGHT_READ` for a write (the device DMAs
+out of the frame's existing contents). Either way the CQ carries only a
+*status*: `BLK_OK = 0`, or `BLK_E_BADARG = 1` (zero count or larger than one
+frame), `BLK_E_RANGE = 2` (outside the range), `BLK_E_RIGHTS = 3` (bad slot,
+wrong kind, or missing right), `BLK_E_DEV = 4` (device error).
+`libplinth::sys_block_read(range, frame, sector_off, count)` is a
+single-in-flight shim over the read op with the same signature and status as
+before; there is no equivalent blocking shim for writes (v2.6 added no such
+call to be backward-compatible with).
 
 **Input events.** An `EventSource` capability (`RIGHT_READ`) names one input
-device. `event_sub` arms a standing subscription (the cap-check -- you may
-subscribe only to a source you hold -- is the multiplexing gate); from then on
-every event on that source posts a CQ completion tagged with the subscription's
-cookie, until `cancel` or process exit. The event in `status` is **raw**: kind in
-bits 0..8, device code in 8..24, value in 24..32, and bit 31 a **drop flag** the
-kernel sets after it dropped one or more events on a full CQ (it drops the newest
-rather than overwrite an unreaped slot -- input's correct failure mode under a
-slow reader). For the keyboard (the only source today, id 0) the kind is
-`EVENT_KEY = 1`, the code is the raw Set-1 scancode byte, and the value is the
-make/break bit (1 = press). The kernel does no keymap translation -- characters,
-layouts, modifiers, and line editing are library-OS policy.
+device (id 0 the keyboard, id 1 the PS/2 mouse). `event_sub` arms a standing
+subscription (the cap-check -- you may subscribe only to a source you hold --
+is the multiplexing gate); from then on every event on that source posts a CQ
+completion tagged with the subscription's cookie, until `cancel` or process
+exit. The event in `status` is **raw**: kind in bits 0..8, device code in
+8..24, value in 24..32, and bit 31 a **drop flag** the kernel sets after it
+dropped one or more events on a full CQ (it drops the newest rather than
+overwrite an unreaped slot -- input's correct failure mode under a slow
+reader). For the keyboard the kind is `EVENT_KEY = 1`, the code is the raw
+Set-1 scancode byte, and the value is the make/break bit (1 = press); for the
+mouse the kind is `EVENT_MOUSE_MOVE`, the code packs `dx`/`dy` as signed bytes,
+and the value's low 7 bits are the button bitmask. The kernel does no keymap
+translation or cursor tracking -- characters, layouts, modifiers, line
+editing, and pointer acceleration are library-OS policy.
 `libplinth::sys_event_recv(source)` is a single-subscription shim (subscribe
 once, reap one event per call) with `EVENT_OK`/`EVENT_ERR` unchanged.
 
 **The async capability.** `libos`'s `ring` module is a reference `no_std` async
-executor over these calls: a one-shot future for a read (overlapping many in
-flight, each matched to its future by `user_data`) and a multishot stream for a
-subscription (one cookie yielding a sequence of events in arrival order). One
-reactor, one `ring_wait` loop, both kinds of completion. A block *write* path is
-not yet part of the ABI -- the first filesystem is read-only.
+executor over these calls: a one-shot future for a read or write (overlapping
+many in flight, each matched to its future by `user_data`) and a multishot
+stream for a subscription (one cookie yielding a sequence of events in arrival
+order). One reactor, one `ring_wait` loop, every kind of completion.
 
 ## Capabilities
 

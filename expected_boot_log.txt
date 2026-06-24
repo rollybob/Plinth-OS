@@ -179,6 +179,17 @@ plinth: asyncblk demo: 1 processes
 asyncblk: ok (4 reads overlapped, each frame verified)
 plinth: asyncblk demo: all done
 
+# Block write path (Design/block_write.md): the write half of the ring ABI.
+# The kernel grants blkwrite-user a BlockRange over device 0 sectors [8,12),
+# minted with RIGHT_WRITE instead of RIGHT_READ -- the multiplexing guarantee
+# now gates the write direction. The demo writes a fixed pattern, reads the
+# same range back into a separate frame, and asserts the bytes match the
+# pattern (not the disk's original ramp content), proving the write reached
+# the device. Frame counts around it must match (check_frames_baseline).
+plinth: blkwrite demo: 1 processes
+blkwrite: ok (write+read-back verified)
+plinth: blkwrite demo: all done
+
 # Phase 2 storage, load-from-disk: the FS library-OS demo. The kernel grants
 # fsdemo a BlockRange over the archive device; fsdemo uses libfs to parse the
 # on-disk archive, find "diskhello" by name, read its ELF off the disk, and

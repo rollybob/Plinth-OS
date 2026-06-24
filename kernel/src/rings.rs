@@ -23,7 +23,7 @@ use crate::frame_alloc::FRAME_SIZE;
 use crate::process;
 use crate::scheduler;
 use crate::virtio_blk::{
-    self, BLK_E_BADARG, BLK_E_DEV, BLK_E_RANGE, BLK_E_RIGHTS,
+    self, Direction, BLK_E_BADARG, BLK_E_DEV, BLK_E_RANGE, BLK_E_RIGHTS,
 };
 
 /// Returned by the non-blocking ring syscalls on error (mirrors `syscall::ERR`).
@@ -62,6 +62,10 @@ const RING_OP_READ: u32 = 0;
 const RING_OP_EVENT_SUB: u32 = 1;
 /// Cancel a live subscription named by its `user_data` cookie on this ring.
 const RING_OP_CANCEL: u32 = 2;
+/// Write `count` sectors from the I/O frame to the `BlockRange`'s device --
+/// the write half of RING_OP_READ (Design/block_write.md S1). Same entry
+/// shape; only the cap-check direction and the virtio request type differ.
+const RING_OP_WRITE: u32 = 3;
 
 /// virtio block I/O is always in 512-byte units (mirrors `virtio_blk`).
 const SECTOR_SIZE: u64 = 512;
@@ -299,6 +303,7 @@ fn post_entry(
 ) -> Outcome {
     match op {
         RING_OP_READ => post_read(id, count, range_slot, frame_slot, sector_off, user_data),
+        RING_OP_WRITE => post_write(id, count, range_slot, frame_slot, sector_off, user_data),
         // For EVENT_SUB the `range_slot` field carries the EventSource cap slot.
         RING_OP_EVENT_SUB => post_event_sub(id, range_slot, user_data),
         RING_OP_CANCEL => post_cancel(id, user_data),
@@ -362,7 +367,64 @@ fn post_read(
 
     // Post into the device, recording the CQ routing for this request. Err means
     // the device free pool is full -- backpressure, leave the entry unconsumed.
-    match virtio_blk::ring_post(dev, abs_sector, count, frame_phys, id, user_data) {
+    match virtio_blk::ring_post(dev, abs_sector, count, frame_phys, id, user_data, Direction::Read) {
+        Ok(()) => Outcome::Consumed,
+        Err(()) => Outcome::Full,
+    }
+}
+
+/// Validate one block-write entry against CURRENT and post it to the device.
+/// The write half of `post_read` (Design/block_write.md S1/S3): the request
+/// must lie inside the holder's BlockRange (RIGHT_WRITE this time -- the
+/// direction the cap must be minted for), and the I/O frame must be the
+/// holder's with RIGHT_READ (the kernel reads its existing contents to hand to
+/// the device, never writes into it). A failed check posts an immediate CQ
+/// error completion and consumes the entry.
+fn post_write(
+    id: usize,
+    count: u64,
+    range_slot: u32,
+    frame_slot: u32,
+    sector_off: u64,
+    user_data: u64,
+) -> Outcome {
+    if count == 0 || count.saturating_mul(SECTOR_SIZE) > FRAME_SIZE {
+        post_status(id, user_data, BLK_E_BADARG);
+        return Outcome::Consumed;
+    }
+
+    let resolved: Result<(usize, u64, u64), u64> = {
+        let cur = process::current().lock();
+        (|| {
+            let proc = cur.as_ref().ok_or(BLK_E_RIGHTS)?;
+            // The BlockRange: RIGHT_WRITE, and the request must lie inside it.
+            let range = proc.caps.lookup(range_slot as usize, RIGHT_WRITE).map_err(|_| BLK_E_RIGHTS)?;
+            let CapObject::BlockRange { dev, start, count: range_count } = range.object else {
+                return Err(BLK_E_RIGHTS);
+            };
+            let end = sector_off.checked_add(count).ok_or(BLK_E_RANGE)?;
+            if end > range_count {
+                return Err(BLK_E_RANGE);
+            }
+            // The I/O frame: RIGHT_READ, since the device DMAs out of it.
+            let frame = proc.caps.lookup(frame_slot as usize, RIGHT_READ).map_err(|_| BLK_E_RIGHTS)?;
+            let CapObject::Frame { addr } = frame.object else {
+                return Err(BLK_E_RIGHTS);
+            };
+            Ok((dev as usize, start + sector_off, addr))
+        })()
+    };
+
+    let (dev, abs_sector, frame_phys) = match resolved {
+        Ok(t) => t,
+        Err(status) => return finish(id, user_data, status),
+    };
+
+    if !virtio_blk::ready(dev) {
+        return finish(id, user_data, BLK_E_DEV);
+    }
+
+    match virtio_blk::ring_post(dev, abs_sector, count, frame_phys, id, user_data, Direction::Write) {
         Ok(()) => Outcome::Consumed,
         Err(()) => Outcome::Full,
     }

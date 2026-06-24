@@ -19,11 +19,13 @@ application-level page-fault handling (self-paging), and `spawn` with
 capability transfer into an isolated child. A 100 Hz timer preemptively
 multiplexes the CPU across several processes (round-robin); synchronous IPC
 connects them; a virtio-blk disk multiplexed by a `BlockRange` capability
-backs a read-only filesystem and load-from-disk; and the i8042 keyboard
-delivers raw events behind an `EventSource` capability. Block I/O and input are
-both async completion rings (io_uring-shaped shared-memory queues) -- reads as
-one-shot requests, input as multishot subscriptions -- with a reference `no_std`
-async executor in `libos` driving many reads in flight and event streams at once.
+backs a read-only filesystem and load-from-disk, plus a block write path with
+no filesystem above it yet; and the i8042 keyboard and PS/2 mouse deliver raw
+events behind `EventSource` capabilities. Block I/O and input are both async
+completion rings (io_uring-shaped shared-memory queues) -- block reads and
+writes as one-shot requests, input as multishot subscriptions -- with a
+reference `no_std` async executor in `libos` driving many requests in flight
+and event streams at once.
 Interrupts run through the Local APIC + I/O APIC (MSI-X for the disk, a
 per-CPU LAPIC timer), and the kernel boots and schedules on every CPU the
 ACPI MADT reports, serialized by a single big kernel lock. No network yet,
@@ -80,7 +82,10 @@ against the cost to determinism rather than taken for granted.
   retired in favour of the ring ABI (v2.4); the throughput lever for a
   kernel-light workload is taking the kernel off the I/O fast path, which is why
   this, not per-CPU run-queue splitting, was the next step after the SMP boot
-  model.
+  model. A `RING_OP_WRITE` op (v2.6) added the write half: the same entry shape
+  with the two cap-checks' direction reversed (`BlockRange` via `RIGHT_WRITE`,
+  the I/O frame via `RIGHT_READ`), proving the ring mechanism needed no change
+  to carry the opposite direction (Design/block_write.md).
 - [x] **Console input.** The i8042 keyboard's IRQ feeds raw scancodes behind an
   interrupt-controller seam; an `EventSource` capability multiplexes the device.
   Input rides the **same completion rings as block I/O**: a keystroke answers no
@@ -125,12 +130,13 @@ against the cost to determinism rather than taken for granted.
 
 ## Stability
 
-The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.5**.
+The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.6**.
 v2 added IPC and revised `spawn`, the one incompatible change from v1 (made
 while Phase 2 is still pre-release); v2.1 (`spawn_from_buffer`), v2.2
 (console input), v2.3 (`block_read` moved to the blocking gate), v2.4
-(async completion rings, retiring `block_read`), and v2.5 (input as multishot
-ring subscriptions, retiring `event_recv`) are all additive over v2 but for the
-two retired-and-shimmed ops. Within a major series, new capabilities are added
+(async completion rings, retiring `block_read`), v2.5 (input as multishot
+ring subscriptions, retiring `event_recv`), and v2.6 (`RING_OP_WRITE`, the
+write half of the block ring ABI) are all additive over v2 but for the two
+retired-and-shimmed ops. Within a major series, new capabilities are added
 without breaking existing programs. Anything not in ABI.md is an implementation
 detail and may move.

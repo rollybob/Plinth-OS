@@ -284,7 +284,7 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
   ipc.rs           the int 0x80 gate: endpoints, send/recv/call/reply,
                    plus ring_wait (the blocking ops share it)
   rings.rs         async completion rings: SQ drain + completion demux,
-                   block reads + multishot event subscriptions,
+                   block reads/writes + multishot event subscriptions,
                    ring_register/ring_submit/ring_wait
   scheduler.rs     preemptive round-robin, per-process kernel stacks,
                    core-agnostic claim-and-run across CPUs
@@ -302,8 +302,9 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
   memory.rs        per-process address spaces: clone, map, switch, destroy
   elf.rs           ELF loader: validate a static ET_EXEC, map PT_LOAD W^X
   pci.rs           legacy PCI config-space (0xCF8/0xCFC) enumeration
-  virtio_blk.rs    virtio-blk (virtio-pci) driver: one virtqueue, DMA,
-                   interrupt-driven completion
+  virtio_blk.rs    virtio-blk (virtio-pci) driver: one virtqueue,
+                   direction-aware DMA (read/write), interrupt-driven
+                   completion
   keyboard.rs      i8042 keyboard: IRQ1 -> raw scancodes
   mouse.rs         i8042 mouse: IRQ12 -> packet-framed dx/dy/buttons
   input.rs         event sources: route keystrokes/mouse packets to ring subs
@@ -330,6 +331,7 @@ user programs (ring 3, each its own crate):
   spawner-user/ grantee-user/   spawn a child and transfer it a capability
   blk-user/      read disk sectors through a bounded BlockRange
   asyncblk-user/ several overlapping reads via the libos async executor
+  blkwrite-user/ write a pattern, read it back, verify the round-trip
   fsdemo-user/   load a program off disk with libfs + spawn_from_buffer
   diskhello-user/   lives only in the boot archive, never embedded
   evt-user/      read a raw keyboard event through an EventSource
@@ -460,7 +462,7 @@ your line through `libinput`.
 
 Plinth runs your code in ring 3 over a stable syscall interface.
 [ABI.md](ABI.md) is the contract -- syscalls, the IPC and device gate, the
-executable format, and entry state, versioned as **v2.5** -- and
+executable format, and entry state, versioned as **v2.6** -- and
 [GUIDE.md](GUIDE.md) is the walkthrough: copy `template-user/` to start a
 program, and see how memory policy goes in a library OS rather than the
 kernel. Where the project is headed is in [ROADMAP.md](ROADMAP.md); how to
@@ -495,7 +497,7 @@ Three layers, all in CI on every push:
 ## Current limitations
 
 These are where Plinth is today, not where it stops. The syscall interface is
-a documented, versioned contract ([ABI.md](ABI.md), v2.5), so you can write
+a documented, versioned contract ([ABI.md](ABI.md), v2.6), so you can write
 your own programs and library OSes against it; growing Plinth toward a
 genuinely usable general-purpose exokernel is the ongoing direction
 ([ROADMAP.md](ROADMAP.md)).
