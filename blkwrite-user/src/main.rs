@@ -8,12 +8,23 @@
 //! `ring::read` and asserts the bytes match the pattern -- not the disk's
 //! original ramp content -- proving the write actually reached the device
 //! rather than the read-back merely returning stale or unwritten data.
+//!
+//! It also holds a second BlockRange (slot 2, sectors [12, 16)) minted
+//! RIGHT_READ only, and asserts a write through it is rejected with
+//! BLK_E_RIGHTS -- the negative-case mirror of blk-user's out-of-range probe.
 
 #![no_std]
 #![no_main]
 
 use libos::ring;
-use libplinth::{sys_exit, sys_frame_alloc, sys_frame_map, sys_write, BLK_OK, BLOCK_SLOT, MAP_BASE, PAGE_SIZE, SYS_ERR};
+use libplinth::{
+    sys_exit, sys_frame_alloc, sys_frame_map, sys_write, BLK_E_RIGHTS, BLK_OK, BLOCK_SLOT,
+    MAP_BASE, PAGE_SIZE, SYS_ERR,
+};
+
+/// The second grant (kernel/src/main.rs): a RIGHT_READ-only BlockRange,
+/// minted right after BLOCK_SLOT, same convention as unified-user's EVENT_SLOT.
+const RDONLY_SLOT: u64 = BLOCK_SLOT + 1;
 
 /// Sectors written/read back. Must match the BlockRange count the kernel
 /// grants this demo (main.rs).
@@ -94,13 +105,26 @@ pub extern "C" fn _start(_id: u64) -> ! {
         }
     }
 
-    if ok {
-        sys_write(b"blkwrite: ok (write+read-back verified)\n");
-        sys_exit(0);
-    } else {
+    if !ok {
         sys_write(b"blkwrite: FAIL (read-back did not match pattern)\n");
         sys_exit(8);
     }
+    sys_write(b"blkwrite: ok (write+read-back verified)\n");
+
+    // Negative case: a write through RDONLY_SLOT (RIGHT_READ only, no
+    // RIGHT_WRITE) must be rejected by post_write's rights check (rings.rs)
+    // with BLK_E_RIGHTS, not silently succeed or fail some other way. Reuses
+    // the write frame -- its contents do not matter, since the write must
+    // never reach the device.
+    let rdonly_status = ring::block_on(ring::write(RDONLY_SLOT, w_slot, 0, 1));
+    if rdonly_status == BLK_E_RIGHTS {
+        sys_write(b"blkwrite: rdonly write rejected\n");
+    } else {
+        sys_write(b"blkwrite: rdonly write NOT rejected\n");
+        sys_exit(9);
+    }
+
+    sys_exit(0);
 }
 
 #[panic_handler]

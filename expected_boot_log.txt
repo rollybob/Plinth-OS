@@ -185,9 +185,13 @@ plinth: asyncblk demo: all done
 # now gates the write direction. The demo writes a fixed pattern, reads the
 # same range back into a separate frame, and asserts the bytes match the
 # pattern (not the disk's original ramp content), proving the write reached
-# the device. Frame counts around it must match (check_frames_baseline).
+# the device. Frame counts around it must match (check_frames_baseline). It
+# also holds a second BlockRange (sectors [12,16), RIGHT_READ only) and
+# asserts a write through it is rejected with BLK_E_RIGHTS -- the negative
+# case for the rights-direction check.
 plinth: blkwrite demo: 1 processes
 blkwrite: ok (write+read-back verified)
+blkwrite: rdonly write rejected
 plinth: blkwrite demo: all done
 
 # Phase 2 storage, load-from-disk: the FS library-OS demo. The kernel grants

@@ -115,7 +115,9 @@ write half of the block ring ABI (`RING_OP_WRITE`), purely additive.
   `write` future mirroring `read`. A new `blkwrite-user` demo writes a fixed
   pattern to a granted range, reads the same range back into a separate frame,
   and asserts the bytes match what was written -- not the disk's original ramp
-  content -- proving the write reached the device.
+  content -- proving the write reached the device. It also holds a second,
+  `RIGHT_READ`-only `BlockRange` and asserts a write through it is rejected
+  with `BLK_E_RIGHTS` -- the negative case for the rights-direction check.
 
 ### Changed
 - **`block_read` moved from syscall nr 10 to the `int 0x80` gate (op 5), ABI

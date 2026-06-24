@@ -493,6 +493,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // frame, and asserts the bytes match what it wrote (not the disk's
         // original ramp content) -- proving the write actually reached the
         // device. Frame counts bracket the demo (no leak).
+        //
+        // A second BlockRange (slot 2) over sectors [12, 16) -- also clear of
+        // every other demo's range -- is minted RIGHT_READ only. The demo
+        // attempts a write through it and asserts the kernel rejects with
+        // BLK_E_RIGHTS: the negative-case mirror of blk-user's out-of-range
+        // probe, closing the gap block_write.md's follow-up note flagged (no
+        // demo asserted a write through a RIGHT_READ-only grant is rejected).
         if virtio_blk::ready(0) {
             const BLKWRITE_BIN: &[u8] =
                 include_bytes!(concat!(env!("OUT_DIR"), "/blkwrite-user"));
@@ -502,7 +509,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 object: CapObject::BlockRange { dev: 0, start: 8, count: 4 },
                 rights: capability::RIGHT_READ | capability::RIGHT_WRITE,
             };
-            scheduler::run("blkwrite demo", &[BLKWRITE_BIN], phys_offset, &[Some(range)]);
+            let rdonly_range = Capability {
+                object: CapObject::BlockRange { dev: 0, start: 12, count: 4 },
+                rights: capability::RIGHT_READ,
+            };
+            scheduler::run(
+                "blkwrite demo",
+                &[BLKWRITE_BIN],
+                phys_offset,
+                &[Some(range), Some(rdonly_range)],
+            );
             let after_blkwrite = free_frames();
             let _ = writeln!(serial, "plinth: {after_blkwrite} frames free after blkwrite");
         }
