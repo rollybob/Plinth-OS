@@ -25,6 +25,13 @@ plinth: timer armed
 # there is no separate boot selftest line.
 plinth: keyboard ready (i8042, IRQ1)
 
+# Mouse bring-up (Design/mouse_input.md): the i8042's second port comes up as
+# the second event source (source 1) and IRQ12 is unmasked. QEMU's q35 machine
+# always exposes a PS/2 mouse on this port, so this line is deterministic under
+# the smoke config; a real-hardware port without one would instead see "no
+# mouse detected" and skip the mouse demo below.
+plinth: mouse ready (i8042 port 2, IRQ12)
+
 # Storage bring-up: discover virtio-blk over legacy PCI config space and bring
 # up every device. Two disks are attached: device 0 (slot 3) is the 1 MiB
 # byte-ramp test image, device 1 (slot 4) is the read-only boot archive. Each
@@ -235,5 +242,15 @@ plinth: unified demo: 1 processes
 unified: start
 unified: ok (1 read + 3 events on one ring)
 plinth: unified demo: all done
+
+# Mouse input (Design/mouse_input.md S2): a second EventSource. mouse-user
+# subscribes to source 1 (the mouse) through the same libos stream adapter
+# evtstream-user uses, and reaps a scripted 3-packet sequence (dx, dy, buttons
+# per packet), asserting each decodes correctly and in order, then cancels.
+# Frame counts around the demo must match (check_frames_baseline).
+plinth: mouse demo: 1 processes
+mouse: start
+mouse: ok (3 packets in order)
+plinth: mouse demo: all done
 
 plinth: boot ok

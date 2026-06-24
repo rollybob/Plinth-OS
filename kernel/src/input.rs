@@ -21,9 +21,13 @@ use spin::Mutex;
 use crate::capability::{CapObject, RIGHT_READ};
 use crate::process;
 
-/// Event kinds. Only keyboard exists today; the tag is here so a mouse (move,
-/// button) rides the same record without a kernel-surface change.
+/// Event kinds.
 pub const EVENT_KEY: u8 = 1;
+/// A mouse motion+button sample (Design/mouse_input.md S1): one packed event
+/// per PS/2 packet, not split per axis, so the CQ-full drop-newest policy
+/// (event_rings.md s5) drops a whole packet atomically rather than risking a
+/// desynced dx/dy/button triplet with no boundary tag to detect it.
+pub const EVENT_MOUSE_MOVE: u8 = 2;
 
 /// One raw input event. Fixed-size and `Copy`; packs into the low 32 bits of a
 /// CQ completion's `status` field (event_rings.md s4).
@@ -50,18 +54,32 @@ impl Event {
         }
     }
 
+    /// A mouse motion+button event (mouse_input.md S1). `dx`/`dy` are one
+    /// PS/2 packet's signed-byte deltas, packed into `code` (dx in the high
+    /// byte, dy in the low byte); `buttons` is the current bitmask (bit 0/1/2
+    /// = left/right/middle), masked to 7 bits so it never collides with the
+    /// CQ's `EVENT_DROPPED` flag at bit 31 (`value`'s bit 7, rings.rs).
+    pub const fn mouse_move(dx: i8, dy: i8, buttons: u8) -> Event {
+        Event {
+            kind: EVENT_MOUSE_MOVE,
+            code: ((dx as u8 as u16) << 8) | (dy as u8 as u16),
+            value: buttons & 0x7F,
+        }
+    }
+
     /// Pack into the low 32 bits of a word: kind in bits 0..8, code in 8..24,
-    /// value in 24..32. The kind byte is always nonzero (`EVENT_KEY` = 1), which
-    /// the event-ring shim relies on to tell a real event from a zero
-    /// subscribe-error status (event_rings.md s5).
+    /// value in 24..32. The kind byte is always nonzero (`EVENT_KEY` = 1,
+    /// `EVENT_MOUSE_MOVE` = 2), which the event-ring shim relies on to tell a
+    /// real event from a zero subscribe-error status (event_rings.md s5).
     pub const fn pack(self) -> u64 {
         (self.kind as u64) | ((self.code as u64) << 8) | ((self.value as u64) << 24)
     }
 }
 
-/// Well-known event sources. The keyboard is source 0; a mouse would be 1.
+/// Well-known event sources (Design/input.md s7, mouse_input.md).
 pub const SOURCE_KEYBOARD: usize = 0;
-const N_SOURCES: usize = 1;
+pub const SOURCE_MOUSE: usize = 1;
+const N_SOURCES: usize = 2;
 
 /// Record an event from `source` -- the producer half, called from a device IRQ
 /// handler (and the synthetic scaffold). Routes the event to every ring
@@ -149,5 +167,61 @@ pub fn deliver_synthetic() {
     };
     if let Some(sc) = next {
         record(SOURCE_KEYBOARD, Event::key(sc));
+    }
+}
+
+// --- synthetic mouse injection (test scaffold, mouse_input.md S3) -----------
+//
+// Mirrors the keyboard's synthetic scaffold above: QEMU's HMP monitor has no
+// `sendkey`-clean equivalent for relative mouse motion deterministic enough to
+// script into the permanent smoke, so a scripted packet sequence drives the
+// exact record -> route -> wake path a real IRQ12 packet would.
+
+const MAX_SYNTHETIC_MOUSE: usize = 16;
+
+struct SyntheticMouse {
+    packets: [(i8, i8, u8); MAX_SYNTHETIC_MOUSE],
+    len: usize,
+    pos: usize,
+}
+
+impl SyntheticMouse {
+    const fn new() -> SyntheticMouse {
+        SyntheticMouse { packets: [(0, 0, 0); MAX_SYNTHETIC_MOUSE], len: 0, pos: 0 }
+    }
+}
+
+static SYNTHETIC_MOUSE: Mutex<SyntheticMouse> = Mutex::new(SyntheticMouse::new());
+
+/// Arm a synthetic `(dx, dy, buttons)` packet sequence (capped at
+/// MAX_SYNTHETIC_MOUSE). Each `deliver_synthetic_mouse` records the next one;
+/// once exhausted, delivery is a no-op. Used by the mouse demo to script
+/// motion deterministically.
+pub fn arm_synthetic_mouse(packets: &[(i8, i8, u8)]) {
+    let mut s = SYNTHETIC_MOUSE.lock();
+    let n = packets.len().min(MAX_SYNTHETIC_MOUSE);
+    s.packets[..n].copy_from_slice(&packets[..n]);
+    s.len = n;
+    s.pos = 0;
+}
+
+/// Record the next armed synthetic mouse packet (if any) through `record`,
+/// waking a reader parked in `ring_wait` on the mouse subscription. Called
+/// from the scheduler's idle-on-input path alongside `deliver_synthetic`. A
+/// no-op once the sequence is exhausted (the real-mouse case, where IRQ12 is
+/// the producer instead).
+pub fn deliver_synthetic_mouse() {
+    let next = {
+        let mut s = SYNTHETIC_MOUSE.lock();
+        if s.pos < s.len {
+            let p = s.packets[s.pos];
+            s.pos += 1;
+            Some(p)
+        } else {
+            None
+        }
+    };
+    if let Some((dx, dy, buttons)) = next {
+        record(SOURCE_MOUSE, Event::mouse_move(dx, dy, buttons));
     }
 }

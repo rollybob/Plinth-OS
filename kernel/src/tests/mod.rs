@@ -16,6 +16,7 @@ mod event_rings;
 mod frame_alloc;
 mod input;
 mod ipc;
+mod mouse;
 mod scheduler;
 mod virtio_blk;
 
@@ -91,6 +92,14 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "elf::segment_file_offset_overflow", run: elf::segment_file_offset_overflow },
     TestCase { name: "elf::segment_vaddr_overflow", run: elf::segment_vaddr_overflow },
     TestCase { name: "input::key_event_encoding", run: input::key_event_encoding },
+    TestCase { name: "mouse::mouse_event_encoding", run: mouse::mouse_event_encoding },
+    TestCase { name: "mouse::mouse_packet_assembles", run: mouse::mouse_packet_assembles },
+    TestCase {
+        name: "mouse::mouse_packet_buttons_and_signs",
+        run: mouse::mouse_packet_buttons_and_signs,
+    },
+    TestCase { name: "mouse::mouse_packet_resyncs", run: mouse::mouse_packet_resyncs },
+    TestCase { name: "mouse::mouse_axis_clamps", run: mouse::mouse_axis_clamps },
     TestCase { name: "ipc::wq_fifo_order", run: ipc::wq_fifo_order },
     TestCase { name: "ipc::wq_single", run: ipc::wq_single },
     TestCase { name: "ipc::wq_take_matches_sender_side", run: ipc::wq_take_matches_sender_side },

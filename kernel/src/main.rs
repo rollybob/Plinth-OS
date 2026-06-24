@@ -50,6 +50,12 @@ mod input;
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod keyboard;
 mod memory;
+// The PS/2 mouse device (the second event source, Design/mouse_input.md) runs
+// only on the userspace boot path; its IRQ12 vector is installed in every
+// build (interrupts::init). Its packet decode (`Packet`/`decode_axis`) is
+// pure logic exercised by the test suite, like the keyboard's `Event` coding.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod mouse;
 // Per-CPU data (Stage B2, D6) is set up and read only from the userspace
 // boot path (BSP) and AP bring-up; the test build never reaches either.
 #[cfg_attr(feature = "tests", allow(dead_code))]
@@ -218,6 +224,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // turns a scancode into a character.
         keyboard::init();
         let _ = writeln!(serial, "plinth: keyboard ready (i8042, IRQ1)");
+
+        // Bring up the i8042's second port (the mouse, source 1,
+        // Design/mouse_input.md) and unmask IRQ12, if a device answers. A
+        // missing mouse is logged, not a boot fault (S4) -- the rest of boot
+        // proceeds either way, and the mouse demo below grants the
+        // EventSource only if `mouse::present()`.
+        mouse::init();
+        if mouse::present() {
+            let _ = writeln!(serial, "plinth: mouse ready (i8042 port 2, IRQ12)");
+        } else {
+            let _ = writeln!(serial, "plinth: no mouse detected (i8042 port 2)");
+        }
 
         // Stage 1 storage bring-up: discover the virtio-blk device over legacy
         // PCI config space, then bring up the modern device (map its BAR,
@@ -594,6 +612,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             scheduler::run("unified demo", &[UNIFIED_BIN], phys_offset, &[Some(range), Some(source)]);
             let after_uni = free_frames();
             let _ = writeln!(serial, "plinth: {after_uni} frames free after unified");
+        }
+
+        // Mouse input (Design/mouse_input.md S2): a second EventSource. The
+        // kernel grants mouse-user a read capability on input source 1 (the
+        // mouse) and nothing else; the process opens a multishot subscription
+        // (the same libos stream adapter the keyboard's evtstream-user uses)
+        // and reaps a scripted packet SEQUENCE, asserting each packet's
+        // dx/dy/buttons decode correctly and in order, then cancels. Only run
+        // if the i8042's second port answered at bring-up (mouse::present()):
+        // a missing mouse is not a boot fault, but there is then no source 1
+        // to subscribe to. Frame counts bracket the demo (no leak).
+        if mouse::present() {
+            const MOUSE_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mouse-user"));
+            let before_mouse = free_frames();
+            let _ = writeln!(serial, "plinth: {before_mouse} frames free before mouse");
+            let source = Capability {
+                object: CapObject::EventSource { id: input::SOURCE_MOUSE as u8 },
+                rights: capability::RIGHT_READ,
+            };
+            // Must match mouse-user's SEQUENCE: (dx, dy, buttons) per packet.
+            input::arm_synthetic_mouse(&[(10, -5, 0x00), (-20, 15, 0x01), (3, 3, 0x02)]);
+            scheduler::run("mouse demo", &[MOUSE_BIN], phys_offset, &[Some(source)]);
+            let after_mouse = free_frames();
+            let _ = writeln!(serial, "plinth: {after_mouse} frames free after mouse");
         }
 
         // BKL contention micro-benchmark (broader-hardware "SMP -- scaling"

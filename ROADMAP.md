@@ -90,7 +90,10 @@ against the cost to determinism rather than taken for granted.
   process blocked on input is not a deadlock -- the kernel idles waiting for a
   keystroke. The `libos` async executor turns the stream into an event stream
   alongside the read future; keymaps and line editing are a library OS
-  (`libinput`); the kernel ships only raw events.
+  (`libinput`); the kernel ships only raw events. A second `EventSource` --
+  the i8042 mouse on IRQ12, raw dx/dy/button packets -- proved the mechanism
+  generalizes past one device with zero ABI or ring changes
+  (Design/mouse_input.md).
 - **Broader hardware.** SMP and real-machine device support, each taken on its
   own merits. Split into stages, because adding a second CPU ends the
   single-core invariant the no-lock kernel rested on -- a concurrency redesign,

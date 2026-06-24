@@ -54,6 +54,10 @@ pub fn init() {
         // IRQ1 (the i8042 keyboard), at the remapped vector. Installed now; the
         // device is brought up and the line unmasked later, on the boot path.
         crate::keyboard::register(idt);
+        // IRQ12 (the i8042 mouse, mouse_input.md), at the remapped vector.
+        // Installed now; the device is brought up (or found absent) later, on
+        // the boot path, same as the keyboard.
+        crate::mouse::register(idt);
         (*addr_of!(IDT_STORAGE)).as_ref().unwrap().load();
     }
 }

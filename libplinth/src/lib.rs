@@ -580,6 +580,9 @@ pub const EVENT_ERR: u64 = 1;
 
 /// Event kind (EVENT_KEY = 1, ...), the low byte of a packed event.
 pub const EVENT_KEY: u8 = 1;
+/// A mouse motion+button sample (Design/mouse_input.md S1): one packed event
+/// per PS/2 packet, decode with `mouse_dx`/`mouse_dy`/`mouse_buttons`.
+pub const EVENT_MOUSE_MOVE: u8 = 2;
 
 // SQ op selectors for the event-ring control entries (event_rings.md s4).
 const RING_OP_EVENT_SUB: u32 = 1;
@@ -733,10 +736,33 @@ pub fn event_code(ev: u64) -> u16 {
 }
 
 /// Unpack a packed event's value. For a key event this is the make/break
-/// convenience bit (1 = press, 0 = release).
+/// convenience bit (1 = press, 0 = release); for a mouse event, the button
+/// bitmask (see `mouse_buttons`, which is the same value under a clearer name).
 #[inline]
 pub fn event_value(ev: u64) -> u8 {
     ((ev >> 24) & 0xFF) as u8
+}
+
+/// Unpack a mouse event's X delta (one PS/2 packet's signed-byte motion, the
+/// high byte of `event_code`). Only meaningful when `event_kind(ev) ==
+/// EVENT_MOUSE_MOVE`.
+#[inline]
+pub fn mouse_dx(ev: u64) -> i8 {
+    (event_code(ev) >> 8) as i8
+}
+
+/// Unpack a mouse event's Y delta (the low byte of `event_code`). Only
+/// meaningful when `event_kind(ev) == EVENT_MOUSE_MOVE`.
+#[inline]
+pub fn mouse_dy(ev: u64) -> i8 {
+    (event_code(ev) & 0xFF) as i8
+}
+
+/// Unpack a mouse event's button bitmask (bit 0/1/2 = left/right/middle).
+/// Only meaningful when `event_kind(ev) == EVENT_MOUSE_MOVE`.
+#[inline]
+pub fn mouse_buttons(ev: u64) -> u8 {
+    event_value(ev)
 }
 
 // ---------------------------------------------------------------------------

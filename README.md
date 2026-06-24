@@ -36,7 +36,7 @@ plinth: syscall interface ready
 plinth: acpi: 1 cpu(s), 1 ioapic(s)
 plinth: timer armed
 plinth: keyboard ready (i8042, IRQ1)
-plinth: keyboard selftest ok
+plinth: mouse ready (i8042 port 2, IRQ12)
 plinth: scanning PCI bus
 plinth: virtio-blk found at 00:03.0
 plinth: virtio-blk found at 00:04.0
@@ -261,7 +261,7 @@ Plinth implements the minimum machinery that makes the argument concrete:
   |                        plinth kernel                           |
   |  capabilities | frames | CPU budgets | endpoints | block ranges|
   |  event sources | async rings | scheduler + timer | addr spaces |
-  |  fault upcall  | virtio-blk | i8042 keyboard | irq seam        |
+  |  fault upcall  | virtio-blk | i8042 kbd+mouse | irq seam        |
   |  LAPIC + I/O APIC | MSI-X | SMP: AP trampoline + BKL + per-CPU |
   +----------------------------------------------------------------+
                        ring 0, one or more CPUs
@@ -305,10 +305,11 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
   virtio_blk.rs    virtio-blk (virtio-pci) driver: one virtqueue, DMA,
                    interrupt-driven completion
   keyboard.rs      i8042 keyboard: IRQ1 -> raw scancodes
-  input.rs         event sources: route keystrokes to ring subscriptions
+  mouse.rs         i8042 mouse: IRQ12 -> packet-framed dx/dy/buttons
+  input.rs         event sources: route keystrokes/mouse packets to ring subs
   gdt.rs           GDT/TSS, sysret-compatible selector layout
   serial.rs        serial console
-  tests/           in-kernel test suite (70 tests, run in QEMU)
+  tests/           in-kernel test suite (78 tests, run in QEMU)
 
 libplinth/   user-side syscall + gate shim -- deliberately NOT a library OS
 libos/       allocator library OSes (BumpAlloc, FreeListAlloc) + ring, a
@@ -335,6 +336,7 @@ user programs (ring 3, each its own crate):
   evtstream-user/  subscribe and reap a multishot event stream (libos)
   unified-user/  one ring_wait drives a block read AND a key stream (join2)
   kbd-user/      read a line through libinput
+  mouse-user/    subscribe and reap a mouse-packet stream (second EventSource)
   faultchild-user/  a child that faults, for liveness testing
   template-user/    minimal skeleton to copy for a new program (see GUIDE.md)
 xtask/       build orchestration: user binaries, disk images, QEMU,
@@ -405,8 +407,8 @@ xtask/       build orchestration: user binaries, disk images, QEMU,
   is small enough to ride the completion's `status` field directly; the kernel
   reserves a zero status as the unambiguous subscribe-error signal (a real event
   always carries a nonzero kind byte).
-- **One interrupt-controller seam.** The keyboard IRQ and the virtio-blk
-  completion IRQ both route through a single `irq` module, built as the one
+- **One interrupt-controller seam.** The keyboard IRQ, the mouse IRQ, and the
+  virtio-blk completion IRQ all route through a single `irq` module, built as the one
   place an interrupt-controller swap has to touch -- and that swap has since
   happened. `irq` now drives the Local APIC + I/O APIC, discovered from the
   ACPI MADT (`acpi.rs`), with MSI-X for virtio completions and a per-CPU LAPIC
@@ -468,10 +470,11 @@ contribute is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Three layers, all in CI on every push:
 
-1. `cargo xtask test` -- 73 in-kernel unit tests (frame allocator, capability
+1. `cargo xtask test` -- 78 in-kernel unit tests (frame allocator, capability
    table, CPU-budget charging, the ELF loader/validator, the scheduler's
-   `pick_next` policy, the IPC wait queue, the block-completion demux, and the
-   event-subscription routing + CQ-full backpressure) executed
+   `pick_next` policy, the IPC wait queue, the block-completion demux, the
+   event-subscription routing + CQ-full backpressure, and the mouse
+   packet-decode framing) executed
    inside QEMU, reported over a serial protocol (`[PASS]`/`[FAIL]`/`[SUITE]`)
    that xtask parses. Pure library-OS logic that does not need the kernel --
    the `libfs` archive parser and the `libinput` keymap -- is host-unit-tested
@@ -521,10 +524,12 @@ genuinely usable general-purpose exokernel is the ongoing direction
 - **Storage is read-only, one filesystem.** A virtio-blk driver and a
   read-only boot archive parsed by `libfs`; there is no `block_write` in the
   ABI yet, and the archive format is the only filesystem. No network.
-- **Input is one keyboard, raw events only.** The kernel ships raw Set-1
-  scancodes from the i8042 device; one reader per source. Keymaps, layouts,
-  and line editing are library-OS policy (`libinput`); fanning input out to
-  many consumers would itself be a library OS over the primitive.
+- **Input is two i8042 devices, raw events only.** The kernel ships raw Set-1
+  scancodes from the keyboard and raw dx/dy/button packets from the mouse;
+  one reader per source. Keymaps, layouts, line editing, and cursor/click
+  semantics are library-OS policy (`libinput` for the keyboard); fanning
+  input out to many consumers would itself be a library OS over the
+  primitive.
 - **IPC endpoints are kernel-granted.** A process does not yet create its own
   endpoints: the kernel mints one per `spawn` (the result channel) and may
   grant one at launch. A process-facing endpoint-create call is not part of

@@ -52,8 +52,9 @@ const SPURIOUS_VECTOR: u8 = 0xFF;
 
 /// IPI vector used to wake an idling core so it re-checks for claimable
 /// scheduler work (Stage B2.3, D4/section 5.4). Clear of every other vector
-/// in use: line IRQs at `VECTOR_BASE..=VECTOR_BASE+11`, virtio MSI-X at
-/// 0x30/0x31 (`virtio_blk::MSIX_VECTOR_BASE`), spurious at 0xFF.
+/// in use: line IRQs at `VECTOR_BASE..=VECTOR_BASE+12` (incl. IRQ12, the
+/// mouse, mouse_input.md), virtio MSI-X at 0x30/0x31
+/// (`virtio_blk::MSIX_VECTOR_BASE`), spurious at 0xFF.
 const RESCHEDULE_VECTOR: u8 = 0xF0;
 
 // IA32_APIC_BASE MSR and the Local APIC register offsets we touch.

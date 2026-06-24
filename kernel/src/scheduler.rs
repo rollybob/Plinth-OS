@@ -756,6 +756,7 @@ unsafe fn switch_to_next(on_idle: NoWorkAction) -> ! {
             // via their device IRQ during the idle below.
             if input_waiter {
                 crate::input::deliver_synthetic();
+                crate::input::deliver_synthetic_mouse();
             }
             idle_until_runnable(); // never returns
         }
