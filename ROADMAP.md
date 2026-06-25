@@ -29,9 +29,12 @@ reference `no_std` async executor in `libos` driving many requests in flight
 and event streams at once.
 Interrupts run through the Local APIC + I/O APIC (MSI-X for the disk, a
 per-CPU LAPIC timer), and the kernel boots and schedules on every CPU the
-ACPI MADT reports, serialized by a single big kernel lock. No network yet,
-and SMP is not scaled past that lock. See the [README](README.md) for the
-full demo.
+ACPI MADT reports, serialized by a single big kernel lock; scheduling uses
+per-core run queues with bounded work stealing (an idle core steals a ready
+process from a busy one). No network yet, and the single lock is
+intentionally left whole -- a benchmark showed it only contends near 100%
+kernel residency, so splitting it earns nothing real workloads would feel.
+See the [README](README.md) for the full demo.
 
 ## Phase 1 -- an adoptable reference
 

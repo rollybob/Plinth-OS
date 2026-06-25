@@ -159,6 +159,18 @@ plinth: rpc demo: all done
 plinth: spawn demo: 1 processes
 plinth: spawn demo: all done
 
+# Work-stealing demo (SMP scaling S4, Design/smp_scaling.md section 6). The
+# parent spawns three CPU-bound workers back to back; all pile onto one core's
+# run queue while other cores idle; idle cores steal them. Two facts proved:
+# (1) every worker completes (the parent joins all three); (2) at least one
+# steal fired when >= 2 cores are online (checked by xtask's steal counter;
+# under -smp 1 the delta is always 0 and the demo still completes). The
+# per-process output is interleaved and nondeterministic (checked by xtask
+# check_steal, not here); only the kernel-side summary lines are fixed.
+plinth: steal demo: 1 processes
+plinth: steal demo: all done
+plinth: steal demo: 0 steals across 1 cores
+
 # Phase 2 storage, BlockRange multiplexing: the kernel grants a process a
 # BlockRange capability naming disk sectors [1,5); the process reads sector 1
 # through it (bytes verified against the image ramp: byte j == (1+j)&0xFF) and

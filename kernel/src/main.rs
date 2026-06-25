@@ -206,18 +206,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // trace is unchanged whether the PIC or the APIC delivers.
         irq::init(topology.as_ref());
 
+        // Arm the BSP's periodic timer. Calibrates against the PIT and stores
+        // the per-period count so each AP can program its own LVT without a
+        // second calibration (must happen before start_aps so the count is
+        // available when ap_entry64 calls timer::arm_ap).
+        timer::arm(100);
+        let _ = writeln!(serial, "plinth: timer armed (100 Hz)");
+
         // Wake every other CPU the MADT reported (broader hardware, Stage
         // B1). Needs the LAPIC up (just above) to send IPIs. Phase 1: each AP
         // proves it can be woken at all and halts in real mode -- it does not
         // yet touch any structure the BSP's demos below use, so nothing here
         // changes the single-CPU concurrency story (that is Stage B2).
         smp::start_aps(&mut serial, topology.as_ref(), phys_offset);
-
-        // Arm the periodic timer. It fires only once a process is in ring 3
-        // (where interrupts are enabled); Stage 1 just counts the ticks, it
-        // does not yet switch processes.
-        timer::arm(100);
-        let _ = writeln!(serial, "plinth: timer armed (100 Hz)");
 
         // Bring up the i8042 keyboard (the first input event source) and unmask
         // IRQ1. Scancodes flow through `input::record`, which routes them to any

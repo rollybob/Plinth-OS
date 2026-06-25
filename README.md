@@ -331,6 +331,8 @@ user programs (ring 3, each its own crate):
   pingpong-user/ share-user/ rpc-user/   the IPC demos (rendezvous, frame
                  transfer, call/reply RPC)
   spawner-user/ grantee-user/   spawn a child and transfer it a capability
+  stealer-user/ stealwork-user/  work-stealing demo (force an imbalance, assert
+                 completion + cross-core steal fired)
   blk-user/      read disk sectors through a bounded BlockRange
   asyncblk-user/ several overlapping reads via the libos async executor
   blkwrite-user/ write a pattern, read it back, verify the round-trip

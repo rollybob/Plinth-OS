@@ -252,6 +252,7 @@ extern "C" fn ap_entry64() -> ! {
     crate::syscall::init(&selectors);
     crate::interrupts::load_on_this_core();
     crate::irq::enable_lapic_ap();
+    timer::arm_ap();
 
     // Interrupts stay disabled until the idle loop's own sti;hlt (`cli` ran
     // in the 16-bit trampoline and nothing above re-enabled it) -- the same

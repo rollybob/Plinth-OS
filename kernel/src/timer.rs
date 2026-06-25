@@ -53,6 +53,12 @@ const DIVIDE_BY_16: u32 = 0b011;
 /// the boot path prints it as proof the timer fired.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// LAPIC timer initial-count for one period at the requested `hz`. Stored by
+/// `arm` (BSP calibration) and read by `arm_ap` (each AP programs its own LVT
+/// from this without running a second PIT calibration, which would race
+/// `start_aps`'s concurrent PIT use).
+static LAPIC_TICKS_PER_PERIOD: AtomicU64 = AtomicU64::new(0);
+
 /// Program a periodic `hz`-Hz tick at `TIMER_VECTOR` and enable it. The
 /// interrupt controller must already be initialised (`irq::init`). Call once
 /// at boot, interrupts off. Uses the LAPIC's own timer once Stage A2 has
@@ -68,6 +74,25 @@ pub fn arm(hz: u32) {
     // SAFETY: single-threaded boot; the fixed PIT ports, programmed once.
     unsafe { program_pit(hz) };
     irq::unmask(0); // IRQ0 (the timer line)
+}
+
+/// Program this AP's LAPIC timer for the same period `arm` calibrated on the
+/// BSP. No PIT calibration -- reads the stored count so the PIT is not touched
+/// while `start_aps` may still be using it. Must be called after `arm` has
+/// already run on the BSP (i.e., `LAPIC_TICKS_PER_PERIOD` is non-zero). Call
+/// from each AP's bring-up path, interrupts off.
+pub fn arm_ap() {
+    let Some(va) = irq::lapic_base() else { return };
+    let ticks = LAPIC_TICKS_PER_PERIOD.load(Ordering::Relaxed) as u32;
+    if ticks == 0 {
+        return;
+    }
+    // SAFETY: `va` is the mapped LAPIC page; per-core hardware, IF=0.
+    unsafe {
+        irq::lapic_reg_write(va, TIMER_DIVIDE_CONFIG, DIVIDE_BY_16);
+        irq::lapic_reg_write(va, TIMER_INITIAL_COUNT, ticks);
+        irq::lapic_reg_write(va, LVT_TIMER, LVT_PERIODIC | TIMER_VECTOR as u32);
+    }
 }
 
 /// Ticks elapsed since `arm`.
@@ -183,6 +208,7 @@ unsafe fn arm_lapic_timer(va: u64, hz: u32) {
     // The window above is ~1/100 s regardless of the requested hz, so scale
     // to the period the caller actually wants.
     let ticks_per_period = ((lapic_per_window as u64 * 100) / hz as u64) as u32;
+    LAPIC_TICKS_PER_PERIOD.store(ticks_per_period.max(1) as u64, Ordering::Relaxed);
 
     irq::lapic_reg_write(va, TIMER_DIVIDE_CONFIG, DIVIDE_BY_16);
     irq::lapic_reg_write(va, TIMER_INITIAL_COUNT, ticks_per_period.max(1));
