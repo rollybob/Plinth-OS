@@ -179,10 +179,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // fault, reclaims the process, and keeps going.
         // Binaries a process may launch with spawn, by id. id 0 = grantee (a
         // worker that sends its result), id 1 = faultchild (a worker that
-        // faults before sending, to exercise death-time reaping).
+        // faults before sending, to exercise death-time reaping), id 2 =
+        // stealwork (a CPU-bound worker the work-stealing S4 demo spawns en
+        // masse onto one core).
         const SPAWNABLE: &[&[u8]] = &[
             include_bytes!(concat!(env!("OUT_DIR"), "/grantee-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/faultchild-user")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/stealwork-user")),
         ];
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
@@ -434,6 +437,36 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let after_spawn = free_frames();
         let _ = writeln!(serial, "plinth: {after_spawn} frames free after spawn");
         let _ = writeln!(serial, "plinth: {} endpoints free after spawn", free_endpoints());
+
+        // Work-stealing demo (SMP scaling S4, Design/smp_scaling.md section 6).
+        // The parent spawns three CPU-bound workers back to back; spawn homes
+        // every child to the spawning core, so all four processes pile onto one
+        // core's run queue while the other cores sit idle. The two facts this
+        // proves: (1) every worker still completes -- the parent joins all
+        // three (recv = wait), and each prints its own "stealwork[id] done";
+        // (2) at least one process actually moved to a different core's array --
+        // the scheduler's steal counter, read as a before/after delta around
+        // the run, is the one signal only stealing produces. Under -smp 1 there
+        // is no other core, so the delta is 0 and the demo still completes on
+        // the single core (the smoke check requires a steal only when >= 2
+        // cores are online). Bracketed by the frame/endpoint baselines like the
+        // other scheduler demos -- the per-spawn result channels leak nothing.
+        const STEALER_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/stealer-user"));
+        let online_cores =
+            (0..percpu::MAX_CORES).filter(|&c| irq::is_core_online(c)).count();
+        let before_steal = free_frames();
+        let _ = writeln!(serial, "plinth: {before_steal} frames free before steal");
+        let _ = writeln!(serial, "plinth: {} endpoints free before steal", free_endpoints());
+        let steals_before = scheduler::steals();
+        scheduler::run("steal demo", &[STEALER_BIN], phys_offset, &[None]);
+        let steals_done = scheduler::steals() - steals_before;
+        let _ = writeln!(
+            serial,
+            "plinth: steal demo: {steals_done} steals across {online_cores} cores"
+        );
+        let after_steal = free_frames();
+        let _ = writeln!(serial, "plinth: {after_steal} frames free after steal");
+        let _ = writeln!(serial, "plinth: {} endpoints free after steal", free_endpoints());
 
         // Block-storage demo (Stage 2): the exokernel multiplexing surface. The
         // kernel grants a process a BlockRange capability naming a sub-range of

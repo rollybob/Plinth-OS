@@ -102,6 +102,15 @@ pub fn mark_ap_online(core_id: usize, apic_id: u8) {
     ONLINE_APIC_IDS.lock()[core_id] = Some(apic_id);
 }
 
+/// Is `core_id` actually up and able to run a process? Core 0 (the BSP) always
+/// is; an AP is once `mark_ap_online` has recorded it. Used by the scheduler's
+/// home-core assignment (`Design/smp_scaling.md` S1: a real per-core array,
+/// placed at setup/spawn time) so a newly created process is never homed to a
+/// core that never came up under this boot's `-smp` count.
+pub fn is_core_online(core_id: usize) -> bool {
+    core_id == percpu::BSP_CORE_ID || ONLINE_APIC_IDS.lock()[core_id].is_some()
+}
+
 /// What `unmask`/`mask` need to program an I/O APIC redirection entry: the
 /// mapped MMIO base, the GSI base, the destination (BSP) APIC id, and the MADT
 /// source overrides that remap legacy lines.

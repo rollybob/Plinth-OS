@@ -427,12 +427,15 @@ xtask/       build orchestration: user binaries, disk images, QEMU,
   mode and into Rust. Per-CPU state (the current process, the kernel stacks)
   lives behind `IA32_GS_BASE` (`percpu.rs`); a single big kernel lock serializes
   every shared structure; a reschedule IPI wakes a halted core when work
-  appears. A process is pinned to the core that first schedules it -- no
-  cross-core migration yet -- which is the first step toward per-core ownership,
-  not a stopgap. Scaling the lock (per-CPU run queues, work stealing) is
-  deliberately deferred until contention data asks for it; a uniprocessor
-  (`-smp 1`) lane is kept as the deterministic regression net. The direction is
-  share-nothing, not faster locks.
+  appears. Each core owns a run queue: a process is homed to a core at spawn
+  time, and an idle core steals one ready process from a busy core's queue
+  (`scheduler.rs`) -- per-core ownership with bounded work stealing, the
+  architectural step toward share-nothing. The single big kernel lock is
+  deliberately left whole: a benchmark showed it only contends near 100% kernel
+  residency, so splitting it earns nothing real workloads would feel and is
+  deferred until contention data asks for it. A uniprocessor (`-smp 1`) lane is
+  kept as the deterministic regression net. The direction is share-nothing, not
+  faster locks.
 - **Self-paging is signal delivery, kept honest.** A `#PF` in a registered
   lazy region is delivered to a ring-3 handler by saving the full faulting
   register context, `iretq`-ing into the handler on its own stack, and a
@@ -505,13 +508,15 @@ your own programs and library OSes against it; growing Plinth toward a
 genuinely usable general-purpose exokernel is the ongoing direction
 ([ROADMAP.md](ROADMAP.md)).
 
-- **SMP, but not yet scaled.** Plinth boots and schedules on multiple cores,
-  but all kernel entry serializes on a single big kernel lock, so adding cores
-  does not yet add kernel throughput. Per-CPU run queues and work stealing -- the
-  step that makes the lock stop being a bottleneck -- are the next roadmap item,
-  deferred on purpose until there is contention data to justify the complexity.
-  Real-machine device support (leaving QEMU's defaults) is the milestone after
-  that.
+- **SMP scheduling is scaled; the kernel lock is not split.** Plinth schedules
+  with per-core run queues and bounded work stealing (an idle core pulls a ready
+  process off a busy one), so scheduling is per-core rather than one shared
+  table. But all kernel entry still serializes on a single big kernel lock --
+  deliberately: a benchmark showed it only contends near 100% kernel residency,
+  a regime real workloads do not occupy, so splitting it is deferred until
+  contention data justifies the complexity. Adding cores therefore scales
+  scheduling locality, not kernel-entry throughput. Real-machine device support
+  (leaving QEMU's defaults) is the next milestone.
 - **`write` is uncapability-gated console output** for demo legibility -- the
   one call that is not behind a capability. A single `write` is atomic with
   respect to other processes, so interleaved demos never tear a line.

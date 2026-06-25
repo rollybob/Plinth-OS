@@ -18,6 +18,20 @@ write half of the block ring ABI (`RING_OP_WRITE`), purely additive.
 ## [Unreleased]
 
 ### Added
+- Broader hardware -- SMP scaling (per-core run queues + bounded work stealing).
+  The scheduler replaces the single flat process table scan with a **per-core
+  run queue** (`CORE_QUEUE`, `kernel/src/scheduler.rs`): a process is homed to a
+  core at spawn time, and `pick_next` scans only the calling core's own queue.
+  An idle core **steals** one ready process from a busy core's queue, lifting
+  the pin from the SMP boot milestone -- migration is now a steal, and the D5
+  shootdown-safety invariants were re-audited against the grown kernel. The
+  single big kernel lock is deliberately left whole (lock-splitting earns
+  nothing until a workload contends it near 100% kernel residency). A new
+  **`steal demo`** (`stealer-user`/`stealwork-user`) forces an imbalance and
+  asserts both that every worker completes and that a cross-core steal actually
+  fired (a kernel steal counter); `cargo xtask smoke-smp` exercises it on 2-4
+  cores. Scheduling scales per-core; kernel-entry throughput is unchanged. The
+  ABI is untouched.
 - Broader hardware -- APIC (Stages A1-A3). Interrupt delivery moved off the 8259
   PIC. A hand-rolled, bounded ACPI **MADT parser** (`kernel/src/acpi.rs`,
   modeled on the PCI enumerator -- no ACPI crate, no AML) discovers the CPU and

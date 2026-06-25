@@ -130,14 +130,20 @@ against the cost to determinism rather than taken for granted.
     Processes pin to their scheduling core (no migration yet). A
     `cargo xtask smoke-smp` lane reruns the assertion battery on 2-4 cores; an
     `-smp 1` lane keeps the deterministic contract as a regression net.
-  - [ ] **SMP -- scaling.** Per-CPU run queues and work stealing, so cores add
-    kernel throughput instead of contending on the one lock. Deferred on
-    evidence: a benchmark showed the single lock only contends near 100% kernel
-    residency, a regime real workloads do not occupy -- so the throughput lever
-    was taking the kernel off the I/O fast path (the async rings above), not
-    splitting the lock. Lock-splitting waits for a workload that actually
-    contends. The long-run direction stays share-nothing -- per-CPU (eventually
-    per-NUMA) state coordinated by message passing.
+  - [x] **SMP -- scaling.** Per-CPU run queues with bounded work stealing: each
+    core owns a run queue (`CORE_QUEUE`, `kernel/src/scheduler.rs`), processes
+    are homed at spawn time, and an idle core steals one Ready process from a
+    busy core's queue (lifting the pin from the boot milestone -- migration is
+    now a steal). Scoped to scheduling *ownership and locality*, not
+    lock-splitting: a benchmark showed the single lock only contends near 100%
+    kernel residency, a regime real workloads do not occupy -- so the throughput
+    lever was taking the kernel off the I/O fast path (the async rings above),
+    not splitting the lock, which is left for a workload that actually contends.
+    This is the architectural step toward the share-nothing direction -- per-CPU
+    (eventually per-NUMA) state coordinated by message passing. The `steal demo`
+    forces an imbalance (one parent spawns workers that pile onto its core while
+    others idle) and asserts both completion and that a cross-core steal fired;
+    `cargo xtask smoke-smp` exercises it on 2-4 cores.
   - [ ] **Real-machine hardware.** Leaving QEMU's comfortable defaults: real
     ACPI quirks, MMIO cache attributes, PCIe ECAM, a NIC. Its own milestone,
     once the concurrency model is scaled.

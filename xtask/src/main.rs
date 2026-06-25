@@ -47,7 +47,7 @@ fn main() {
 const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
     "share", "rpc", "faultchild", "blk", "asyncblk", "blkwrite", "fsdemo", "diskhello", "evt",
-    "evtstream", "unified", "kbd", "mouse", "rwfs", "template", "bench",
+    "evtstream", "unified", "kbd", "mouse", "rwfs", "stealer", "stealwork", "template", "bench",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -552,6 +552,10 @@ const RPC_OFFSET: u64 = 1000;
 /// match grantee-user's RESULT.
 const SPAWN_RESULT: u64 = 42;
 
+/// Workers the steal demo spawns; must match stealer-user's WORKERS. Each
+/// prints one `stealwork[id] done` line and the parent joins all of them.
+const STEAL_WORKERS: u64 = 3;
+
 /// Assert each scheduled process printed its own lines in program order.
 /// Under preemption the processes' lines interleave arbitrarily, but a single
 /// process's output is always in program order -- so for each id the counters
@@ -791,6 +795,69 @@ fn check_reap(actual: &str) {
     }
 }
 
+/// Verify the work-stealing demo (S4, Design/smp_scaling.md section 6). Two
+/// facts: (1) every worker completed -- `workers` distinct `stealwork[id] done`
+/// lines AND the parent's `stealer: joined <workers> workers` line; (2) at
+/// least one process actually moved to another core's array -- the kernel's
+/// `steal demo: <n> steals across <c> cores` line, with `n >= 1` REQUIRED when
+/// `c >= 2` (the only configuration where stealing is possible at all; under a
+/// single online core the demo still completes with zero steals, which is
+/// correct, not a failure). Interleaving-robust: it counts a role's own lines
+/// and a before/after-style fact, never an exact global position -- so it holds
+/// at -smp 1 and under real cross-core reordering at -smp N alike.
+fn check_steal(actual: &str, workers: u64) {
+    let lines: Vec<&str> = actual.lines().map(str::trim).collect();
+
+    // (1a) every worker printed its own completion line, exactly once each.
+    let done = lines
+        .iter()
+        .filter(|l| l.starts_with("stealwork[") && l.ends_with("] done"))
+        .count() as u64;
+    if done != workers {
+        eprintln!("smoke: FAIL steal: saw {done} 'stealwork[..] done' lines, expected {workers}");
+        std::process::exit(1);
+    }
+
+    // (1b) the parent joined them all.
+    let joined = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("stealer: joined "))
+        .and_then(|rest| rest.strip_suffix(" workers"))
+        .and_then(|n| n.trim().parse::<u64>().ok());
+    match joined {
+        Some(n) if n == workers => {}
+        Some(n) => {
+            eprintln!("smoke: FAIL steal: parent joined {n} workers, expected {workers}");
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("smoke: FAIL steal: no 'stealer: joined N workers' line -- parent hung?");
+            std::process::exit(1);
+        }
+    }
+
+    // (2) the cross-core move actually happened (when >= 2 cores are online).
+    // Key on "steals across" so this matches the kernel's steal-count line and
+    // not run()'s own "plinth: steal demo: N processes" launch banner.
+    let parse = |l: &str| -> Option<(u64, u64)> {
+        let (before, after) = l.split_once(" steals across ")?;
+        let n = before.split_whitespace().last()?.parse().ok()?;
+        let (c_str, _) = after.split_once(" cores")?;
+        Some((n, c_str.trim().parse().ok()?))
+    };
+    let Some((steals, cores)) = lines.iter().find_map(|l| parse(l)) else {
+        eprintln!("smoke: FAIL steal: no 'N steals across C cores' line");
+        std::process::exit(1);
+    };
+    if cores >= 2 && steals == 0 {
+        eprintln!("smoke: FAIL steal: {cores} cores online but 0 steals -- stealing did not fire");
+        std::process::exit(1);
+    }
+    println!(
+        "smoke: work-stealing ok ({workers} workers joined, {steals} steals across {cores} cores)"
+    );
+}
+
 fn smoke(uefi_path: &Path) {
     run_smoke_checks(uefi_path, true);
 }
@@ -829,6 +896,9 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     check_reap(&actual);
     check_frames_baseline(&actual, "spawn");
     check_endpoints_baseline(&actual, "spawn");
+    check_steal(&actual, STEAL_WORKERS);
+    check_frames_baseline(&actual, "steal");
+    check_endpoints_baseline(&actual, "steal");
     check_frames_baseline(&actual, "blk");
     check_frames_baseline(&actual, "asyncblk");
     check_frames_baseline(&actual, "blkwrite");
