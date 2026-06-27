@@ -1,0 +1,17 @@
+# Standalone crate -- intentionally not a workspace member. User crates that
+# draw to the screen depend on it by path and build it for x86_64-unknown-none
+# themselves (it is only ever built on the bare target, as a dependency of a
+# *-user binary).
+[workspace]
+
+[package]
+name = "libgfx"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libplinth = { path = "../libplinth" }
+
+[profile.release]
+opt-level = 3
+lto = true

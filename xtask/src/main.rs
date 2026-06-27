@@ -47,7 +47,8 @@ fn main() {
 const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
     "share", "rpc", "faultchild", "blk", "asyncblk", "blkwrite", "fsdemo", "diskhello", "evt",
-    "evtstream", "unified", "kbd", "mouse", "rwfs", "stealer", "stealwork", "template", "bench",
+    "evtstream", "unified", "kbd", "mouse", "rwfs", "stealer", "stealwork", "gfx", "gfxtext",
+    "gfxsplit", "gfxbound", "template", "bench",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -320,8 +321,12 @@ fn build() -> PathBuf {
     uefi_path
 }
 
-/// Compose the QEMU command line shared by run and smoke.
-fn build_qemu_cmd(uefi_path: &Path, gdb: bool) -> Command {
+/// Compose the QEMU command line shared by run and smoke. `exit_on_debug` adds
+/// the isa-debug-exit device: the capture paths (smoke/test/bench) need it so the
+/// kernel can self-terminate QEMU and the harness can collect serial; the
+/// interactive `run` path omits it so the kernel halts after boot and the window
+/// stays open for inspection (the framebuffer's last frame remains on screen).
+fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool) -> Command {
     let root = workspace_root();
 
     // OVMF provides separate code (read-only) and vars (read-write)
@@ -352,10 +357,23 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool) -> Command {
         "-no-reboot",
         "-m", "256M",
         "-cpu", "qemu64",
-        // isa-debug-exit: the kernel writes N to port 0xF4 and QEMU exits
-        // with status (N << 1) | 1. Kernel success (N=0) -> exit code 1.
-        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        // Pin the display adapter so OVMF's GOP hands the bootloader a linear
+        // framebuffer with stable geometry (Design/display.md D6, Stage 1).
+        // Smoke/test add `-display none` (headless) in run_capture; the device
+        // stays present either way, so the framebuffer exists with or without a
+        // host window -- and `run` and `smoke` see identical pixels, so the
+        // framebuffer hash matches across both. Pinned alongside the OVMF 0.2.8
+        // firmware: re-check boot if either changes.
+        "-vga", "std",
     ]);
+
+    if exit_on_debug {
+        // isa-debug-exit: the kernel writes N to port 0xF4 and QEMU exits with
+        // status (N << 1) | 1. Kernel success (N=0) -> exit code 1. Only the
+        // capture paths add it; `run` omits it so the kernel halts and the
+        // window stays open.
+        cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+    }
 
     // Plinth is deliberately uniprocessor by default: deterministic serial
     // output is a feature, not a limitation, and `-smp 1` is the regression
@@ -443,25 +461,23 @@ fn wait_qemu(mut child: std::process::Child) -> i32 {
 }
 
 fn run(uefi_path: &Path, gdb: bool) {
-    let child = build_qemu_cmd(uefi_path, gdb)
+    // Interactive path: no isa-debug-exit device (build_qemu_cmd's last arg is
+    // false), so the kernel halts after boot instead of self-terminating, and
+    // the QEMU window stays open until you close it -- which is how you inspect
+    // the framebuffer (the last frame the visual demos drew remains on screen).
+    // No timeout: wait for you to close the window.
+    let mut child = build_qemu_cmd(uefi_path, gdb, false)
         .spawn()
         .expect("failed to launch qemu-system-x86_64");
-    let code = wait_qemu(child);
-    if code == i32::MIN {
-        std::process::exit(2);
-    }
-    // Exit code 1 is kernel-signalled success via isa-debug-exit.
-    if code != 0 && code != 1 {
-        eprintln!("QEMU exited with unexpected code: {code}");
-        std::process::exit(code);
-    }
+    eprintln!("QEMU window open -- close it to return to the shell.");
+    let _ = child.wait();
 }
 
 /// Boot with captured stdout and return the serial output. A reader thread
 /// drains the pipe so a full buffer never stalls QEMU.
 fn run_capture(uefi_path: &Path) -> String {
     use std::io::Read;
-    let mut cmd = build_qemu_cmd(uefi_path, false);
+    let mut cmd = build_qemu_cmd(uefi_path, false, true);
     // Headless: all output we care about arrives over serial. Without
     // this, QEMU tries to open its default (GTK) display and dies on
     // CI runners that have no display server at all.
@@ -858,6 +874,22 @@ fn check_steal(actual: &str, workers: u64) {
     );
 }
 
+/// Verify the sub-region split demo (Stage 4): both band holders mapped their
+/// disjoint band and drew it. The two `gfxsplit[N]: ok` lines come from
+/// concurrent processes, so their order is nondeterministic -- assert presence,
+/// not position (like check_steal's per-worker lines). Reaching `ok` means the
+/// draw stayed inside the grant (an out-of-band write would have faulted first);
+/// the boundary itself is exercised by gfxbound.
+fn check_gfxsplit(actual: &str) {
+    for want in ["gfxsplit[0]: ok", "gfxsplit[1]: ok"] {
+        if !actual.lines().any(|l| l.contains(want)) {
+            eprintln!("smoke: FAIL gfxsplit: missing {want:?} -- a band holder did not confine + draw");
+            std::process::exit(1);
+        }
+    }
+    println!("smoke: gfxsplit ok (both band holders confined to their grant and drew)");
+}
+
 fn smoke(uefi_path: &Path) {
     run_smoke_checks(uefi_path, true);
 }
@@ -909,6 +941,11 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     check_frames_baseline(&actual, "unified");
     check_frames_baseline(&actual, "mouse");
     check_frames_baseline(&actual, "rwfs");
+    check_frames_baseline(&actual, "gfx");
+    check_frames_baseline(&actual, "gfxtext");
+    check_gfxsplit(&actual);
+    check_frames_baseline(&actual, "gfxsplit");
+    check_frames_baseline(&actual, "gfxbound");
 }
 
 /// Core counts `smoke-smp` boots under. 2 is the minimum that exercises any

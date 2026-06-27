@@ -292,6 +292,15 @@ pub fn user_accessible(l4: u64, va: u64) -> bool {
     }
 }
 
+/// Translate a kernel virtual address to its physical address, if mapped.
+/// Used at boot to learn the framebuffer's physical base from the virtual
+/// address the bootloader mapped it at (Design/display.md, framebuffer.rs), so
+/// the region can be re-mapped into a user address space.
+pub fn kernel_phys_of(va: u64) -> Option<u64> {
+    let mapper = unsafe { mapper_for(kernel_l4()) };
+    mapper.translate_addr(VirtAddr::new(va)).map(|pa| pa.as_u64())
+}
+
 /// Is `va` mapped at all in `l4`?
 pub fn is_mapped(l4: u64, va: u64) -> bool {
     let mapper = unsafe { mapper_for(l4) };

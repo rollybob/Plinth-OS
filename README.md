@@ -204,6 +204,21 @@ those scancodes into a line with `libinput`, an unprivileged library OS holding
 the keymap, shift handling, and line editor -- so the echoed `Hi` is policy the
 kernel never sees.
 
+**The screen is multiplexed like the disk.** The kernel discovers the UEFI GOP
+linear framebuffer the bootloader maps (no GPU driver) and hands it out as a
+`Framebuffer` capability; `fb_map` maps the pixels into the holder and the kernel
+gets off the path. All drawing is policy in `libgfx` -- a pixel writer, an 8x8
+bitmap font, `draw_text` -- exactly as the keymap is policy: gfxtext-demo draws a
+title and echoes a keyboard line *on-screen* (joining the framebuffer and the
+keyboard `EventSource` in one library OS), and the pixel boundary stays testable
+by hashing a fixed region to serial. The multiplexing payoff is gfxsplit-demo:
+the screen is split into two disjoint horizontal **bands**, one granted to each
+of two concurrent graphics library OSes, each confined to its own rows *by the
+page tables* -- and gfxbound-demo, a band holder that writes one row past its
+grant, is killed by the kernel's page fault. Disjoint regions of one screen are
+handed to mutually isolated tenants, the display analogue of disjoint
+`BlockRange`s -- and the guarantee is structural, not a cooperative clip.
+
 ## Why exokernels
 
 A conventional kernel bundles mechanism (multiplexing hardware safely) with
@@ -237,10 +252,11 @@ Plinth implements the minimum machinery that makes the argument concrete:
   instruction -- self-paging, the exokernel's signature move. The kernel's
   mechanism is delivery and resume; the policy is the application's.
 - **Policy lives in library OSes, not the kernel**: allocation (`libos`), two
-  on-disk filesystem formats (`libfs` read-only, `librwfs` read-write), and
-  the keyboard keymap and line editor (`libinput`) are all unprivileged code
-  linked into the programs that want them. The kernel ships frames, sectors,
-  and raw scancodes; what those *mean* is decided above the kernel.
+  on-disk filesystem formats (`libfs` read-only, `librwfs` read-write), the
+  keyboard keymap and line editor (`libinput`), and graphics -- pixels, a font,
+  text (`libgfx`) -- are all unprivileged code linked into the programs that want
+  them. The kernel ships frames, sectors, raw scancodes, and a raw framebuffer;
+  what those *mean* is decided above the kernel.
 
 ## Architecture
 
@@ -310,6 +326,7 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
   input.rs         event sources: route keystrokes/mouse packets to ring subs
   gdt.rs           GDT/TSS, sysret-compatible selector layout
   serial.rs        serial console
+  framebuffer.rs   discover the GOP framebuffer; hand it out as a Framebuffer cap
   tests/           in-kernel test suite (78 tests, run in QEMU)
 
 libplinth/   user-side syscall + gate shim -- deliberately NOT a library OS
@@ -319,6 +336,8 @@ libfs/       a read-only boot-archive parser -- the filesystem as a libOS
 librwfs/     a bitmap allocator + mutable directory -- a second, writable
              filesystem as a libOS, over the same block ring ABI
 libinput/    a Set-1 keymap (with shift) and line reader -- input as a libOS
+libgfx/      a framebuffer writer, an 8x8 bitmap font + draw_text -- graphics
+             (rendering) as a libOS over the Framebuffer capability
 demo-app/    the shared allocator workload, generic over the memory policy
 
 user programs (ring 3, each its own crate):
@@ -344,6 +363,10 @@ user programs (ring 3, each its own crate):
   unified-user/  one ring_wait drives a block read AND a key stream (join2)
   kbd-user/      read a line through libinput
   mouse-user/    subscribe and reap a mouse-packet stream (second EventSource)
+  gfx-user/      map the framebuffer (Framebuffer cap), draw + hash; non-fb cap denied
+  gfxtext-user/  draw a title + echo a keyboard line on-screen (libgfx + libinput)
+  gfxsplit-user/ two libOSes each draw a disjoint screen band (run as two procs)
+  gfxbound-user/ write past a band's grant -> kernel page-faults it (the boundary)
   faultchild-user/  a child that faults, for liveness testing
   template-user/    minimal skeleton to copy for a new program (see GUIDE.md)
 xtask/       build orchestration: user binaries, disk images, QEMU,

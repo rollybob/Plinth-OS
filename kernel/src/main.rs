@@ -29,6 +29,11 @@ mod elf;
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod fault;
 mod frame_alloc;
+// The framebuffer bring-up (Stage 1 of the visual milestone, Design/display.md)
+// draws + hashes the GOP framebuffer only on the userspace boot path; the test
+// build stops before it.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod framebuffer;
 mod gdt;
 mod interrupts;
 // The interrupt-controller seam (8259 PIC today). Its remap/unmask/eoi are
@@ -112,6 +117,12 @@ const BOOTLOADER_CONFIG: BootloaderConfig = {
     // The frame allocator hands physical frames to userspace, so all of
     // physical memory must be reachable from kernel virtual addresses.
     c.mappings.physical_memory = Some(Mapping::Dynamic);
+    // Map the UEFI GOP framebuffer into the kernel address space for the Stage 1
+    // display bring-up (Design/display.md). Dynamic placement matches
+    // physical_memory above; the bootloader sets up GOP and fills
+    // boot_info.framebuffer when a display adapter is present (the smoke QEMU
+    // pins one with -vga std). This is the default, set explicitly for clarity.
+    c.mappings.framebuffer = Mapping::Dynamic;
     c
 };
 
@@ -189,6 +200,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ];
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
+
+        // Stage 1 display bring-up (Design/display.md): draw a fixed test
+        // pattern into the GOP framebuffer the bootloader mapped for us and hash
+        // a fixed sub-rectangle to serial, proving the framebuffer exists under
+        // the test config and that a known draw is byte-deterministic. This is a
+        // scaffold -- Stage 2 hands the framebuffer to a graphics libOS as a
+        // capability and the kernel stops drawing.
+        framebuffer::init(&mut serial, boot_info.framebuffer.as_mut());
 
         // Discover the CPU + interrupt-controller topology from ACPI (broader
         // hardware, Stage A1): parse the MADT for the Local APIC base, the I/O
@@ -736,6 +755,118 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             scheduler::run("rwfs demo", &[RWFS_BIN], phys_offset, &[Some(range)]);
             let after_rwfs = free_frames();
             let _ = writeln!(serial, "plinth: {after_rwfs} frames free after rwfs");
+        }
+
+        // Visual userspace (Stage 2, Design/display.md): the framebuffer as a
+        // capability. The kernel grants gfx-user a whole-screen Framebuffer
+        // capability (at GRANT_SLOT) and nothing about pixels; the graphics
+        // library OS (libgfx) maps it with fb_map and draws straight into the
+        // mapped memory -- the kernel multiplexes the raw region, all drawing is
+        // policy. The demo first proves a non-framebuffer capability is refused
+        // by fb_map (the type guard, the display analogue of the BlockRange
+        // check), then draws a fixed plaid and hashes a 128x128 origin square.
+        // The hash is byte-identical to the value Stage 1's kernel-side draw
+        // produced, proving the libOS-through-capability path yields the same
+        // pixels. Runs only if the bootloader gave us a framebuffer. Frame counts
+        // bracket the demo: no leak -- the page tables for the ~4 MiB mapping are
+        // freed at teardown, and the firmware pixels are never pooled.
+        if let Some(fbobj) = framebuffer::framebuffer_cap() {
+            const GFX_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gfx-user"));
+            let before_gfx = free_frames();
+            let _ = writeln!(serial, "plinth: {before_gfx} frames free before gfx");
+            let cap = Capability {
+                object: fbobj,
+                rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+            };
+            scheduler::run("gfx demo", &[GFX_BIN], phys_offset, &[Some(cap)]);
+            let after_gfx = free_frames();
+            let _ = writeln!(serial, "plinth: {after_gfx} frames free after gfx");
+        }
+
+        // Visual userspace (Stage 3, Design/display.md): bitmap text + an
+        // input-driven frame. The kernel grants gfxtext-user the whole-screen
+        // Framebuffer (slot 1) AND the keyboard EventSource (slot 2); the
+        // graphics libOS draws a fixed "PLINTH" title and echoes a line read
+        // through the keyboard -- raw scancodes decoded by libinput's keymap,
+        // glyphs rendered by libgfx's font, all unprivileged policy over the two
+        // capabilities. The kernel knows nothing about fonts or keymaps. A
+        // scripted scancode sequence drives the input deterministically (the
+        // keyboard input smoke's discipline), so the rendered frame and its hash
+        // are stable. Runs only if a framebuffer is present. Frame counts bracket
+        // the demo (no leak: the mapping's page tables and the event-ring frames
+        // are freed at teardown).
+        if let Some(fbobj) = framebuffer::framebuffer_cap() {
+            const GFXTEXT_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gfxtext-user"));
+            let before_gfxtext = free_frames();
+            let _ = writeln!(serial, "plinth: {before_gfxtext} frames free before gfxtext");
+            let fbcap = Capability {
+                object: fbobj,
+                rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+            };
+            let source = Capability {
+                object: CapObject::EventSource { id: 0 },
+                rights: capability::RIGHT_READ,
+            };
+            // Set-1 make codes for "stage 3" + Enter -- must spell the line the
+            // font renders (uppercased) and the smoke asserts.
+            input::arm_synthetic(&[0x1F, 0x14, 0x1E, 0x22, 0x12, 0x39, 0x04, 0x1C]);
+            scheduler::run("gfxtext demo", &[GFXTEXT_BIN], phys_offset, &[Some(fbcap), Some(source)]);
+            let after_gfxtext = free_frames();
+            let _ = writeln!(serial, "plinth: {after_gfxtext} frames free after gfxtext");
+        }
+
+        // Visual userspace (Stage 4, Design/display.md) -- the thesis climax:
+        // sub-region multiplexing. The kernel splits the screen into two disjoint
+        // horizontal bands and grants one to each of two concurrent graphics
+        // library OSes (gfxsplit-user, slot index in RDI -> top/bottom). Each maps
+        // ONLY its band (fb_map maps the band's contiguous rows), fills it, and
+        // labels it -- confined by the page tables, not a cooperative check: a
+        // band holder's address space contains only its rows, so neither can
+        // reach the other's pixels. This is the display analogue of two libOSes
+        // handed disjoint BlockRanges. Then gfxbound-user, granted one band,
+        // deliberately writes one row past it and is #PF-terminated -- the
+        // "rejected outside the grant" negative, enforced structurally. Frame
+        // counts bracket each (no leak; the faulted gfxbound is reclaimed like
+        // crash-demo).
+        if let Some(r) = framebuffer::region() {
+            let half = r.height / 2;
+            if let (Some(top), Some(bottom)) = (
+                framebuffer::framebuffer_cap_band(0, half),
+                framebuffer::framebuffer_cap_band(half, r.height - half),
+            ) {
+                const GFXSPLIT_BIN: &[u8] =
+                    include_bytes!(concat!(env!("OUT_DIR"), "/gfxsplit-user"));
+                let rights = capability::RIGHT_MAP | capability::RIGHT_WRITE;
+                let before_split = free_frames();
+                let _ = writeln!(serial, "plinth: {before_split} frames free before gfxsplit");
+                let topcap = Capability { object: top, rights };
+                let botcap = Capability { object: bottom, rights };
+                // Two-process run: process 0 gets the top band, process 1 the
+                // bottom (one grant each); RDI tells each which it is.
+                scheduler::run(
+                    "gfxsplit demo",
+                    &[GFXSPLIT_BIN, GFXSPLIT_BIN],
+                    phys_offset,
+                    &[Some(topcap), Some(botcap)],
+                );
+                let after_split = free_frames();
+                let _ = writeln!(serial, "plinth: {after_split} frames free after gfxsplit");
+            }
+
+            // Negative: a band holder that writes past its grant is faulted.
+            if let Some(top) = framebuffer::framebuffer_cap_band(0, half) {
+                const GFXBOUND_BIN: &[u8] =
+                    include_bytes!(concat!(env!("OUT_DIR"), "/gfxbound-user"));
+                let before_bound = free_frames();
+                let _ = writeln!(serial, "plinth: {before_bound} frames free before gfxbound");
+                let topcap = Capability {
+                    object: top,
+                    rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+                };
+                scheduler::run("gfxbound demo", &[GFXBOUND_BIN], phys_offset, &[Some(topcap)]);
+                let after_bound = free_frames();
+                let _ = writeln!(serial, "plinth: {after_bound} frames free after gfxbound");
+            }
         }
 
         // BKL contention micro-benchmark (broader-hardware "SMP -- scaling"

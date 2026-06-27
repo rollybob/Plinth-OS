@@ -3,7 +3,7 @@
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
 follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
-current contract is **v2.6**. v2 added IPC and revised `spawn`, breaking v1 --
+current contract is **v2.7**. v2 added IPC and revised `spawn`, breaking v1 --
 the one incompatible ABI change so far; v2.1 added `spawn_from_buffer` (the
 load-from-disk path), v2.2 added console input (`event_recv` + `EventSource`),
 both additive over v2; v2.3 moved `block_read` to the `int 0x80` gate so it can
@@ -13,11 +13,37 @@ additive but for the retirement of the now-unused `block_read` op; v2.5 ports
 input onto the same rings as multishot subscriptions (`RING_OP_EVENT_SUB`/
 `RING_OP_CANCEL` SQ ops), retiring the `event_recv` gate op behind a shim -- one
 ring, one `ring_wait`, now multiplexes block reads and input; v2.6 adds the
-write half of the block ring ABI (`RING_OP_WRITE`), purely additive.
+write half of the block ring ABI (`RING_OP_WRITE`), purely additive; v2.7 adds
+the framebuffer as a capability (`Framebuffer` + the `fb_map` syscall, nr 14),
+purely additive.
 
 ## [Unreleased]
 
 ### Added
+- Visual userspace -- the framebuffer as a capability (ABI v2.7), a staged
+  milestone built on the linear framebuffer the `bootloader` crate already maps
+  (UEFI GOP -- no GPU driver). The kernel only *discovers* the framebuffer
+  (`kernel/src/framebuffer.rs`: capture the physical base + geometry, report it)
+  and multiplexes it through a new **`Framebuffer` capability** + an **`fb_map`
+  syscall** (nr 14): `fb_map(slot, va, info_ptr)` maps the region into the
+  holder at a user-chosen address and writes back the geometry. All drawing --
+  pixels, fonts, text, layout -- is library-OS policy in a new clean-room
+  **`libgfx`** (a framebuffer writer, an 8x8 bitmap font + `draw_text`, and a
+  deterministic frame hash); the kernel never touches a pixel, exactly as it
+  never decodes a scancode. Determinism is kept across the pixel boundary by
+  hashing a fixed sub-rectangle to serial and asserting it (the smoke QEMU pins
+  `-vga std` headless so a GOP framebuffer exists). Four demos stage it:
+  `gfx-user` proves the cap + `fb_map` + that a non-framebuffer capability is
+  refused, and that a libOS draw matches the kernel's own byte for byte;
+  `gfxtext-user` draws a title and echoes a scripted keyboard line on-screen
+  (libinput's keymap + libgfx's font, both unprivileged); and `gfxsplit-user` +
+  `gfxbound-user` are the multiplexing payoff -- the screen is split into two
+  disjoint horizontal **bands**, one granted to each of two concurrent graphics
+  libOSes (confined to their rows by paging, not a cooperative check, the
+  display analogue of disjoint `BlockRange`s), and a band holder that writes one
+  row past its grant is `#PF`-terminated. Sub-region grants are the same
+  `Framebuffer` variant with an offset base and reduced height -- no new
+  syscall, so the ABI bump is just the `fb_map`/`Framebuffer` surface.
 - Broader hardware -- SMP scaling (per-core run queues + bounded work stealing).
   The scheduler replaces the single flat process table scan with a **per-core
   run queue** (`CORE_QUEUE`, `kernel/src/scheduler.rs`): a process is homed to a

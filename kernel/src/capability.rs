@@ -89,6 +89,31 @@ pub enum CapObject {
     /// table slot (like an Endpoint), so teardown releases it via `rings::release`
     /// (the SQ/CQ frames are ordinary Frame capabilities, freed on their own).
     Ring { id: usize },
+    /// The linear framebuffer (Design/display.md): a memory-mapped pixel region
+    /// the bootloader's UEFI GOP set up, named together with the geometry needed
+    /// to draw into it. `RIGHT_MAP` gates `fb_map`, which maps the region into
+    /// the holder's address space; `RIGHT_WRITE` marks it writable. The kernel
+    /// multiplexes the raw region; all drawing (fonts, layout, compositing) is
+    /// library-OS policy -- the same "secure binding over a raw resource" move as
+    /// frames, `BlockRange`, and `EventSource`, applied to pixels.
+    ///
+    /// Geometry is carried inline (like `BlockRange`'s sectors): `phys_base` is
+    /// the region's physical base, `stride` the pixels per row (>= width), and
+    /// `format` the pixel layout (0=rgb, 1=bgr, 2=u8, 3=other). v1 grants the
+    /// whole screen; a sub-region grant (Design/display.md Stage 4) is the same
+    /// variant with a smaller rect and an offset `phys_base`, the display
+    /// analogue of disjoint `BlockRange`s. Pure inline data naming firmware MMIO,
+    /// not a pooled resource, so teardown just drops it -- no reference count,
+    /// and the pixel frames are never returned to the allocator (consistent with
+    /// the D3b narrowing).
+    Framebuffer {
+        phys_base: u64,
+        width: u32,
+        height: u32,
+        stride: u32,
+        bytes_per_pixel: u8,
+        format: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

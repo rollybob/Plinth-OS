@@ -1,0 +1,23 @@
+# Standalone crate -- intentionally not a workspace member.
+[workspace]
+
+[package]
+name = "gfxsplit-user"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gfxsplit-user"
+path = "src/main.rs"
+
+[dependencies]
+libplinth = { path = "../libplinth" }
+libgfx = { path = "../libgfx" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true

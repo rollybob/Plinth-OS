@@ -7,6 +7,16 @@ plinth: GDT + TSS loaded
 plinth: IDT loaded
 plinth: syscall interface ready
 
+# Display bring-up (Design/display.md). The bootloader maps a UEFI GOP linear
+# framebuffer; the kernel only DISCOVERS it (capturing the physical base +
+# geometry) and reports "present" -- it never draws a pixel. "present" proves a
+# framebuffer exists under the test QEMU config (-vga std, headless). The
+# geometry detail line (WxH/stride/bpp/fmt) is NOT asserted -- the resolution can
+# shift across QEMU versions, like the PCI BAR lines. The framebuffer is handed
+# to a graphics library OS as a capability; the actual draw + the determinism
+# hash are the gfx demo near the end of boot (drawing is libOS policy, Stage 2).
+plinth: framebuffer present
+
 # ACPI MADT discovery (broader hardware, Stage A1): parse the RSDP -> XSDT ->
 # MADT for the CPU + interrupt-controller topology. Pure discovery -- the 8259
 # PIC still drives interrupts; this only reports what an APIC bring-up (Stage A2)
@@ -295,5 +305,65 @@ rwfs: a.txt deleted
 rwfs: bitmap reclaim verified (c.txt reused a.txt's sector)
 rwfs: ok (create/read/delete/reuse verified)
 plinth: rwfs demo: all done
+
+# Visual userspace (Stage 2, Design/display.md): the framebuffer as a capability.
+# The kernel grants gfx-user a whole-screen Framebuffer capability (at GRANT_SLOT)
+# and nothing about pixels; the graphics library OS (libgfx) maps it with fb_map
+# and draws straight into the mapped memory -- the kernel multiplexes the raw
+# region, drawing is libOS policy. The demo first proves a non-framebuffer
+# capability (a Frame, which carries RIGHT_MAP) is refused by fb_map on the kind
+# check -- the multiplexing/type guard, the display analogue of the BlockRange
+# check -- then draws a fixed plaid and hashes a 128x128 origin square. The hash
+# is byte-identical to the value the kernel's own Stage 1 draw produced, proving
+# the libOS-through-capability path yields the same pixels. Frame counts bracket
+# the demo (check_frames_baseline): no leak -- the ~4 MiB mapping's page tables
+# are freed at teardown, and the firmware pixels are never pooled.
+plinth: gfx demo: 1 processes
+gfx: start
+gfx: non-framebuffer rejected
+gfx: framebuffer hash 0xa89206aa6c9abb25
+gfx: ok
+plinth: gfx demo: all done
+
+# Visual userspace (Stage 3, Design/display.md): bitmap text + an input-driven
+# frame. The kernel grants gfxtext-user the whole-screen Framebuffer (slot 1) and
+# the keyboard EventSource (slot 2); libgfx draws a fixed "PLINTH" title and
+# echoes a line read through the keyboard -- raw scancodes decoded by libinput's
+# keymap, glyphs rendered by libgfx's 8x8 font, all unprivileged policy. A
+# scripted scancode sequence ("stage 3" + Enter, armed kernel-side) drives the
+# input, so the rendered frame and its hash are deterministic. The echoed line is
+# lowercase (the keymap's output, "stage 3"); the font folds it to uppercase on
+# screen. Frame counts bracket the demo (no leak: the framebuffer mapping's page
+# tables and the event-ring frames are freed at teardown).
+plinth: gfxtext demo: 1 processes
+gfxtext: start
+gfxtext: line 'stage 3'
+gfxtext: framebuffer hash 0x1b5bf12a50c91325
+gfxtext: ok
+plinth: gfxtext demo: all done
+
+# Visual userspace (Stage 4, Design/display.md) -- the thesis climax: sub-region
+# multiplexing. The kernel splits the screen into two disjoint horizontal bands
+# and grants one to each of two concurrent graphics library OSes; each maps ONLY
+# its band (fb_map maps the band's contiguous rows) and draws it, confined by the
+# page tables -- neither can reach the other's pixels. The two "gfxsplit[N]: ok"
+# lines come from concurrent processes, so their order is nondeterministic and
+# they are checked for presence by xtask (check_gfxsplit), not asserted here.
+# Frame counts bracket the demo (no leak).
+plinth: gfxsplit demo: 2 processes
+plinth: gfxsplit demo: all done
+
+# Sub-region boundary (Stage 4, the negative case): gfxbound-user, granted one
+# band, deliberately writes one row PAST it -- the next band's first row, never
+# mapped in its address space. The kernel takes the page fault and terminates the
+# process (the same path as crash-demo), proving a band holder cannot reach
+# pixels outside its grant -- the display analogue of BlockRange's out-of-range
+# rejection, enforced structurally by paging. The rip/addr in the #PF line vary,
+# so only the stable prefix is asserted. Boot continues; frames are reclaimed.
+plinth: gfxbound demo: 1 processes
+gfxbound: writing past my band
+plinth: [user fault] #PF
+plinth: terminating user process
+plinth: gfxbound demo: all done
 
 plinth: boot ok

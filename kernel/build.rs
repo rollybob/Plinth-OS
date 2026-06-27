@@ -17,7 +17,8 @@ use std::path::PathBuf;
 const USER_BINARIES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
     "share", "rpc", "faultchild", "blk", "asyncblk", "blkwrite", "fsdemo", "evt", "evtstream",
-    "unified", "kbd", "mouse", "rwfs", "stealer", "stealwork",
+    "unified", "kbd", "mouse", "rwfs", "stealer", "stealwork", "gfx", "gfxtext",
+    "gfxsplit", "gfxbound",
 ];
 
 // Embedded only by the `bench` build (`cargo xtask bench`), matching the

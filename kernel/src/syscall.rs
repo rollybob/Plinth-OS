@@ -14,6 +14,7 @@
 //! | 11 | spawn_buf   | buf_va, len, slot   | wait handle, or ERR      |
 //! | 12 | ring_register | sq_slot, cq_slot, entries | ring cap slot, or ERR |
 //! | 13 | ring_submit | ring                | count posted, or ERR     |
+//! | 14 | fb_map      | slot, va, info_ptr  | 0, or ERR                |
 //!
 //! Nr 10 (block_read) was retired in ABI v2.3: a blocking read must suspend and
 //! resume with a return value, which needs the full resumable trap frame only an
@@ -192,6 +193,7 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         // blocking `ring_wait` is on the `int 0x80` gate (op 6, see ipc.rs).
         12 => crate::rings::ring_register(a1, a2, a3),
         13 => crate::rings::ring_submit(a1),
+        14 => sys_fb_map(a1, a2, a3),
         _ => ERR,
     };
     unsafe { bkl::release() };
@@ -320,6 +322,116 @@ fn sys_frame_map(slot: u64, va: u64) -> u64 {
     }
 
     *entry = Some((va, slot as usize));
+    0
+}
+
+/// fb_map(slot, va, info_ptr): map the framebuffer named by the capability at
+/// `slot` into the caller's address space, contiguously from the user-chosen
+/// `va` (the exokernel contract, like frame_map), and write its geometry to the
+/// FbInfo struct at `info_ptr` (five u32s: width, height, stride,
+/// bytes_per_pixel, format). Returns 0, or ERR.
+///
+/// The mapped pages name firmware MMIO, not pooled frames, so they are NOT
+/// recorded in `proc.maps` (which exists to dealloc pooled frames) and are never
+/// returned to the allocator -- teardown's `destroy_address_space` frees only
+/// the page tables. There can be far more pages than `proc.maps` holds anyway
+/// (a 1280x800x4 framebuffer is ~1000 pages).
+fn sys_fb_map(slot: u64, va: u64, info_ptr: u64) -> u64 {
+    // Resolve the capability (and the process L4) up front, then drop CURRENT
+    // before taking FRAME_ALLOC -- the file-wide lock order is CURRENT then
+    // FRAME_ALLOC, never nested the other way.
+    let (l4, phys_base, width, height, stride, bpp, format) = {
+        let cur = process::current().lock();
+        let Some(proc) = cur.as_ref() else {
+            return ERR;
+        };
+        let Ok(cap) = proc.caps.lookup(slot as usize, RIGHT_MAP) else {
+            return ERR;
+        };
+        // A non-framebuffer capability (even one that carries RIGHT_MAP, like a
+        // Frame) is rejected here: the kind check is the multiplexing/type
+        // guard, the display analogue of BlockRange's device+range check.
+        let CapObject::Framebuffer { phys_base, width, height, stride, bytes_per_pixel, format } =
+            cap.object
+        else {
+            return ERR;
+        };
+        (proc.l4, phys_base, width, height, stride, bytes_per_pixel, format)
+    };
+
+    // Bytes the whole framebuffer spans, rounded up to a page.
+    let map_size = (height as u64) * (stride as u64) * (bpp as u64);
+    let span = (map_size + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
+    if span == 0 || va % FRAME_SIZE != 0 || va < USER_MAP_BASE {
+        return ERR;
+    }
+    let Some(end) = va.checked_add(span) else {
+        return ERR;
+    };
+    if end > USER_MAP_END {
+        return ERR;
+    }
+
+    // Validate the FbInfo destination (5 * u32 = 20 bytes) is mapped and
+    // user-accessible before the kernel writes it -- the same discipline `write`
+    // applies before touching any user pointer.
+    const FB_INFO_BYTES: u64 = 20;
+    let Some(info_last) = info_ptr.checked_add(FB_INFO_BYTES - 1) else {
+        return ERR;
+    };
+    {
+        let mut page = info_ptr & !(FRAME_SIZE - 1);
+        loop {
+            if !memory::user_accessible(l4, page) {
+                return ERR;
+            }
+            if page >= info_last & !(FRAME_SIZE - 1) {
+                break;
+            }
+            page += FRAME_SIZE;
+        }
+    }
+
+    // Map the framebuffer pages: writable, user-accessible, non-executable.
+    // Cacheable (no NO_CACHE), matching frame_map and the bootloader's own
+    // framebuffer mapping -- the GOP framebuffer is WB RAM under QEMU. A real-
+    // hardware port would want write-combining here (a later refinement).
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    {
+        let mut fa_guard = FRAME_ALLOC.lock();
+        let Some(fa) = fa_guard.as_mut() else {
+            return ERR;
+        };
+        let mut off = 0u64;
+        while off < span {
+            if memory::map_user_page(l4, fa, va + off, phys_base + off, flags).is_err() {
+                // Roll back the pages mapped before the failure; the page-table
+                // frames allocated stay until teardown frees the address space.
+                let mut back = 0u64;
+                while back < off {
+                    memory::unmap_user_page(l4, va + back);
+                    back += FRAME_SIZE;
+                }
+                return ERR;
+            }
+            off += FRAME_SIZE;
+        }
+    }
+
+    // Hand the geometry back. SAFETY: [info_ptr, info_ptr+20) was just verified
+    // mapped and user-accessible in the active address space; IF is masked and
+    // the CPU is single, so nothing can unmap it under us.
+    unsafe {
+        let p = info_ptr as *mut u32;
+        p.add(0).write_volatile(width);
+        p.add(1).write_volatile(height);
+        p.add(2).write_volatile(stride);
+        p.add(3).write_volatile(bpp as u32);
+        p.add(4).write_volatile(format as u32);
+    }
     0
 }
 

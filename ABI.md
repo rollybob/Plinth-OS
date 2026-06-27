@@ -1,4 +1,4 @@
-# Plinth ABI v2.6
+# Plinth ABI v2.7
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -124,6 +124,21 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   `block_write` to be backward-compatible with, unlike `block_read`'s v2.4
   retirement.
 
+### v2.7 (visual userspace -- the framebuffer as a capability)
+
+- **New: `Framebuffer` capability + `fb_map` syscall (nr 14).** A `Framebuffer`
+  capability names the UEFI GOP linear framebuffer the bootloader set up,
+  together with the geometry (width, height, stride, bytes-per-pixel, pixel
+  format) carried inline -- the same "secure binding over a raw resource" move as
+  `Frame`/`BlockRange`/`EventSource`, applied to pixels. `fb_map(slot, va,
+  info_ptr)` maps the whole region into the caller's address space at the
+  user-chosen `va` (the exokernel placement contract, like `frame_map`) and
+  writes the geometry to the `info_ptr` struct. `RIGHT_MAP` gates the map; a
+  non-`Framebuffer` capability is refused on the kind check. The kernel
+  multiplexes the raw region and never touches a pixel -- fonts, layout, and
+  compositing are library-OS policy (`libgfx`), exactly as keymaps and on-disk
+  formats are. Purely additive: no existing call changed.
+
 ## Syscall interface
 
 The non-blocking calls use the `syscall`/`sysretq` instructions:
@@ -150,6 +165,7 @@ The non-blocking calls use the `syscall`/`sysretq` instructions:
 | 11 | spawn_from_buffer | buf_va, len, transfer | wait handle, or `SYS_ERR`   |
 | 12 | ring_register | sq_slot, cq_slot, entries | ring cap slot, or `SYS_ERR` |
 | 13 | ring_submit  | ring                  | entries consumed, or `SYS_ERR`   |
+| 14 | fb_map       | slot, va, info_ptr    | 0, or `SYS_ERR`                  |
 
 (Nr 10, `block_read`, was retired in v2.3 -- moved to the `int 0x80` gate --
 and that gate op was itself retired in v2.4: block I/O is the ring ABI. The
@@ -201,6 +217,17 @@ Notes:
   channel, `ENDPOINT_SLOT` send capability, `transfer`, and the returned wait
   handle all behave exactly as for `spawn`. Embedded `spawn`-by-id is not
   retired -- it remains the built-in bootstrap loader.
+- **fb_map(slot, va, info_ptr)** maps the framebuffer named by the `Framebuffer`
+  capability at `slot` into the caller's address space, contiguously from the
+  page-aligned `va` (which, with the whole region, must lie in the Map window),
+  and writes the geometry to `info_ptr` -- five `u32`s in order: width, height,
+  stride (pixels per row), bytes-per-pixel, and pixel format (0=rgb, 1=bgr,
+  2=u8, 3=other). The `[info_ptr, info_ptr+20)` range must be mapped and
+  user-accessible. Returns 0, or `SYS_ERR` for a bad slot, a non-`Framebuffer`
+  capability, a missing `RIGHT_MAP`, or a `va`/geometry that does not fit the Map
+  window. The user chooses `va`, the exokernel placement contract; the kernel
+  multiplexes the raw pixel region and does no drawing. `libgfx::Framebuffer::map`
+  wraps this with a typed `FbInfo`.
 
 ## IPC interface
 
@@ -380,6 +407,7 @@ index into a per-process table; the records never leave the kernel. Kinds:
 | BlockRange | `count` sectors on a device      | `READ`, `WRITE`            |
 | EventSource | one input device's event stream | `READ`                     |
 | Ring       | a bound SQ/CQ pair (block I/O + input) | `READ`, `WRITE`      |
+| Framebuffer | the linear framebuffer (a pixel region + geometry) | `MAP`, `WRITE` |
 
 Rights are checked at use, not at transfer. `Reply` capabilities are minted by
 the kernel (on receiving a `call`) and consumed on use; you cannot create one. A
@@ -391,7 +419,13 @@ reach each other's blocks, and a range on one disk cannot read another. An
 `EventSource` names one input device (id 0 = keyboard); a holder reads only the
 source it was granted, never another. A `Ring` is minted by `ring_register` over
 a caller-owned SQ/CQ frame pair and bound to that process: it cannot be submitted
-or waited on by anyone else, and it is released when the process exits.
+or waited on by anyone else, and it is released when the process exits. A
+`Framebuffer` names the linear framebuffer's pixel region plus its geometry; the
+holder maps it with `fb_map` (`RIGHT_MAP`) and draws into the mapped pixels
+itself -- the kernel never interprets them. v1 grants the whole screen; a
+sub-region grant (a smaller rect over the same screen) is the display analogue of
+disjoint `BlockRange`s, so two graphics library OSes can be handed
+non-overlapping regions that cannot reach each other's pixels.
 
 ### Well-known initial capabilities
 
@@ -399,13 +433,14 @@ A few slots are well-known, the way file descriptor 0 is on Unix:
 
 - `CPU_CAP_SLOT = 0` -- the CPU-time budget minted for every process. Pass it
   to `cpu_charge`.
-- `GRANT_SLOT = ENDPOINT_SLOT = BLOCK_SLOT = EVENT_SOURCE_SLOT = 1` -- the first
-  capability the kernel grants a process after its CPU budget. For a spawned child
-  this is the **send** capability on its parent's result channel (use it to report
-  a result); for a process the kernel launches with an endpoint, it is that
-  endpoint capability; for one launched with disk access, a `BlockRange`; for one
-  launched with input, an `EventSource`. A capability moved in via `spawn`'s
-  `transfer` argument lands in the next slot after this one.
+- `GRANT_SLOT = ENDPOINT_SLOT = BLOCK_SLOT = EVENT_SOURCE_SLOT = FB_SLOT = 1` --
+  the first capability the kernel grants a process after its CPU budget. For a
+  spawned child this is the **send** capability on its parent's result channel
+  (use it to report a result); for a process the kernel launches with an endpoint,
+  it is that endpoint capability; for one launched with disk access, a
+  `BlockRange`; for one launched with input, an `EventSource`; for a graphics
+  process, a `Framebuffer`. A capability moved in via `spawn`'s `transfer`
+  argument lands in the next slot after this one.
 
 All other slots start empty.
 

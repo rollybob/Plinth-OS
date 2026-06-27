@@ -21,6 +21,7 @@
 //! | 11 | spawn_buf   | buf_va, len, slot| wait handle, or SYS_ERR |
 //! | 12 | ring_register | sq_slot, cq_slot, entries | ring cap slot, or ERR |
 //! | 13 | ring_submit | ring         | count posted, or SYS_ERR |
+//! | 14 | fb_map      | slot, va, info_ptr | 0, or SYS_ERR       |
 //!
 //! Block I/O is the async-ring ABI (nr 12/13 + `ring_wait` on the `int 0x80`
 //! gate, op 6); `sys_block_read` is a single-in-flight shim over it. The old
@@ -63,6 +64,20 @@ pub const BLOCK_SLOT: u64 = 1;
 /// process lands here too -- the same first-grant slot as the others. Pass it
 /// to sys_event_recv.
 pub const EVENT_SOURCE_SLOT: u64 = 1;
+
+/// A Framebuffer capability the kernel grants a scheduler-launched graphics
+/// process lands here too -- the same first-grant slot as the others. Pass it
+/// to sys_fb_map (or libgfx's Framebuffer::map).
+pub const FB_SLOT: u64 = 1;
+
+/// Pixel-format codes the kernel writes into the FbInfo `format` field at
+/// sys_fb_map time (mirrors the kernel's framebuffer.rs FMT_*). A graphics
+/// library OS uses these to pick the channel order; the kernel never touches a
+/// pixel itself.
+pub const FB_FMT_RGB: u32 = 0;
+pub const FB_FMT_BGR: u32 = 1;
+pub const FB_FMT_U8: u32 = 2;
+pub const FB_FMT_OTHER: u32 = 3;
 
 /// Demand-paged window. A not-present access here, once the process has
 /// registered a fault handler (sys_fault_reg), is delivered to that handler
@@ -135,6 +150,18 @@ pub fn sys_frame_map(slot: u64, va: u64) -> u64 {
 #[inline]
 pub fn sys_frame_free(slot: u64) -> u64 {
     syscall3(5, slot, 0, 0)
+}
+
+/// Map the framebuffer named by the capability at `slot` into this address space
+/// at the page-aligned `va` (inside [MAP_BASE, MAP_END), with room for the whole
+/// region), and have the kernel write the geometry to `info_ptr`: five u32s in
+/// order -- width, height, stride (pixels/row), bytes_per_pixel, format (FB_FMT_*).
+/// Returns 0, or SYS_ERR (bad slot, not a Framebuffer capability, missing
+/// RIGHT_MAP, or `va`/geometry out of range). `libgfx::Framebuffer::map` wraps
+/// this with a typed FbInfo; most callers use that rather than calling here.
+#[inline]
+pub fn sys_fb_map(slot: u64, va: u64, info_ptr: u64) -> u64 {
+    syscall3(14, slot, va, info_ptr)
 }
 
 /// Charge `amount` CPU ticks against the CpuTime capability at `slot`

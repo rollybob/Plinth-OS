@@ -31,7 +31,11 @@ Interrupts run through the Local APIC + I/O APIC (MSI-X for the disk, a
 per-CPU LAPIC timer), and the kernel boots and schedules on every CPU the
 ACPI MADT reports, serialized by a single big kernel lock; scheduling uses
 per-core run queues with bounded work stealing (an idle core steals a ready
-process from a busy one). No network yet, and the single lock is
+process from a busy one). The UEFI GOP linear framebuffer is multiplexed by a
+`Framebuffer` capability: a graphics library OS (`libgfx`) maps it and does all
+the drawing -- pixels, an 8x8 font, text -- in unprivileged code, and the screen
+can be split into disjoint horizontal bands handed to separate graphics libOSes,
+each confined to its rows by paging. No network yet, and the single lock is
 intentionally left whole -- a benchmark showed it only contends near 100%
 kernel residency, so splitting it earns nothing real workloads would feel.
 See the [README](README.md) for the full demo.
@@ -116,6 +120,20 @@ against the cost to determinism rather than taken for granted.
   FAT libOS. A `rwfs-user` demo proves the bitmap actually reclaims freed
   space, not just hides it: a file created after a delete lands at the exact
   sector the deleted file held.
+- [x] **Visual userspace.** The UEFI GOP linear framebuffer the `bootloader`
+  crate already maps -- no GPU driver -- multiplexed by a `Framebuffer`
+  capability and an `fb_map` syscall (ABI v2.7). The kernel only discovers the
+  framebuffer and hands it out; all drawing is library-OS policy in a clean-room
+  `libgfx` (a pixel writer, an 8x8 bitmap font + `draw_text`, a deterministic
+  frame hash), exactly as the kernel ships raw scancodes and owns no keymap. The
+  pixel boundary stays testable by hashing a fixed sub-rectangle to serial (the
+  smoke pins `-vga std` headless). The multiplexing payoff: the screen splits
+  into disjoint horizontal **bands**, one granted to each of two concurrent
+  graphics libOSes, confined to their rows by paging -- and a band holder that
+  writes past its grant is `#PF`-terminated (the display analogue of disjoint
+  `BlockRange`s). A `gfxtext-user` demo also echoes a keyboard line on-screen,
+  joining the framebuffer and the keyboard `EventSource` in one libOS
+  (Design/display.md).
 - **Broader hardware.** SMP and real-machine device support, each taken on its
   own merits. Split into stages, because adding a second CPU ends the
   single-core invariant the no-lock kernel rested on -- a concurrency redesign,
@@ -153,13 +171,14 @@ against the cost to determinism rather than taken for granted.
 
 ## Stability
 
-The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.6**.
+The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.7**.
 v2 added IPC and revised `spawn`, the one incompatible change from v1 (made
 while Phase 2 is still pre-release); v2.1 (`spawn_from_buffer`), v2.2
 (console input), v2.3 (`block_read` moved to the blocking gate), v2.4
 (async completion rings, retiring `block_read`), v2.5 (input as multishot
-ring subscriptions, retiring `event_recv`), and v2.6 (`RING_OP_WRITE`, the
-write half of the block ring ABI) are all additive over v2 but for the two
+ring subscriptions, retiring `event_recv`), v2.6 (`RING_OP_WRITE`, the
+write half of the block ring ABI), and v2.7 (the `Framebuffer` capability +
+the `fb_map` syscall) are all additive over v2 but for the two
 retired-and-shimmed ops. Within a major series, new capabilities are added
 without breaking existing programs. Anything not in ABI.md is an implementation
 detail and may move.
