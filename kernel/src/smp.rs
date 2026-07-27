@@ -470,7 +470,7 @@ pub fn start_aps<W: Write>(out: &mut W, topology: Option<&acpi::Topology>, phys_
 
         if read_status(phys_offset) == STATUS_ALIVE {
             online += 1;
-            irq::mark_ap_online(core_id, apic_id);
+            irq::mark_core_online(core_id, apic_id);
             let _ = writeln!(out, "plinth:   smp: apic id {apic_id} online");
         } else {
             let _ = writeln!(out, "plinth:   smp: apic id {apic_id} did not respond");

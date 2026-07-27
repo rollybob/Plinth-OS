@@ -87,26 +87,63 @@ static APIC_MODE: AtomicBool = AtomicBool::new(false);
 static LAPIC_VA: AtomicU64 = AtomicU64::new(0);
 /// The I/O APIC programming state, set at init and read by `unmask`/`mask`.
 static IOAPIC: Mutex<Option<IoApicState>> = Mutex::new(None);
-/// Physical APIC id of each AP that reported alive (`smp::start_aps`), indexed
-/// by its dense core id; `None` for a core id never brought up. Lets
-/// `send_reschedule_ipi` target each online AP individually instead of the
-/// "all excluding self" destination shorthand (Stage B2.3: that shorthand,
-/// under repeated back-to-back sends with 2+ APs online, was implicated in a
-/// real crash found by booting under PLINTH_SMP=3/4 -- never reproduced with
-/// it removed, and not reproduced since switching to per-target sends either).
+/// Physical APIC id of each online core, indexed by its dense core id; `None`
+/// for a core id never brought up. Lets `send_reschedule_ipi` target each one
+/// individually instead of the "all excluding self" destination shorthand
+/// (Stage B2.3: that shorthand, under repeated back-to-back sends with 2+ APs
+/// online, was implicated in a real crash found by booting under
+/// PLINTH_SMP=3/4 -- never reproduced with it removed, and not reproduced
+/// since switching to per-target sends either).
+///
+/// **This array holds EVERY online core, the BSP included.** It used to hold
+/// only APs: `send_reschedule_ipi` iterates it, so the BSP was never an IPI
+/// target, and an AP that woke a BSP-homed process could not poke the BSP to
+/// go look. The "all excluding self" shorthand this replaced *did* reach the
+/// BSP, so the B2.3 fix silently dropped it. Waking every AP is not waking
+/// every core.
+///
+/// This is a **latency** defect, not a deadlock, and the distinction cost a
+/// session to establish (Sessions/07-27-2026.md). Every core arms its own
+/// periodic LAPIC timer (`timer::arm`/`arm_ap`) and every idle path halts via
+/// `sti; hlt` with the BKL released, so an un-IPI'd core still wakes on its
+/// own next tick and re-checks. The cost of being absent here is therefore up
+/// to one tick period (10 ms at 100 Hz) of added wake latency -- never a hang.
+///
+/// Do not re-derive a deadlock from this. The intermittent `-smp` hang that
+/// was originally blamed on it (Sessions/07-26-2026.md section 5) was
+/// `idle_until_runnable` having no return path; the BSP was awake and looping
+/// the whole time, not waiting for an IPI. Fixed in `scheduler.rs`.
 static ONLINE_APIC_IDS: Mutex<[Option<u8>; percpu::MAX_CORES]> = Mutex::new([None; percpu::MAX_CORES]);
 
 /// Record that `core_id` is alive at `apic_id`, so `send_reschedule_ipi` can
-/// target it. Call once, from `smp::start_aps`, right after an AP reports in.
-pub fn mark_ap_online(core_id: usize, apic_id: u8) {
+/// target it. Called for the BSP from `init` (once the LAPIC is up and its id
+/// is known) and for each AP from `smp::start_aps` as it reports in.
+///
+/// Every core that can run a process should be registered here. A core missing
+/// from this array cannot be woken out of `hlt` by a peer's IPI -- it still
+/// wakes on its own periodic timer tick, so the cost is latency, not progress
+/// (see `ONLINE_APIC_IDS`).
+pub fn mark_core_online(core_id: usize, apic_id: u8) {
     ONLINE_APIC_IDS.lock()[core_id] = Some(apic_id);
 }
 
 /// Is `core_id` actually up and able to run a process? Core 0 (the BSP) always
-/// is; an AP is once `mark_ap_online` has recorded it. Used by the scheduler's
-/// home-core assignment (`Design/smp_scaling.md` S1: a real per-core array,
-/// placed at setup/spawn time) so a newly created process is never homed to a
-/// core that never came up under this boot's `-smp` count.
+/// is; any other core is once `mark_core_online` has recorded it. Used by the
+/// scheduler's home-core assignment (`Design/smp_scaling.md` S1: a real
+/// per-core array, placed at setup/spawn time) so a newly created process is
+/// never homed to a core that never came up under this boot's `-smp` count.
+///
+/// **The BSP special-case must stay**, even though `init` now registers the BSP
+/// in `ONLINE_APIC_IDS` for IPI purposes. In the PIC fallback (no MADT) `init`
+/// returns before it can register anything, and `scheduler::next_home_core`
+/// loops until it finds an online core -- its termination argument is exactly
+/// "core 0 is online from boot". Making this a plain array lookup would spin
+/// that loop forever on any machine without a MADT.
+///
+/// So the two consumers of `ONLINE_APIC_IDS` deliberately differ: this one
+/// answers "can a process live here", which is true of the BSP unconditionally;
+/// `send_reschedule_ipi` answers "who must I physically poke", which needs a
+/// real APIC id and is a no-op without a LAPIC anyway.
 pub fn is_core_online(core_id: usize) -> bool {
     core_id == percpu::BSP_CORE_ID || ONLINE_APIC_IDS.lock()[core_id].is_some()
 }
@@ -154,6 +191,11 @@ pub fn init(topo: Option<&acpi::Topology>) {
         isos: t.isos,
         iso_count: t.iso_count,
     });
+    // Register the BSP alongside the APs that will report in later. Without
+    // this the BSP is not an IPI target, so an AP that wakes a BSP-homed
+    // process cannot nudge the BSP out of `hlt` and the boot deadlocks with
+    // every core halted (see ONLINE_APIC_IDS).
+    mark_core_online(percpu::BSP_CORE_ID, bsp_id);
     APIC_MODE.store(true, Ordering::Relaxed);
 }
 
@@ -385,7 +427,18 @@ pub fn send_reschedule_ipi() {
         return; // no MADT / no LAPIC -- nothing to IPI, and no AP woke either
     };
     let targets = *ONLINE_APIC_IDS.lock();
-    for apic_id in targets.into_iter().flatten() {
+    // Skip self: the caller is by definition running, not halted, and will
+    // re-check its own queue on its own. Sending to self would only cost a
+    // spurious reschedule interrupt on the way out. (This replaces what the
+    // retired "all excluding self" shorthand did in hardware.)
+    // SAFETY: percpu::init has run on every core that can reach this -- the
+    // BSP before irq::init, each AP before it enters the scheduler.
+    let me = unsafe { percpu::core_id() };
+    for (core_id, apic_id) in targets.into_iter().enumerate() {
+        let Some(apic_id) = apic_id else { continue };
+        if core_id == me {
+            continue;
+        }
         let dest = (apic_id as u32) << 24;
         // SAFETY: `va` came from `lapic_base()`, so the APIC is up; `dest`
         // names a specific physical APIC id this function's own caller
