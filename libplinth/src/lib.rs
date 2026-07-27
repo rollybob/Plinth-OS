@@ -36,6 +36,16 @@
 /// Error return shared by all syscalls.
 pub const SYS_ERR: u64 = u64::MAX;
 
+/// The ABI version this libplinth speaks, as a display string.
+///
+/// Bump it with the ABI itself (`ABI.md`'s title, `CHANGELOG.md`, and the
+/// release tag all carry the same number -- this project's tags *are* its ABI
+/// versions). Anything that shows a version to a user reads it from here, so a
+/// version on screen cannot drift from the contract the binary was built
+/// against. It drifted exactly once, when the shell splash kept saying 2.7
+/// through the v2.8 bump.
+pub const ABI_VERSION: &[u8] = b"2.8";
+
 /// frame_map only accepts virtual addresses in [MAP_BASE, MAP_END),
 /// page-aligned. Mirrors the kernel's user mapping window.
 pub const MAP_BASE: u64 = 0x1000_0000;

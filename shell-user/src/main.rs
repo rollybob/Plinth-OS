@@ -19,8 +19,8 @@
 use libgfx::{text_width, Framebuffer};
 use libinput::{read_key, Key, Keymap};
 use libplinth::{
-    sys_cap_release, sys_exit, sys_recv_cap, sys_spawn, sys_write, write_hex, FB_SLOT, IPC_OK,
-    MAP_BASE, NO_CAP, SYS_ERR,
+    sys_cap_release, sys_exit, sys_recv_cap, sys_spawn, sys_write, write_hex, ABI_VERSION, FB_SLOT,
+    IPC_OK, MAP_BASE, NO_CAP, SYS_ERR,
 };
 
 /// The keyboard EventSource lands in the slot after the framebuffer (a single-
@@ -44,7 +44,16 @@ fn draw_splash(fb: &Framebuffer) {
     let info = fb.info();
     fb.fill_rect(0, 0, info.width, info.height, BG.0, BG.1, BG.2);
     fb.draw_text_centered(info.width / 2, info.height / 2 - 30, b"PLINTH", FG, BG, 6);
-    fb.draw_text_centered(info.width / 2, info.height / 2 + 36, b"VERSION 2.7", FG, BG, 2);
+    // "VERSION " + libplinth's ABI_VERSION, assembled on the stack -- no_std has
+    // no format!. Read from libplinth rather than written out here so the splash
+    // cannot fall behind the ABI again, as it did through the v2.8 bump.
+    const PREFIX: &[u8] = b"VERSION ";
+    let mut banner = [0u8; 24];
+    let n = PREFIX.len() + ABI_VERSION.len();
+    banner[..PREFIX.len()].copy_from_slice(PREFIX);
+    banner[PREFIX.len()..n].copy_from_slice(ABI_VERSION);
+    // Well below the hashed top-left square, so the splash hash is unaffected.
+    fb.draw_text_centered(info.width / 2, info.height / 2 + 36, &banner[..n], FG, BG, 2);
 }
 
 /// Rectangle (x, y, w, h) of icon `idx` in a 2x2 grid centered on screen.
@@ -61,6 +70,41 @@ fn icon_rect(w: u32, h: u32, idx: usize) -> (u32, u32, u32, u32) {
     (ox + col * (iw + gap), oy + row * (ih + gap), iw, ih)
 }
 
+/// Paint one icon cell: the box, its border, and its label.
+///
+/// The cell is refilled before the border is drawn, and `draw_border` paints
+/// just *inside* the rectangle, so a previously-thicker selection border is
+/// fully erased. That makes this pixel-identical to what `draw_home` draws for
+/// the same icon -- which is what lets a selection move repaint two cells
+/// instead of the whole screen.
+fn draw_icon(fb: &Framebuffer, sw: u32, sh: u32, idx: usize, selected: bool) {
+    let (x, y, w, h) = icon_rect(sw, sh, idx);
+    fb.fill_rect(x, y, w, h, BAR.0, BAR.1, BAR.2);
+    let (border, t) = if selected { (SEL_BORDER, 4) } else { (ICON_BORDER, 2) };
+    fb.draw_border(x, y, w, h, t, border.0, border.1, border.2);
+    let label = ICON_LABELS[idx];
+    let lw = text_width(label, 3);
+    fb.draw_text(x + (w - lw) / 2, y + h / 2 - 12, label, FG, BAR, 3);
+}
+
+/// Move the selection highlight by repainting only the two cells whose borders
+/// change.
+///
+/// A full `draw_home` here would clear the entire screen and repaint it on every
+/// arrow press. There is no back buffer -- drawing goes straight to the scanned-
+/// out framebuffer -- so that full-screen clear is visible as a flash. The icons
+/// are disjoint from each other, from the title bar, and from the bottom hint,
+/// so repainting just these two cells leaves the screen in exactly the state a
+/// full `draw_home` would have produced.
+fn move_selection(fb: &Framebuffer, prev: usize, sel: usize) {
+    if prev == sel {
+        return;
+    }
+    let info = fb.info();
+    draw_icon(fb, info.width, info.height, prev, false);
+    draw_icon(fb, info.width, info.height, sel, true);
+}
+
 fn draw_home(fb: &Framebuffer, sel: usize) {
     let info = fb.info();
     fb.fill_rect(0, 0, info.width, info.height, BG.0, BG.1, BG.2);
@@ -69,13 +113,7 @@ fn draw_home(fb: &Framebuffer, sel: usize) {
     fb.draw_text(8, 8, b"PLINTH HOME", FG, BAR, 3);
     let mut i = 0;
     while i < 4 {
-        let (x, y, w, h) = icon_rect(info.width, info.height, i);
-        fb.fill_rect(x, y, w, h, BAR.0, BAR.1, BAR.2);
-        let (border, t) = if i == sel { (SEL_BORDER, 4) } else { (ICON_BORDER, 2) };
-        fb.draw_border(x, y, w, h, t, border.0, border.1, border.2);
-        let label = ICON_LABELS[i];
-        let lw = text_width(label, 3);
-        fb.draw_text(x + (w - lw) / 2, y + h / 2 - 12, label, FG, BAR, 3);
+        draw_icon(fb, info.width, info.height, i, i == sel);
         i += 1;
     }
     // Controls hint along the bottom. It sits well below the hashed top-left
@@ -136,12 +174,14 @@ pub extern "C" fn _start(_idx: u64) -> ! {
         match read_key(KBD_SLOT, &mut keymap) {
             // 2x2 grid: up/down toggle the row, left/right toggle the column.
             Key::Up | Key::Down => {
+                let prev = sel;
                 sel ^= 2;
-                draw_home(&fb, sel);
+                move_selection(&fb, prev, sel);
             }
             Key::Left | Key::Right => {
+                let prev = sel;
                 sel ^= 1;
-                draw_home(&fb, sel);
+                move_selection(&fb, prev, sel);
             }
             Key::Enter => {
                 if sel == APP_ICON {
