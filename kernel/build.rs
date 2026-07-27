@@ -40,6 +40,19 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
 
+    // Debug-only single-demo filter. A boot runs ~23 demos in sequence, which
+    // makes bisecting a hang or a fault miserable; PLINTH_DEMO=<substring>
+    // builds a kernel that skips every demo whose label does not match, so one
+    // can be reproduced in isolation. Forwarded as a rustc-env so
+    // `option_env!` in scheduler.rs sees it, and rerun-if-env-changed so
+    // changing (or clearing) it actually rebuilds instead of serving a cached
+    // kernel with the previous filter compiled in -- the failure mode that
+    // would make this tool lie.
+    println!("cargo:rerun-if-env-changed=PLINTH_DEMO");
+    if let Ok(filter) = std::env::var("PLINTH_DEMO") {
+        println!("cargo:rustc-env=PLINTH_DEMO={filter}");
+    }
+
     let bench = std::env::var("CARGO_FEATURE_BENCH").is_ok();
     let binaries = USER_BINARIES
         .iter()

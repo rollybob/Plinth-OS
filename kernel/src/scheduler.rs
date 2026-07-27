@@ -708,11 +708,41 @@ unsafe fn fabricate_initial_frame(id: usize, entry: u64) -> u64 {
     base
 }
 
+/// Optional demo filter, set at build time by `PLINTH_DEMO=<list>` (see
+/// build.rs), where `<list>` is one or more comma-separated substrings --
+/// `steal` for one demo, `scheduler,ipc,steal` for a subset. `None` in every
+/// normal build, so this folds away entirely.
+///
+/// A list rather than a single name because the interesting failures are
+/// interactions: a demo that passes alone can still hang after some earlier
+/// demo has run, so bisecting needs to express a *prefix* of the boot, not one
+/// demo at a time.
+///
+/// Purely a debugging aid for bisecting a hang or a fault across a ~23-demo
+/// boot. Two things to keep in mind when reading a filtered run:
+///
+/// - A filtered boot does NOT match `expected_boot_log.txt`, so `smoke` will
+///   report a transcript mismatch. That is expected -- what a filtered run
+///   tells you is whether the kernel *reaches the end*, not whether the
+///   transcript is right.
+/// - A demo that passes in isolation is NOT cleared. A deadlock can depend on
+///   state an earlier demo left behind (a process still blocked, an endpoint
+///   refcount, a non-empty core queue), so isolation narrows the search; it
+///   does not exonerate.
+const DEMO_FILTER: Option<&str> = option_env!("PLINTH_DEMO");
+
 /// Launch each binary as an independent process and round-robin them under the
 /// timer until all have exited. Returns to the boot path when the last one
 /// exits. Per design D4 these are kernel-launched, independent processes; this
 /// does not use (or compose with) `spawn`.
 pub fn run(label: &str, binaries: &[&[u8]], phys_offset: u64, extra: &[Option<Capability>]) {
+    // Skipped before anything is claimed or launched, so a filtered-out demo
+    // leaves no trace in the scheduler at all.
+    if let Some(filter) = DEMO_FILTER {
+        if !filter.split(',').any(|want| label.contains(want.trim())) {
+            return;
+        }
+    }
     let mut serial = serial::init();
     let count = binaries.len().min(MAX_PROCESSES);
     let _ = writeln!(serial, "plinth: {label}: {count} processes");
