@@ -1041,7 +1041,14 @@ unsafe fn switch_to_next(cur_pos: usize, on_idle: NoWorkAction) -> ! {
                 crate::input::deliver_synthetic();
                 crate::input::deliver_synthetic_mouse();
             }
-            idle_until_runnable(); // never returns
+            // Returns once nothing is blocked on input or disk any more (the
+            // waiter it was idling for can be claimed, run and exited by
+            // another core). Re-check everything from the top rather than
+            // falling through: `first_claimable_slot` and the steal attempt
+            // above are both stale by now, and the table-empty branch below
+            // is only correct after they have been retried.
+            idle_until_runnable();
+            continue;
         }
 
         if table_entirely_empty() {
@@ -1114,13 +1121,18 @@ unsafe fn resume_process(next: usize) -> ! {
 /// disk I/O and nothing else runs: the keyboard IRQ delivers a real event
 /// (waking a reader), or the virtio completion IRQ wakes a process blocked on
 /// `block_read`; the Stage-2 synthetic keyboard injection is delivered by the
-/// caller before we get here. Never returns.
+/// caller before we get here.
+///
+/// Resumes a process directly (never returning) when one becomes claimable, or
+/// RETURNS to `switch_to_next` once nothing is waiting on input or disk any
+/// more -- see the comment on that check for the hang that made it necessary.
+/// It deliberately does not decide anything about launchers or an empty table;
+/// that lives in `switch_to_next` alone.
 ///
 /// # Safety
-/// The caller holds the BKL (D4) and no other locks; a process is blocked on
-/// input, so a wake is possible (otherwise this idles forever, which is
-/// correct -- the system is waiting for a keystroke).
-unsafe fn idle_until_runnable() -> ! {
+/// The caller holds the BKL (D4) and no other locks, and holds it again on
+/// return. A process is blocked on input or disk, so a wake is possible.
+unsafe fn idle_until_runnable() {
     let me = percpu::core_id() as u32;
     loop {
         // A delivery (synthetic, or a keyboard IRQ on a prior iteration) may have
@@ -1135,6 +1147,28 @@ unsafe fn idle_until_runnable() -> ! {
         // via a device IRQ), not on this core doing anything in particular.
         if let Some(stolen) = try_steal(me) {
             resume_process(stolen);
+        }
+        // The precondition that justified waiting here can evaporate while we
+        // are halted, and this core is not the one that resolves it: the
+        // waiter we entered for gets woken, is claimed (or stolen) by ANOTHER
+        // core, runs to completion and exits over there. This core then holds
+        // a wait for something that no longer exists -- and if it is the
+        // launcher, a `run()` that only it can return from.
+        //
+        // Hand the decision back to `switch_to_next` instead of deciding here.
+        // It already owns the launcher/AP/table-empty logic, and the S2 bug
+        // recorded at its steal call site is precisely what a second, private
+        // copy of that logic costs.
+        //
+        // Bug found by booting this (07-27): the BSP entered here while the
+        // shell demo's process was blocked on input, the AP stole that process
+        // and exited it, and the BSP idled forever against an empty table --
+        // `[idle] core 0 input table=EEEE in=0` on serial, timer alive,
+        // counter climbing, every core halted, QEMU at 0% CPU. It presented as
+        // a lost wakeup and is not one: no IPI is missing, the core is awake
+        // and simply had no way out of this function.
+        if !crate::input::any_waiter() && !crate::virtio_blk::any_waiter() {
+            return;
         }
         // BKL (D4): the lock must NOT be held while halted -- a device IRQ's
         // handler (keyboard_interrupt, blk_interrupt_*) needs to acquire it to
