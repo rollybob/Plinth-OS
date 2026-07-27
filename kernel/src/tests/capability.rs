@@ -2,7 +2,8 @@
 
 use super::TestCtx;
 use crate::capability::{
-    CapError, CapObject, CapTable, MAX_CAPS, RIGHT_CONSUME, RIGHT_MAP, RIGHT_READ, RIGHT_WRITE,
+    release_action, CapError, CapObject, CapTable, ReleaseAction, MAX_CAPS, RIGHT_CONSUME,
+    RIGHT_MAP, RIGHT_READ, RIGHT_WRITE,
 };
 use crate::test_assert;
 
@@ -180,6 +181,93 @@ pub fn event_source_rights(_ctx: &mut TestCtx) -> Result<(), &'static str> {
         table.lookup(slot, RIGHT_WRITE) == Err(CapError::RightsDenied),
         "write allowed by a read-only EventSource"
     );
+    Ok(())
+}
+
+/// The release policy (Design/cap_release.md D4): every capability kind maps to
+/// exactly one action, and the two callers -- `cap_release` and
+/// `process::teardown` -- both read it from here, so they cannot drift apart.
+///
+/// This is the whole of what the in-kernel harness can reach: `sys_cap_release`
+/// itself needs a current process and a live address space, so the syscall's
+/// end-to-end behaviour is proved by caprelease-user in the smoke instead.
+/// Guarding the decision here is what stops a future capability kind being
+/// added with a reclaim path at death and a leak on request.
+pub fn release_action_per_kind(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    test_assert!(
+        release_action(&CapObject::Frame { addr: 0x4000 })
+            == ReleaseAction::FreeFrame { addr: 0x4000 },
+        "a Frame must be returned to the allocator, at its own address"
+    );
+    test_assert!(
+        release_action(&CapObject::Ring { id: 2 }) == ReleaseAction::ReleaseRing { id: 2 },
+        "a Ring must release its kernel table slot, by its own id"
+    );
+    test_assert!(
+        release_action(&CapObject::Endpoint { id: 3 }) == ReleaseAction::DropEndpoint,
+        "an Endpoint must drop a reference so free-at-zero can fire"
+    );
+
+    // The kinds the D3b narrowing (2026-06-17) settled as owning nothing
+    // poolable. If a new one is added it must be classified deliberately,
+    // which is what this list is for.
+    for obj in [
+        CapObject::CpuTime { budget: 100 },
+        CapObject::BlockRange { dev: 0, start: 8, count: 4 },
+        CapObject::EventSource { id: 0 },
+        CapObject::Framebuffer {
+            phys_base: 0x8000_0000,
+            width: 1280,
+            height: 800,
+            stride: 1280,
+            bytes_per_pixel: 4,
+            format: 1,
+        },
+    ] {
+        test_assert!(
+            release_action(&obj) == ReleaseAction::DropSlot,
+            "a capability naming no pooled resource must just vacate its slot"
+        );
+    }
+    Ok(())
+}
+
+/// A Reply capability is the one kind release refuses (D3). It names a caller
+/// that is Blocked-awaiting-reply, and `capability.rs` leans on that -- "the
+/// caller cannot run or exit until replied" is why a Reply needs no generation
+/// counter. Releasing one would strand that caller forever, so `cap_release`
+/// returns an error and leaves the slot alone; a server that wants out replies,
+/// and a server that dies is handled by `ipc::reap_dying`.
+pub fn release_action_refuses_reply(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    test_assert!(
+        release_action(&CapObject::Reply { caller: 1 }) == ReleaseAction::Refuse,
+        "releasing a Reply was allowed -- it would strand the blocked caller"
+    );
+    Ok(())
+}
+
+/// The reuse property the whole fix exists for, at table level: a revoked slot
+/// is handed straight back out by the next mint, so a process that releases
+/// what it is done with can spawn indefinitely through a 16-slot table. The
+/// `revoke` test above already pins one round of this; here it is driven past
+/// the table size, which is the shape of the 2026-06-27 crash (the shell got
+/// roughly nine launches before the table filled).
+pub fn slot_reuse_past_table_size(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut table = CapTable::new();
+    // Occupy one slot permanently, the way a process holds its CPU budget.
+    table
+        .mint(CapObject::CpuTime { budget: 10 }, RIGHT_CONSUME)
+        .map_err(|_| "mint of the standing capability failed")?;
+
+    let mut round = 0usize;
+    while round < MAX_CAPS * 2 {
+        let slot = table
+            .mint(CapObject::Endpoint { id: round % 8 }, RIGHT_READ)
+            .map_err(|_| "mint failed -- the table filled, so a release did not free its slot")?;
+        test_assert!(slot != 0, "the standing capability's slot was handed out");
+        table.revoke(slot).map_err(|_| "revoke of a live slot failed")?;
+        round += 1;
+    }
     Ok(())
 }
 

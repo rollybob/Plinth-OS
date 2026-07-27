@@ -169,6 +169,19 @@ plinth: rpc demo: all done
 plinth: spawn demo: 1 processes
 plinth: spawn demo: all done
 
+# cap_release regression (Design/cap_release.md, ABI v2.8): a released capability
+# slot is genuinely reusable. 20 spawn -> join -> release round-trips through a
+# 16-slot capability table; a build that leaks the spent wait handle cannot get
+# past round ~15. The child (quietworker, SPAWNABLE id 4) is silent, so the whole
+# regression costs two asserted lines. The summary line ("caprelease: 20 spawn
+# round-trips, slots reused") is checked by xtask's check_caprelease rather than
+# asserted here -- same treatment as the spawn demo's parent output, since a
+# spawning parent's line can land either side of a child's scheduling. Frame AND
+# endpoint baselines bracket the demo: 20 result endpoints created and reclaimed
+# must leave both tables where they started.
+plinth: caprelease demo: 1 processes
+plinth: caprelease demo: all done
+
 # Work-stealing demo (SMP scaling S4, Design/smp_scaling.md section 6). The
 # parent spawns three CPU-bound workers back to back; all pile onto one core's
 # run queue while other cores idle; idle cores steal them. Two facts proved:
@@ -365,5 +378,40 @@ gfxbound: writing past my band
 plinth: [user fault] #PF
 plinth: terminating user process
 plinth: gfxbound demo: all done
+
+# Visual userspace skin (D8, Design/display_skin.md) -- the finale: a shell with a
+# splash, a home screen of app icons, and arrow-key navigation, all library-OS
+# policy over the whole-screen Framebuffer (slot 1) + the keyboard EventSource
+# (slot 2). A scripted scancode sequence drives it: select+open the BARS view,
+# back out, select APP, launch it TWICE. APP is a real spawned process (shellapp):
+# the shell hands it the framebuffer via spawn capability transfer; it draws,
+# hashes, and transfers the framebuffer BACK over the spawn result channel before
+# exiting (the display capability as transferable focus, shell -> app -> shell).
+# Each fixed frame's top-left square is hashed (the determinism gate); "back home"
+# hash equals "home" hash (same title bar), proving the shell redrew home
+# identically after getting the screen back. Frame counts bracket the demo.
+#
+# The SECOND launch is the regression guard (Design/cap_release.md D7). Both bugs
+# found on 2026-06-27 only appear on a relaunch: the framebuffer capability does
+# not come back to FB_SLOT (the shell must track where recv_cap landed it), and
+# the spent wait handle used to be unreleasable. Every line of the second launch
+# is identical to the first -- that sameness IS the assertion.
+plinth: shell demo: 1 processes
+shell: start
+shell: splash hash 0x549089847b362325
+shell: home hash 0x4b82ddae83e366a5
+shell: view hash 0x2a82b4e08a822325
+shell: launching app
+shellapp: start
+shellapp: framebuffer hash 0x41ff80e28d622325
+shellapp: returning the screen
+shell: back home hash 0x4b82ddae83e366a5
+shell: launching app
+shellapp: start
+shellapp: framebuffer hash 0x41ff80e28d622325
+shellapp: returning the screen
+shell: back home hash 0x4b82ddae83e366a5
+shell: quit
+plinth: shell demo: all done
 
 plinth: boot ok

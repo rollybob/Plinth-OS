@@ -28,8 +28,11 @@ fn main() {
 
     match subcmd {
         "build"   => { build_all(); }
-        "run"     => { let img = build_all(); run(&img, false); }
-        "run-gdb" => { let img = build_all(); run(&img, true); }
+        // `run`/`run-gdb` build the kernel with the `interactive` feature, so the
+        // shell waits for real keyboard input (drive the cursor yourself) instead
+        // of auto-playing its scripted tour. smoke/test/bench stay scripted.
+        "run"     => { let img = build_interactive(); run(&img, false); }
+        "run-gdb" => { let img = build_interactive(); run(&img, true); }
         "smoke"   => { let img = build_all(); smoke(&img); }
         "smoke-smp" => { let img = build_all(); smoke_smp(&img); }
         "bench"   => { let img = build_bench(); bench(&img); }
@@ -48,7 +51,7 @@ const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
     "share", "rpc", "faultchild", "blk", "asyncblk", "blkwrite", "fsdemo", "diskhello", "evt",
     "evtstream", "unified", "kbd", "mouse", "rwfs", "stealer", "stealwork", "gfx", "gfxtext",
-    "gfxsplit", "gfxbound", "template", "bench",
+    "gfxsplit", "gfxbound", "shell", "shellapp", "caprelease", "quietworker", "template", "bench",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -290,6 +293,39 @@ fn archive_image() -> PathBuf {
     path
 }
 
+/// Build the full userspace + the kernel with the `interactive` feature, into a
+/// separate image (so it never clobbers the smoke/run image). Used by `run`:
+/// the shell then waits for real keyboard input instead of its scripted tour.
+fn build_interactive() -> PathBuf {
+    for name in USER_CRATES {
+        build_user_crate(name);
+    }
+    archive_image();
+
+    let root = workspace_root();
+    let kernel_dir = root.join("kernel");
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(&cargo)
+        .current_dir(&kernel_dir)
+        .args(["build", "--features", "interactive"])
+        .status()
+        .expect("failed to invoke cargo for interactive kernel build");
+    assert!(status.success(), "interactive kernel build failed");
+
+    let kernel_bin = root.join("target/x86_64-unknown-none/debug/kernel");
+    let out_dir = root.join("target/disk-images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let uefi_path = out_dir.join("uefi-interactive.img");
+    bootloader::UefiBoot::new(&kernel_bin)
+        .create_disk_image(&uefi_path)
+        .unwrap();
+
+    println!("interactive disk image: {}", uefi_path.display());
+    uefi_path
+}
+
 /// Build the kernel and produce a UEFI-bootable disk image.
 fn build() -> PathBuf {
     let root = workspace_root();
@@ -322,10 +358,13 @@ fn build() -> PathBuf {
 }
 
 /// Compose the QEMU command line shared by run and smoke. `exit_on_debug` adds
-/// the isa-debug-exit device: the capture paths (smoke/test/bench) need it so the
-/// kernel can self-terminate QEMU and the harness can collect serial; the
-/// interactive `run` path omits it so the kernel halts after boot and the window
-/// stays open for inspection (the framebuffer's last frame remains on screen).
+/// the isa-debug-exit device, which lets the kernel terminate QEMU by writing to
+/// port 0xF4. Every path passes true as of 2026-07-25: the capture paths need it
+/// so the kernel self-terminates and the harness can collect serial, and `run`
+/// needs it so quitting the shell actually closes the window. The parameter is
+/// kept rather than inlined because omitting the device is exactly how you get a
+/// window that survives boot, if inspecting a final frame is ever worth more than
+/// a clean exit (it was, briefly -- see `run`).
 fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool) -> Command {
     let root = workspace_root();
 
@@ -369,9 +408,7 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool) -> Command {
 
     if exit_on_debug {
         // isa-debug-exit: the kernel writes N to port 0xF4 and QEMU exits with
-        // status (N << 1) | 1. Kernel success (N=0) -> exit code 1. Only the
-        // capture paths add it; `run` omits it so the kernel halts and the
-        // window stays open.
+        // status (N << 1) | 1. Kernel success (N=0) -> exit code 1.
         cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     }
 
@@ -460,17 +497,37 @@ fn wait_qemu(mut child: std::process::Child) -> i32 {
     }
 }
 
+/// Boot interactively: a real window, real keyboard, no captured serial.
+///
+/// The isa-debug-exit device IS attached here (2026-07-25, reversing Task 6 of
+/// 06-27, which omitted it so the window would survive boot for framebuffer
+/// inspection). On the `interactive` kernel build the shell waits for real
+/// keypresses, so the kernel does not reach `qemu_exit` until you press Q --
+/// meaning the device no longer cuts the session short, it just lets Q actually
+/// close the window instead of parking the kernel in a `hlt` loop that is
+/// indistinguishable from a hang. Inspecting a final frame is now a thing to add
+/// back deliberately if a log ever proves insufficient, rather than a permanent
+/// cost paid on every run.
+///
+/// No timeout: an interactive session lasts as long as you want it to.
 fn run(uefi_path: &Path, gdb: bool) {
-    // Interactive path: no isa-debug-exit device (build_qemu_cmd's last arg is
-    // false), so the kernel halts after boot instead of self-terminating, and
-    // the QEMU window stays open until you close it -- which is how you inspect
-    // the framebuffer (the last frame the visual demos drew remains on screen).
-    // No timeout: wait for you to close the window.
-    let mut child = build_qemu_cmd(uefi_path, gdb, false)
+    let mut child = build_qemu_cmd(uefi_path, gdb, true)
         .spawn()
         .expect("failed to launch qemu-system-x86_64");
-    eprintln!("QEMU window open -- close it to return to the shell.");
-    let _ = child.wait();
+    eprintln!("QEMU open -- press Q in the shell to exit, or close the window.");
+    // `wait`, not `wait_with_output`: serial is on inherited stdio (`-serial
+    // stdio`) so the log streams straight to this terminal; capturing it here
+    // would swallow it.
+    let status = child.wait().expect("failed to wait on qemu");
+    // isa-debug-exit reports (N << 1) | 1, so kernel Success -> 1, Failure -> 3.
+    // Closing the window by hand terminates QEMU normally -> 0.
+    match status.code() {
+        Some(0) => eprintln!("QEMU window closed."),
+        Some(1) => eprintln!("kernel exited cleanly."),
+        Some(3) => eprintln!("kernel exited reporting FAILURE (panic, or a failed suite)."),
+        Some(c) => eprintln!("QEMU exited with unexpected code: {c}"),
+        None => eprintln!("QEMU terminated by signal."),
+    }
 }
 
 /// Boot with captured stdout and return the serial output. A reader thread
@@ -571,6 +628,11 @@ const SPAWN_RESULT: u64 = 42;
 /// Workers the steal demo spawns; must match stealer-user's WORKERS. Each
 /// prints one `stealwork[id] done` line and the parent joins all of them.
 const STEAL_WORKERS: u64 = 3;
+
+/// Spawn round-trips the cap_release demo runs; must match caprelease-user's
+/// ROUNDS. It has to exceed the 16-slot capability table for the test to mean
+/// anything -- a build that leaks the spent wait handle dies partway through.
+const CAPRELEASE_ROUNDS: u64 = 20;
 
 /// Assert each scheduled process printed its own lines in program order.
 /// Under preemption the processes' lines interleave arbitrarily, but a single
@@ -811,6 +873,41 @@ fn check_reap(actual: &str) {
     }
 }
 
+/// Verify the cap_release regression (Design/cap_release.md): a released
+/// capability slot is reusable, so a process can spawn and join more times than
+/// its 16-slot capability table could ever hold handles at once.
+///
+/// The demo exits non-zero partway through if any round fails, so the summary
+/// line existing at all is most of the assertion; the round count is checked
+/// too, so a demo silently shortened below the table size cannot pass while
+/// proving nothing. This is the one check that would have caught the 2026-06-27
+/// crash -- the shell tour's single launch never came close to the limit.
+fn check_caprelease(actual: &str, rounds: u64) {
+    let marker = "caprelease: ";
+    let got = actual
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix(marker))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse::<u64>().ok());
+    match got {
+        Some(v) if v == rounds => {
+            println!("smoke: cap_release ok ({v} spawn round-trips through a 16-slot table)");
+        }
+        Some(v) => {
+            eprintln!("smoke: FAIL cap_release: {v} round-trips, expected {rounds}");
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!(
+                "smoke: FAIL cap_release: no summary line -- a round failed \
+                 (a leaked wait handle fills the table around round 15)"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Verify the work-stealing demo (S4, Design/smp_scaling.md section 6). Two
 /// facts: (1) every worker completed -- `workers` distinct `stealwork[id] done`
 /// lines AND the parent's `stealer: joined <workers> workers` line; (2) at
@@ -928,6 +1025,9 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     check_reap(&actual);
     check_frames_baseline(&actual, "spawn");
     check_endpoints_baseline(&actual, "spawn");
+    check_caprelease(&actual, CAPRELEASE_ROUNDS);
+    check_frames_baseline(&actual, "caprelease");
+    check_endpoints_baseline(&actual, "caprelease");
     check_steal(&actual, STEAL_WORKERS);
     check_frames_baseline(&actual, "steal");
     check_endpoints_baseline(&actual, "steal");
@@ -946,6 +1046,7 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     check_gfxsplit(&actual);
     check_frames_baseline(&actual, "gfxsplit");
     check_frames_baseline(&actual, "gfxbound");
+    check_frames_baseline(&actual, "shell");
 }
 
 /// Core counts `smoke-smp` boots under. 2 is the minimum that exercises any

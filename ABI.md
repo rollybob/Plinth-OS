@@ -1,4 +1,4 @@
-# Plinth ABI v2.7
+# Plinth ABI v2.8
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -139,6 +139,41 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   compositing are library-OS policy (`libgfx`), exactly as keymaps and on-disk
   formats are. Purely additive: no existing call changed.
 
+### v2.8 (giving a capability back)
+
+- **New: `cap_release` syscall (nr 15).** Releases the capability at a slot and
+  frees the slot for reuse. What "release" means follows the capability: a
+  `Frame` is unmapped and returned to the allocator, a `Ring` releases its
+  kernel table slot, an `Endpoint` drops a reference (and the endpoint is
+  reclaimed when the last one goes). The kinds that name no pooled resource --
+  `CpuTime`, `BlockRange`, `EventSource`, `Framebuffer` -- simply vacate the
+  slot. No rights are required: rights gate *use*, not removal.
+
+  A capability table is a fixed 16 slots with no heap behind it, so a slot is a
+  real resource. Until now the only way to empty one was `frame_free`, which
+  refused anything that was not a `Frame` -- so a capability a process was
+  legitimately *finished* with, above all a spawn wait handle after its join,
+  could not be given back at all. Any program that spawns repeatedly ran out of
+  table.
+
+- **Retired: `frame_free` (nr 5).** `cap_release` generalises it; releasing a
+  `Frame` does exactly what it did. The number is left unused, as nr 10 was.
+  `libplinth::sys_frame_free` remains as a wrapper, so programs that mean "free
+  this frame" can still say so. Note the generalisation gives up a small guard:
+  `frame_free` refused a non-frame slot, `cap_release` releases whatever is
+  there.
+
+- **`Reply` capabilities cannot be released.** `cap_release` on one returns
+  `SYS_ERR` and leaves it in place. A `Reply` names a caller that is blocked
+  awaiting it; dropping it would strand that caller forever. Reply, or exit --
+  a dying server's caller is woken with `IPC_PEER_DIED`.
+
+- **Releasing a `Framebuffer` surrenders authority, not access.** `fb_map`
+  mappings are not tracked per-capability (the region is ~1000 pages), so pixels
+  stay writable through an existing mapping after the capability is gone. This
+  is the same property a capability *transfer* already has. Do not use release
+  as a revocation.
+
 ## Syscall interface
 
 The non-blocking calls use the `syscall`/`sysretq` instructions:
@@ -157,7 +192,6 @@ The non-blocking calls use the `syscall`/`sysretq` instructions:
 | 2  | exit         | code                  | does not return                  |
 | 3  | frame_alloc  | --                    | capability slot, or `SYS_ERR`    |
 | 4  | frame_map    | slot, vaddr           | 0, or `SYS_ERR`                  |
-| 5  | frame_free   | slot                  | 0, or `SYS_ERR`                  |
 | 6  | cpu_charge   | slot, amount          | remaining budget, or terminates  |
 | 7  | fault_reg    | entry, stack_top      | 0, or `SYS_ERR`                  |
 | 8  | fault_return | --                    | resumes the faulting instruction |
@@ -166,10 +200,12 @@ The non-blocking calls use the `syscall`/`sysretq` instructions:
 | 12 | ring_register | sq_slot, cq_slot, entries | ring cap slot, or `SYS_ERR` |
 | 13 | ring_submit  | ring                  | entries consumed, or `SYS_ERR`   |
 | 14 | fb_map       | slot, va, info_ptr    | 0, or `SYS_ERR`                  |
+| 15 | cap_release  | slot                  | 0, or `SYS_ERR`                  |
 
 (Nr 10, `block_read`, was retired in v2.3 -- moved to the `int 0x80` gate --
 and that gate op was itself retired in v2.4: block I/O is the ring ABI. The
-blocking half, `ring_wait`, is on the gate -- see the IPC interface table.)
+blocking half, `ring_wait`, is on the gate -- see the IPC interface table.
+Nr 5, `frame_free`, was retired in v2.8 -- `cap_release` generalises it.)
 
 Notes:
 
@@ -184,8 +220,13 @@ Notes:
   page-aligned virtual address inside the map window (below). The kernel
   validates the capability, alignment, and window; placement is the
   program's choice. This is the core exokernel move.
-- **frame_free** unmaps (if mapped), revokes, and frees the frame at
-  `slot`. Aimed at a non-frame slot it fails without disturbing it.
+- **cap_release** gives the capability at `slot` back and frees the slot. A
+  `Frame` is unmapped and returned to the allocator; a `Ring` releases its
+  kernel table slot; an `Endpoint` drops a reference, and the endpoint itself is
+  reclaimed once the last capability to it is gone. Everything else just vacates
+  the slot. Returns `SYS_ERR` for a slot past the table, an empty slot, or a
+  `Reply` capability. A long-lived program that spawns must release its spent
+  wait handles: the table is 16 slots and does not grow.
 - **cpu_charge** debits `amount` ticks from the CPU-time capability at
   `slot` and returns the remaining budget. Charging more than remains is
   consuming a resource you no longer hold: the kernel terminates the

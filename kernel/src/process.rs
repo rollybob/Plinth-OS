@@ -370,23 +370,39 @@ pub fn teardown(mut proc: Process, boot_frames: &[Option<(u64, u64)>]) {
         memory::unmap_user_page(l4, *va);
     }
     proc.caps.drain(|cap| {
-        // Only Frame capabilities own a poolable resource. A CpuTime
-        // budget (spent or not) has nothing to return -- dropping the slot
-        // is the whole of its teardown.
-        if let CapObject::Frame { addr } = cap.object {
-            let _ = fa.dealloc(addr);
+        // The same per-kind release policy `cap_release` runs, from the one
+        // shared decision function -- so a new capability kind cannot be
+        // reclaimed correctly at death and leak on request, or vice versa
+        // (Design/cap_release.md D4).
+        match crate::capability::release_action(&cap.object) {
+            // Frame capabilities are the only kind that owns a poolable
+            // resource. The mappings were already torn down by the loop above.
+            crate::capability::ReleaseAction::FreeFrame { addr } => {
+                let _ = fa.dealloc(addr);
+            }
+            // A ring capability leaving permanently: release its kernel table
+            // slot. The SQ/CQ frames are ordinary Frame caps, reclaimed above.
+            crate::capability::ReleaseAction::ReleaseRing { id } => {
+                crate::rings::release(id);
+            }
+            // An endpoint capability leaving permanently: drop its reference
+            // and free the endpoint slot if this was the last one able to
+            // reach it. Teardown and cap_release are the only two
+            // permanent-removal sites, so the only places the free-at-zero
+            // check runs (transfers pass false; see ipc::note_cap_*).
+            crate::capability::ReleaseAction::DropEndpoint => {
+                crate::ipc::note_cap_removed(&cap, true);
+            }
+            // Nothing pooled: a CpuTime budget (spent or not) has nothing to
+            // return, and the inline kinds name no allocation.
+            crate::capability::ReleaseAction::DropSlot => {}
+            // `Refuse` exists to stop a *live* process stranding a caller by
+            // releasing an unconsumed Reply. At death that caller has already
+            // been woken with IPC_PEER_DIED by `ipc::reap_dying`, which runs
+            // before teardown (hardening D5), so here the slot just goes --
+            // refusing would mean never freeing the table.
+            crate::capability::ReleaseAction::Refuse => {}
         }
-        // A ring capability leaving permanently: release its kernel table slot.
-        // The SQ/CQ frames are ordinary Frame caps, reclaimed by the arm above.
-        if let CapObject::Ring { id } = cap.object {
-            crate::rings::release(id);
-        }
-        // An endpoint capability leaving permanently: drop its reference and
-        // free the endpoint slot if this was the last one able to reach it.
-        // This is the single permanent-removal site, so the only place the
-        // free-at-zero check runs (transfers pass false; see ipc::note_cap_*).
-        // A no-op for every non-endpoint capability.
-        crate::ipc::note_cap_removed(&cap, true);
     });
     for (va, phys) in boot_frames.iter().flatten() {
         memory::unmap_user_page(l4, *va);

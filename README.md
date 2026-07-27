@@ -219,6 +219,17 @@ grant, is killed by the kernel's page fault. Disjoint regions of one screen are
 handed to mutually isolated tenants, the display analogue of disjoint
 `BlockRange`s -- and the guarantee is structural, not a cooperative clip.
 
+**And on top of all of it, a shell.** shell-demo is the skin: a splash, a home
+screen of app icons, and a selection cursor you move with the arrow keys -- all
+unprivileged policy over the framebuffer and keyboard capabilities (the keymap
+even decodes the arrows' extended scancodes in `libinput`, the kernel still
+shipping only raw bytes). Selecting the app icon makes the shell `spawn` a real
+process and hand it the framebuffer capability; the app draws, then transfers the
+capability *back* over the spawn channel before exiting, and the shell returns to
+the home screen. The display capability moves shell -> app -> shell -- a focus
+handoff built from the same `spawn` + IPC capability transfer the earlier demos
+used, with the kernel never drawing a pixel or knowing what an "icon" is.
+
 ## Why exokernels
 
 A conventional kernel bundles mechanism (multiplexing hardware safely) with
@@ -271,8 +282,8 @@ Plinth implements the minimum machinery that makes the argument concrete:
   ======+======+============+=============+============+======+======
   syscall/sysret  |              int 0x80 gate              |
    write exit      | send recv call reply ring_wait
-   frame_alloc/map/free cpu_charge fault_reg/return spawn spawn_from_buffer
-   ring_register ring_submit
+   frame_alloc/map cap_release cpu_charge fault_reg/return spawn
+   spawn_from_buffer ring_register ring_submit fb_map
   +----------------------------------------------------------------+
   |                        plinth kernel                           |
   |  capabilities | frames | CPU budgets | endpoints | block ranges|
@@ -336,8 +347,9 @@ libfs/       a read-only boot-archive parser -- the filesystem as a libOS
 librwfs/     a bitmap allocator + mutable directory -- a second, writable
              filesystem as a libOS, over the same block ring ABI
 libinput/    a Set-1 keymap (with shift) and line reader -- input as a libOS
-libgfx/      a framebuffer writer, an 8x8 bitmap font + draw_text -- graphics
-             (rendering) as a libOS over the Framebuffer capability
+libgfx/      a framebuffer writer, an 8x8 bitmap font + draw_text, text
+             centering + a border primitive -- graphics (rendering) as a libOS
+             over the Framebuffer capability
 demo-app/    the shared allocator workload, generic over the memory policy
 
 user programs (ring 3, each its own crate):
@@ -367,6 +379,10 @@ user programs (ring 3, each its own crate):
   gfxtext-user/  draw a title + echo a keyboard line on-screen (libgfx + libinput)
   gfxsplit-user/ two libOSes each draw a disjoint screen band (run as two procs)
   gfxbound-user/ write past a band's grant -> kernel page-faults it (the boundary)
+  shell-user/    the skin: splash + a home screen of app icons + arrow-key nav
+  shellapp-user/ an app the shell spawns + hands the screen to, then gets back
+  caprelease-user/  20 spawn/join/release round-trips through a 16-slot table
+  quietworker-user/ a silent worker for the loop above (grantee without output)
   faultchild-user/  a child that faults, for liveness testing
   template-user/    minimal skeleton to copy for a new program (see GUIDE.md)
 xtask/       build orchestration: user binaries, disk images, QEMU,
@@ -493,7 +509,7 @@ your line through `libinput`.
 
 Plinth runs your code in ring 3 over a stable syscall interface.
 [ABI.md](ABI.md) is the contract -- syscalls, the IPC and device gate, the
-executable format, and entry state, versioned as **v2.6** -- and
+executable format, and entry state, versioned as **v2.8** -- and
 [GUIDE.md](GUIDE.md) is the walkthrough: copy `template-user/` to start a
 program, and see how memory policy goes in a library OS rather than the
 kernel. Where the project is headed is in [ROADMAP.md](ROADMAP.md); how to

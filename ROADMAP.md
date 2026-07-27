@@ -133,7 +133,13 @@ against the cost to determinism rather than taken for granted.
   writes past its grant is `#PF`-terminated (the display analogue of disjoint
   `BlockRange`s). A `gfxtext-user` demo also echoes a keyboard line on-screen,
   joining the framebuffer and the keyboard `EventSource` in one libOS
-  (Design/display.md).
+  (Design/display.md). On top of it all, a **shell skin** (Design/display_skin.md,
+  `shell-user`): a splash, a home screen of app icons, and arrow-key navigation
+  (libinput decodes the extended cursor scancodes; libgfx centers text and draws
+  borders) -- and selecting the app icon makes the shell `spawn` a real process
+  and hand it the framebuffer capability, which the app draws into and transfers
+  back over the spawn channel (display capability as transferable focus,
+  shell -> app -> shell). All of it library-OS policy; no kernel or ABI change.
 - **Broader hardware.** SMP and real-machine device support, each taken on its
   own merits. Split into stages, because adding a second CPU ends the
   single-core invariant the no-lock kernel rested on -- a concurrency redesign,
@@ -171,14 +177,14 @@ against the cost to determinism rather than taken for granted.
 
 ## Stability
 
-The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.7**.
+The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.8**.
 v2 added IPC and revised `spawn`, the one incompatible change from v1 (made
 while Phase 2 is still pre-release); v2.1 (`spawn_from_buffer`), v2.2
 (console input), v2.3 (`block_read` moved to the blocking gate), v2.4
 (async completion rings, retiring `block_read`), v2.5 (input as multishot
 ring subscriptions, retiring `event_recv`), v2.6 (`RING_OP_WRITE`, the
-write half of the block ring ABI), and v2.7 (the `Framebuffer` capability +
-the `fb_map` syscall) are all additive over v2 but for the two
-retired-and-shimmed ops. Within a major series, new capabilities are added
-without breaking existing programs. Anything not in ABI.md is an implementation
-detail and may move.
+write half of the block ring ABI), v2.7 (the `Framebuffer` capability +
+the `fb_map` syscall), and v2.8 (`cap_release`, retiring `frame_free`) are
+all additive over v2 but for the three retired-and-shimmed ops. Within a
+major series, new capabilities are added without breaking existing programs.
+Anything not in ABI.md is an implementation detail and may move.

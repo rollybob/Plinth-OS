@@ -30,7 +30,28 @@ pub fn read_line(source_slot: u64, buf: &mut [u8]) -> usize {
                     len += 1;
                 }
             }
-            Key::None => {}
+            // Arrow navigation has no meaning in a line reader; ignore it.
+            Key::Up | Key::Down | Key::Left | Key::Right | Key::None => {}
+        }
+    }
+}
+
+/// Read the next decoded key from the EventSource at `source_slot`, blocking
+/// until one arrives. Unlike `read_line`, the caller owns the `Keymap` (so shift
+/// and extended-prefix state persist across calls) and receives each key action
+/// as it is decoded -- arrows and Enter included. Events that decode to nothing
+/// (a modifier, a key release, the `0xE0` prefix) are skipped, so every call
+/// returns a real key. This is the input primitive a UI shell drives a cursor
+/// with, the navigation analogue of `read_line`.
+pub fn read_key(source_slot: u64, keymap: &mut Keymap) -> Key {
+    loop {
+        let (status, ev) = sys_event_recv(source_slot);
+        if status != EVENT_OK {
+            continue;
+        }
+        let k = keymap.feed(event_kind(ev), event_code(ev), event_value(ev));
+        if k != Key::None {
+            return k;
         }
     }
 }

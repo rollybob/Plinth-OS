@@ -122,6 +122,61 @@ pub struct Capability {
     pub rights: u8,
 }
 
+/// What the kernel must do, beyond emptying the slot, when a capability
+/// leaves a table for good.
+///
+/// Most capabilities name no pooled kernel resource -- the D3b hardening
+/// narrowing (2026-06-17) settled which ones do -- so most of these are
+/// `DropSlot`. The point of naming the decision is that there are two places
+/// that make it (`cap_release` and `process::teardown`) and they must not
+/// drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseAction {
+    /// Return this frame to the allocator. The caller must also unmap every
+    /// mapping made through the slot -- the frame is about to be reusable by
+    /// someone else, so a surviving mapping would be a hole in the isolation.
+    FreeFrame { addr: u64 },
+    /// Release the kernel ring-table slot. The ring's SQ/CQ frames are
+    /// ordinary `Frame` capabilities and are freed on their own.
+    ReleaseRing { id: usize },
+    /// Drop one reference to an endpoint, freeing the endpoint slot if this
+    /// was the last capability able to reach it.
+    DropEndpoint,
+    /// Nothing pooled: emptying the slot is the whole of the release.
+    DropSlot,
+    /// Not releasable on request. Only `Reply`: it names a caller that is
+    /// Blocked-awaiting-reply, and dropping it would strand that caller
+    /// forever. A live process must reply; a dying one is handled earlier by
+    /// `ipc::reap_dying`, which wakes the caller before teardown drains.
+    Refuse,
+}
+
+/// The release policy, as a pure decision. `syscall::sys_cap_release` runs it
+/// for one slot on request; `process::teardown` runs it for every slot at
+/// death (mapping `Refuse` to "just drop", since `reap_dying` has already
+/// woken any stranded caller by then). Pure so the in-kernel test harness can
+/// reach it -- a syscall needs a current process and a live address space,
+/// and the harness has neither.
+pub fn release_action(object: &CapObject) -> ReleaseAction {
+    match *object {
+        CapObject::Frame { addr } => ReleaseAction::FreeFrame { addr },
+        CapObject::Ring { id } => ReleaseAction::ReleaseRing { id },
+        CapObject::Endpoint { .. } => ReleaseAction::DropEndpoint,
+        CapObject::Reply { .. } => ReleaseAction::Refuse,
+        // Pure inline data naming no pooled resource. A CpuTime budget is
+        // forfeit rather than returned -- CPU time is not poolable -- and a
+        // Framebuffer names firmware MMIO that is never allocated from
+        // anywhere. Releasing a Framebuffer surrenders the authority but NOT
+        // the mapping: fb_map pages are not tracked in `proc.maps` (the
+        // region is ~1000 pages), the same wrinkle a cap transfer already has
+        // (Design/shared_patterns.md #22, Design/cap_release.md D5).
+        CapObject::CpuTime { .. }
+        | CapObject::BlockRange { .. }
+        | CapObject::EventSource { .. }
+        | CapObject::Framebuffer { .. } => ReleaseAction::DropSlot,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapError {
     TableFull,

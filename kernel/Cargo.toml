@@ -21,3 +21,8 @@ tests = []
 # (bench-user) after the demos, then report. Driven by `cargo xtask bench`.
 # Off by default, so the production kernel is byte-identical.
 bench = []
+# Interactive build (`cargo xtask run`): skip arming the shell's scripted input
+# so it waits for REAL keyboard input -- you drive the home-screen cursor with
+# the arrow keys yourself. The default (smoke/test) build keeps the scripted
+# tour so the shell completes and quits headlessly + deterministically.
+interactive = []

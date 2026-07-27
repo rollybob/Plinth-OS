@@ -67,6 +67,15 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "capability::cpu_charge_wrong_type", run: capability::cpu_charge_wrong_type },
     TestCase { name: "capability::block_range_rights", run: capability::block_range_rights },
     TestCase { name: "capability::event_source_rights", run: capability::event_source_rights },
+    TestCase { name: "capability::release_action_per_kind", run: capability::release_action_per_kind },
+    TestCase {
+        name: "capability::release_action_refuses_reply",
+        run: capability::release_action_refuses_reply,
+    },
+    TestCase {
+        name: "capability::slot_reuse_past_table_size",
+        run: capability::slot_reuse_past_table_size,
+    },
     TestCase { name: "elf::valid_minimal", run: elf::valid_minimal },
     TestCase { name: "elf::valid_three_segments", run: elf::valid_three_segments },
     TestCase { name: "elf::too_small", run: elf::too_small },

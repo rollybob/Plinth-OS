@@ -16,7 +16,9 @@
 
 pub mod keymap;
 
+pub use keymap::{Key, Keymap};
+
 #[cfg(target_os = "none")]
 mod reader;
 #[cfg(target_os = "none")]
-pub use reader::read_line;
+pub use reader::{read_key, read_line};

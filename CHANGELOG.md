@@ -3,7 +3,7 @@
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
 follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
-current contract is **v2.7**. v2 added IPC and revised `spawn`, breaking v1 --
+current contract is **v2.8**. v2 added IPC and revised `spawn`, breaking v1 --
 the one incompatible ABI change so far; v2.1 added `spawn_from_buffer` (the
 load-from-disk path), v2.2 added console input (`event_recv` + `EventSource`),
 both additive over v2; v2.3 moved `block_read` to the `int 0x80` gate so it can
@@ -15,11 +15,67 @@ input onto the same rings as multishot subscriptions (`RING_OP_EVENT_SUB`/
 ring, one `ring_wait`, now multiplexes block reads and input; v2.6 adds the
 write half of the block ring ABI (`RING_OP_WRITE`), purely additive; v2.7 adds
 the framebuffer as a capability (`Framebuffer` + the `fb_map` syscall, nr 14),
-purely additive.
+purely additive; v2.8 adds `cap_release` (nr 15) -- the first way to give a
+capability *back* -- and retires `frame_free` (nr 5) into it.
 
 ## [Unreleased]
 
 ### Added
+- **`cap_release` (ABI v2.8): a capability can finally be given back.** A
+  capability table is a fixed 16 slots with no heap behind it, so a slot is a
+  real, exhaustible resource -- but until now the only call that could empty one
+  was `frame_free`, which refused anything that was not a `Frame`. A capability a
+  process had legitimately *finished* with was stuck in its table for the rest of
+  its life. The clearest case: every `spawn` mints a wait handle, and after the
+  join that handle names a channel whose child is gone. The shell leaked one slot
+  per app launch and its ninth-or-so launch failed with the table full.
+  `cap_release(slot)` releases any kind, following the capability -- a `Frame` is
+  unmapped and returned to the allocator, a `Ring` releases its kernel table slot,
+  an `Endpoint` drops a reference (the endpoint is reclaimed when the last one
+  goes), and the kinds naming no pooled resource just vacate the slot. The policy
+  is one pure function shared with process teardown, so the reclaim path at death
+  and the one on request cannot drift apart. A `Reply` capability is refused: it
+  names a caller blocked awaiting it, and releasing it would strand that caller.
+  `spawn_and_wait` now releases the handle it joined on, so the common
+  spawn-in-a-loop shape is leak-free without callers thinking about it. New
+  `caprelease-user` runs 20 spawn/join/release round-trips through the 16-slot
+  table (with a silent `quietworker-user` child) -- a leaking build cannot finish
+  it -- and the scripted shell tour now launches its app twice, since both bugs
+  found on 2026-06-27 only appear on a relaunch.
+
+### Changed
+- **`cargo xtask run` closes its window again when the shell quits.** The
+  interactive path had omitted QEMU's isa-debug-exit device so the window would
+  survive boot and the framebuffer's last frame could be inspected; the cost was
+  that the kernel could not terminate QEMU at all, so quitting the shell left it
+  halted behind a live-looking, unresponsive window. The device is attached on
+  every path now. It does not cut a session short: the interactive kernel's shell
+  waits for real keypresses, so the kernel only reaches its exit once you ask to
+  leave. `run` also reports what the exit code meant, so a panicking interactive
+  run is no longer silent.
+- **`frame_free` (syscall nr 5) is retired**, generalised into `cap_release`.
+  The number is left unused, as nr 10 was. `libplinth::sys_frame_free` remains as
+  a wrapper over `cap_release`, so no program had to change. One guard is given
+  up deliberately: `frame_free` refused a non-frame slot, `cap_release` releases
+  whatever is there.
+- A visual userspace **skin** -- a shell with a splash, a home screen of app
+  icons, and arrow-key navigation, built entirely as library-OS policy (no kernel
+  or ABI change) over the whole-screen `Framebuffer` capability + the keyboard
+  `EventSource` + `spawn` + IPC. `libgfx` gains text centering (`text_width`,
+  `draw_text_centered`) and a border primitive (`draw_border`); `libinput` gains
+  arrow-key decoding (the extended `0xE0`-prefixed cursor keys -- the kernel
+  already ships the raw prefix byte, so this is pure libOS) and a `read_key`
+  navigation primitive alongside `read_line`. A new `shell-user` draws the splash
+  and a 2x2 icon grid with a moving selection cursor; three icons are
+  shell-drawn views, and the fourth launches a **real spawned app**
+  (`shellapp-user`, a new SPAWNABLE binary): the shell `spawn`s it and transfers
+  it the framebuffer capability, the app draws, then transfers the capability
+  **back** over the spawn result channel before exiting -- the display capability
+  as transferable focus (shell -> app -> shell), built from `spawn` + IPC
+  capability transfer + `fb_map`. A scripted scancode sequence drives the
+  navigation deterministically; each fixed frame's top-left square is hashed to
+  serial. (`cargo xtask run` keeps the QEMU window open, so the shell is
+  interactive there.) This is the planned end of the display arc.
 - Visual userspace -- the framebuffer as a capability (ABI v2.7), a staged
   milestone built on the linear framebuffer the `bootloader` crate already maps
   (UEFI GOP -- no GPU driver). The kernel only *discovers* the framebuffer

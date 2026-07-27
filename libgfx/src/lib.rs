@@ -184,6 +184,47 @@ impl Framebuffer {
             cx += FONT_W * scale;
         }
     }
+
+    /// Draw `text` horizontally centered on `cx` (its left edge at
+    /// `cx - text_width/2`), top at `y`. For a screen-centered title pass
+    /// `cx = width/2`. Clamps the left edge to 0 so a too-wide string still
+    /// starts on screen.
+    pub fn draw_text_centered(
+        &self,
+        cx: u32,
+        y: u32,
+        text: &[u8],
+        fg: (u8, u8, u8),
+        bg: (u8, u8, u8),
+        scale: u32,
+    ) {
+        let w = text_width(text, scale);
+        let x = cx.saturating_sub(w / 2);
+        self.draw_text(x, y, text, fg, bg, scale);
+    }
+
+    /// Draw a `thickness`-pixel border just inside the `w` x `h` rectangle at
+    /// (x, y) -- the four edges, leaving the interior untouched (fill it first
+    /// with `fill_rect` if wanted). Used for icon boxes and the selection
+    /// highlight.
+    pub fn draw_border(&self, x: u32, y: u32, w: u32, h: u32, thickness: u32, r: u8, g: u8, b: u8) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let t = thickness.min(w).min(h);
+        // Top and bottom edges.
+        self.fill_rect(x, y, w, t, r, g, b);
+        self.fill_rect(x, y + h - t, w, t, r, g, b);
+        // Left and right edges.
+        self.fill_rect(x, y, t, h, r, g, b);
+        self.fill_rect(x + w - t, y, t, h, r, g, b);
+    }
+}
+
+/// Rendered width of `text` at `scale`, in pixels (one cell per byte). For
+/// centering and layout.
+pub fn text_width(text: &[u8], scale: u32) -> u32 {
+    text.len() as u32 * FONT_W * scale
 }
 
 /// 8x8 glyph cell dimensions.

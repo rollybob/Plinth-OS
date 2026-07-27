@@ -6,7 +6,6 @@
 //! |  2 | exit        | code                | (never returns)          |
 //! |  3 | frame_alloc | --                  | capability slot, or ERR  |
 //! |  4 | frame_map   | slot, va            | 0, or ERR                |
-//! |  5 | frame_free  | slot                | 0, or ERR                |
 //! |  6 | cpu_charge  | slot, amount        | remaining, or terminates |
 //! |  7 | fault_reg   | entry, stack_top    | 0, or ERR                |
 //! |  8 | fault_return| --                  | (resumes), or ERR        |
@@ -15,6 +14,11 @@
 //! | 12 | ring_register | sq_slot, cq_slot, entries | ring cap slot, or ERR |
 //! | 13 | ring_submit | ring                | count posted, or ERR     |
 //! | 14 | fb_map      | slot, va, info_ptr  | 0, or ERR                |
+//! | 15 | cap_release | slot                | 0, or ERR                |
+//!
+//! Nr 5 (frame_free) was retired in ABI v2.8: `cap_release` generalises it to
+//! every capability kind, and a frame release is exactly what it used to do.
+//! `libplinth::sys_frame_free` survives as a wrapper. See Design/cap_release.md.
 //!
 //! Nr 10 (block_read) was retired in ABI v2.3: a blocking read must suspend and
 //! resume with a return value, which needs the full resumable trap frame only an
@@ -55,6 +59,7 @@ use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
 use crate::bkl;
+use crate::capability;
 use crate::capability::{
     CapError, CapObject, Capability, RIGHT_CONSUME, RIGHT_MAP, RIGHT_READ, RIGHT_RECV, RIGHT_SEND,
     RIGHT_WRITE,
@@ -178,7 +183,8 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         2 => sys_exit(a1),
         3 => sys_frame_alloc(),
         4 => sys_frame_map(a1, a2),
-        5 => sys_frame_free(a1),
+        // nr 5 (frame_free) was retired in ABI v2.8: cap_release (nr 15)
+        // generalises it to every capability kind. The number is left unused.
         6 => sys_cpu_charge(a1, a2),
         7 => sys_fault_reg(a1, a2),
         8 => sys_fault_return(),
@@ -194,6 +200,7 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         12 => crate::rings::ring_register(a1, a2, a3),
         13 => crate::rings::ring_submit(a1),
         14 => sys_fb_map(a1, a2, a3),
+        15 => sys_cap_release(a1),
         _ => ERR,
     };
     unsafe { bkl::release() };
@@ -435,42 +442,78 @@ fn sys_fb_map(slot: u64, va: u64, info_ptr: u64) -> u64 {
     0
 }
 
-/// frame_free(slot): revoke the capability, unmap any mapping made
-/// through it, and return the frame to the allocator.
-fn sys_frame_free(slot: u64) -> u64 {
+/// cap_release(slot): give a capability back. Revoke it, release whatever
+/// pooled kernel resource it owned, and leave the slot free for reuse.
+///
+/// A capability table is a fixed 16-slot array with no heap behind it, so a
+/// slot is a real resource and a process that cannot return one can run out.
+/// Until v2.8 the only way to empty a slot was `frame_free`, which type-checked
+/// for `Frame` -- so an endpoint capability a process was *done* with (the
+/// spawn wait handle, after the join) was stuck there for the process's whole
+/// life. That is the leak `shell-user` hit: one slot per app launch, table full
+/// after ~9. See Design/cap_release.md.
+///
+/// The per-kind decision is `capability::release_action`, shared with
+/// `process::teardown` so the two cannot drift. No rights are required:
+/// rights gate use, not removal (the same rule `CapTable::revoke` states, and
+/// the reason the type lookup below passes a mask of 0).
+///
+/// Returns 0, or ERR for a bad slot, an empty slot, or a `Reply` capability
+/// (releasing one would strand a caller blocked awaiting that reply -- D3).
+fn sys_cap_release(slot: u64) -> u64 {
     let mut cur = process::current().lock();
     let Some(proc) = cur.as_mut() else {
         return ERR;
     };
-    // Only frames are freeable this way. Check the type with a no-rights
-    // lookup *before* revoking, so a frame_free aimed at a non-frame slot
-    // (e.g. the CpuTime budget) fails without destroying the capability.
-    match proc.caps.lookup(slot as usize, 0) {
-        Ok(cap) if matches!(cap.object, CapObject::Frame { .. }) => {}
-        _ => return ERR,
+
+    // Decide BEFORE revoking, so a release the kernel refuses (a Reply cap)
+    // leaves the capability intact rather than destroying it on the way to
+    // reporting the error. Same ordering discipline the retired frame_free
+    // used for its type check, generalised.
+    let Ok(cap) = proc.caps.lookup(slot as usize, 0) else {
+        return ERR;
+    };
+    let action = capability::release_action(&cap.object);
+    if action == capability::ReleaseAction::Refuse {
+        return ERR;
     }
-    let Ok(cap) = proc.caps.revoke(slot as usize) else {
+    if proc.caps.revoke(slot as usize).is_err() {
         return ERR;
-    };
-    let CapObject::Frame { addr } = cap.object else {
-        return ERR;
-    };
-    let l4 = proc.l4;
+    }
 
-    let mut fa_guard = FRAME_ALLOC.lock();
-    let Some(fa) = fa_guard.as_mut() else {
-        return ERR;
-    };
-
-    for entry in proc.maps.iter_mut() {
-        if let Some((va, s)) = *entry {
-            if s == slot as usize {
-                memory::unmap_user_page(l4, va);
-                *entry = None;
+    match action {
+        capability::ReleaseAction::FreeFrame { addr } => {
+            let l4 = proc.l4;
+            let mut fa_guard = FRAME_ALLOC.lock();
+            let Some(fa) = fa_guard.as_mut() else {
+                return ERR;
+            };
+            // Unmap before returning the frame: it is about to be handed to
+            // someone else, and a surviving mapping would outlive the grant.
+            for entry in proc.maps.iter_mut() {
+                if let Some((va, s)) = *entry {
+                    if s == slot as usize {
+                        memory::unmap_user_page(l4, va);
+                        *entry = None;
+                    }
+                }
             }
+            let _ = fa.dealloc(addr);
         }
+        capability::ReleaseAction::ReleaseRing { id } => {
+            crate::rings::release(id);
+        }
+        capability::ReleaseAction::DropEndpoint => {
+            // A permanent removal, so the free-at-zero check runs (unlike a
+            // transfer, which passes false because a matching mint follows).
+            // This is the second permanent-removal site after teardown.
+            ipc::note_cap_removed(&cap, true);
+        }
+        // Nothing pooled. Note that a Framebuffer's mapping deliberately
+        // survives: fb_map pages are not tracked in `proc.maps` (D5).
+        capability::ReleaseAction::DropSlot => {}
+        capability::ReleaseAction::Refuse => unreachable!("refused above"),
     }
-    let _ = fa.dealloc(addr);
     0
 }
 

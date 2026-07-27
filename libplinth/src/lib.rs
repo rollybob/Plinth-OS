@@ -13,7 +13,6 @@
 //! |  2 | exit        | code         | (never returns)          |
 //! |  3 | frame_alloc | --           | cap slot, or SYS_ERR     |
 //! |  4 | frame_map   | slot, va     | 0, or SYS_ERR            |
-//! |  5 | frame_free  | slot         | 0, or SYS_ERR            |
 //! |  6 | cpu_charge  | slot, amount | remaining, or terminates |
 //! |  7 | fault_reg   | entry, stack | 0, or SYS_ERR            |
 //! |  8 | fault_return| --           | (resumes faulting insn)  |
@@ -22,10 +21,15 @@
 //! | 12 | ring_register | sq_slot, cq_slot, entries | ring cap slot, or ERR |
 //! | 13 | ring_submit | ring         | count posted, or SYS_ERR |
 //! | 14 | fb_map      | slot, va, info_ptr | 0, or SYS_ERR       |
+//! | 15 | cap_release | slot         | 0, or SYS_ERR            |
 //!
 //! Block I/O is the async-ring ABI (nr 12/13 + `ring_wait` on the `int 0x80`
 //! gate, op 6); `sys_block_read` is a single-in-flight shim over it. The old
 //! block_read syscall (nr 10, then `int 0x80` op 5) was retired in ABI v2.4.
+//!
+//! `frame_free` (nr 5) was retired in ABI v2.8: `cap_release` generalises it to
+//! every capability kind. `sys_frame_free` below is now a wrapper over
+//! `sys_cap_release`, so callers that mean "free this frame" still say so.
 
 #![no_std]
 
@@ -146,10 +150,44 @@ pub fn sys_frame_map(slot: u64, va: u64) -> u64 {
     syscall3(4, slot, va, 0)
 }
 
+/// Give back the capability at `slot`, freeing the slot for reuse.
+///
+/// What "give back" means depends on the capability: a frame is unmapped and
+/// returned to the allocator, a ring releases its kernel table slot, an
+/// endpoint drops a reference (and the endpoint is reclaimed when the last one
+/// goes). The kinds that name no pooled resource -- a CPU budget, a block
+/// range, an event source, the framebuffer -- just vacate the slot.
+///
+/// A capability table is a fixed 16 slots with no heap behind it, so this is
+/// how a long-lived process stays alive: anything that spawns repeatedly must
+/// release its spent wait handles or it will run out of table.
+///
+/// Two caveats worth knowing before calling it:
+///
+/// - Releasing the framebuffer surrenders the *authority*, not the mapping.
+///   `fb_map` pages are not tracked per-capability, so pixels stay writable
+///   through an existing mapping. Do not treat this as revoking access.
+/// - Releasing your CPU budget succeeds and forfeits it. Nothing stops you
+///   from disarming yourself.
+///
+/// Returns 0, or SYS_ERR for a slot past the table, an empty slot, or a reply
+/// capability (releasing one would strand the caller waiting on it -- reply,
+/// or exit).
+#[inline]
+pub fn sys_cap_release(slot: u64) -> u64 {
+    syscall3(15, slot, 0, 0)
+}
+
 /// Unmap (if mapped), revoke, and free the frame named by `slot`.
+///
+/// A wrapper over `sys_cap_release` since ABI v2.8 -- the dedicated
+/// `frame_free` syscall (nr 5) is retired. Kept because "free the frame" is
+/// what a caller holding a frame actually means. Note the generalisation
+/// removed a small guard: the old syscall rejected a non-frame slot, this one
+/// releases whatever is there.
 #[inline]
 pub fn sys_frame_free(slot: u64) -> u64 {
-    syscall3(5, slot, 0, 0)
+    sys_cap_release(slot)
 }
 
 /// Map the framebuffer named by the capability at `slot` into this address space
@@ -577,13 +615,21 @@ pub fn sys_reply(reply_slot: u64, msg: u64) -> u64 {
 /// - `(IPC_ERR, _)` -- the spawn itself failed.
 ///
 /// `transfer_slot` moves one capability into the child (or `NO_CAP` for none).
+///
+/// The handle is released once the wait completes (ABI v2.8): a join is the end
+/// of that channel's usefulness, and a capability table is only 16 slots, so a
+/// helper that spawns in a loop must give the slot back or the caller runs out
+/// of table. Before `cap_release` existed there was no way to do this, which is
+/// why repeated launches used to die with a full table.
 #[inline]
 pub fn spawn_and_wait(child_id: u64, transfer_slot: u64) -> (u64, u64) {
     let handle = sys_spawn(child_id, transfer_slot);
     if handle == SYS_ERR {
         return (IPC_ERR, 0);
     }
-    sys_recv(handle)
+    let out = sys_recv(handle);
+    sys_cap_release(handle);
+    out
 }
 
 // ---------------------------------------------------------------------------

@@ -192,11 +192,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // worker that sends its result), id 1 = faultchild (a worker that
         // faults before sending, to exercise death-time reaping), id 2 =
         // stealwork (a CPU-bound worker the work-stealing S4 demo spawns en
-        // masse onto one core).
+        // masse onto one core), id 3 = shellapp (the app the D8 shell launches
+        // and hands the framebuffer to -- Design/display_skin.md; shell-user
+        // mirrors this id as SHELLAPP_ID), id 4 = quietworker (a silent
+        // grantee, spawned in a loop by the cap_release demo -- a chatty child
+        // would add twenty lines to expected_boot_log for nothing).
         const SPAWNABLE: &[&[u8]] = &[
             include_bytes!(concat!(env!("OUT_DIR"), "/grantee-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/faultchild-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/stealwork-user")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/shellapp-user")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/quietworker-user")),
         ];
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
@@ -457,6 +463,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let after_spawn = free_frames();
         let _ = writeln!(serial, "plinth: {after_spawn} frames free after spawn");
         let _ = writeln!(serial, "plinth: {} endpoints free after spawn", free_endpoints());
+
+        // cap_release demo (Design/cap_release.md, ABI v2.8): a capability slot,
+        // once released, is genuinely reusable. A capability table is a fixed 16
+        // slots with no heap behind it, and until v2.8 nothing could empty one on
+        // request except frame_free -- which type-checked for Frame, so a spent
+        // spawn wait handle (a RECV Endpoint cap) was stuck there for the
+        // process's whole life. The shell leaked one slot per app launch and died
+        // with a full table on the ninth (2026-06-27). caprelease-user runs 20
+        // spawn -> join -> release round-trips through that 16-slot table: a
+        // leaking build cannot get past round ~15, and every round here reuses the
+        // slot the previous one gave back. The child (quietworker, id 4) is silent
+        // on purpose, so the whole regression costs one line of boot log. Frame
+        // and endpoint baselines bracket it -- 20 result endpoints created and
+        // reclaimed must leave the endpoint table exactly where it started.
+        const CAPRELEASE_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/caprelease-user"));
+        let before_caprel = free_frames();
+        let _ = writeln!(serial, "plinth: {before_caprel} frames free before caprelease");
+        let _ = writeln!(serial, "plinth: {} endpoints free before caprelease", free_endpoints());
+        scheduler::run("caprelease demo", &[CAPRELEASE_BIN], phys_offset, &[None]);
+        let after_caprel = free_frames();
+        let _ = writeln!(serial, "plinth: {after_caprel} frames free after caprelease");
+        let _ = writeln!(serial, "plinth: {} endpoints free after caprelease", free_endpoints());
 
         // Work-stealing demo (SMP scaling S4, Design/smp_scaling.md section 6).
         // The parent spawns three CPU-bound workers back to back; spawn homes
@@ -869,6 +897,53 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
         }
 
+        // Visual userspace skin (D8, Design/display_skin.md) -- the finale: a
+        // shell (splash + a home screen of app icons + arrow-key navigation)
+        // entirely as library-OS policy over the whole-screen Framebuffer (slot
+        // 1) and the keyboard EventSource (slot 2). Three icons are shell-drawn
+        // views; selecting the fourth makes the shell SPAWN a real app
+        // (shellapp, SPAWNABLE id 3) and TRANSFER it the framebuffer capability,
+        // which the app draws into and then transfers BACK over the spawn result
+        // channel before exiting -- the display capability as transferable focus
+        // (shell -> app -> shell), built from spawn + IPC cap transfer + fb_map,
+        // no new kernel surface. A scripted scancode sequence drives the nav
+        // deterministically (the gfxtext discipline); each fixed frame is hashed
+        // to serial. Frame counts bracket the demo (no leak: the shell's and the
+        // app's framebuffer mappings and the event-ring frames are freed at
+        // teardown). Runs only if a framebuffer is present.
+        if let Some(fbobj) = framebuffer::framebuffer_cap() {
+            const SHELL_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell-user"));
+            let before_shell = free_frames();
+            let _ = writeln!(serial, "plinth: {before_shell} frames free before shell");
+            let fbcap = Capability {
+                object: fbobj,
+                rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+            };
+            let source = Capability {
+                object: CapObject::EventSource { id: 0 },
+                rights: capability::RIGHT_READ,
+            };
+            // Set-1 scancodes driving the home screen: Right (0xE0 0x4D) ->
+            // select BARS, Enter (0x1C) -> open its view, Backspace (0x0E) ->
+            // back, Down (0xE0 0x50) -> select APP, Enter (0x1C) -> launch it,
+            // Enter (0x1C) -> launch it a SECOND time, 'q' (0x10) -> quit. Must
+            // match shell-user's navigation + the expected_boot_log hashes. The
+            // `interactive` build (cargo xtask run) omits this, so the shell
+            // waits for REAL arrow keys and you drive the cursor yourself.
+            //
+            // The second launch is deliberate (Design/cap_release.md D7): both
+            // bugs found on 2026-06-27 -- the capability-slot migration and the
+            // wait-handle leak -- only appear on a RELAUNCH, and a one-launch
+            // tour is exactly why smoke missed them. It is a regression guard for
+            // the framebuffer round-tripping cleanly, not for table exhaustion:
+            // that takes ~9 launches and is caprelease-user's job instead.
+            #[cfg(not(feature = "interactive"))]
+            input::arm_synthetic(&[0xE0, 0x4D, 0x1C, 0x0E, 0xE0, 0x50, 0x1C, 0x1C, 0x10]);
+            scheduler::run("shell demo", &[SHELL_BIN], phys_offset, &[Some(fbcap), Some(source)]);
+            let after_shell = free_frames();
+            let _ = writeln!(serial, "plinth: {after_shell} frames free after shell");
+        }
+
         // BKL contention micro-benchmark (broader-hardware "SMP -- scaling"
         // decision: is splitting the lock, roadmap item B3, even justified?).
         // Saturate every core with the cheapest kernel-entry hammer there is
@@ -921,6 +996,18 @@ fn qemu_exit(code: ExitCode) -> ! {
         let mut port = Port::new(0xF4);
         port.write(code as u32);
     }
+    // Reaching here means nothing answered port 0xF4, so this is the halt
+    // path, not the exit path: real hardware, or a QEMU invocation without the
+    // isa-debug-exit device. Every xtask path attaches it, so under xtask the
+    // write above terminates QEMU and this line never runs -- it adds no
+    // asserted output and cannot move the smoke line count.
+    //
+    // Say so anyway. An unannounced halt with a live window and an
+    // unresponsive keyboard reads as a hang, which is exactly how the
+    // device-less `run` path was misread on 2026-07-25. A fresh serial handle,
+    // like the panic handler takes, since callers may hold one.
+    let mut serial = serial::init();
+    let _ = writeln!(serial, "plinth: halted -- no exit device; close the QEMU window");
     loop {
         x86_64::instructions::hlt();
     }
