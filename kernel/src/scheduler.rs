@@ -869,7 +869,7 @@ pub fn on_exit() -> ! {
     // The current process is gone; switch_to_next decides what "nothing else
     // claimable" means from here (launcher vs. AP, table empty vs. other
     // cores' work still live -- see NoWorkAction's doc).
-    unsafe { switch_to_next(cur_pos, NoWorkAction::ExitedReturnIfDone) }
+    unsafe { switch_to_next_on_core_stack(cur_pos, NoWorkAction::ExitedReturnIfDone) }
 }
 
 /// True once `run` has called `sched_start` on this core, i.e. this core has
@@ -950,6 +950,63 @@ fn table_entirely_empty() -> bool {
 /// Caller must have already removed the leaving process from `CURRENT` (taken
 /// it for teardown, or parked it in its slot as Blocked), must hold the BKL
 /// (D4), and must hold no other locks.
+/// Enter `switch_to_next` on THIS core's own stack, abandoning the current one.
+///
+/// **A core must never halt on a stack it does not own.** `switch_to_next`
+/// parks -- in its own wait loop, or by calling `ap_idle_loop` -- and it is
+/// reached from two very different places. From a syscall, the current stack is
+/// the per-core syscall stack, which nothing else can touch. From a ring-3
+/// FAULT, it is the faulting process's OWN kernel stack, because
+/// `resume_process` pointed `rsp0` there. That process is being torn down, its
+/// slot goes back on the free list, and `setup_process`/`fabricate_initial_frame`
+/// will hand the same slot -- and therefore the same `kstack_top(slot)` -- to a
+/// brand new process, quite possibly on a different core. That core then writes
+/// its frames over the stack a parked core is still halted on.
+///
+/// Bug found 07-27 by instrumenting it: `core 0 is fabricating a new process
+/// into slot 1, but core 1 is HALTED on slot 1's kernel stack`, on 14 of 16
+/// boots at `-smp 4`. When the parked core woke, its locals and return
+/// addresses had been overwritten, which surfaced as a wild control transfer
+/// into `KSTACKS` (`rip == addr`, instruction fetch on a non-executable page)
+/// or a `ret` onto a small integer like `0x8`. It reproduced only with 2+ cores
+/// and only when a fault-driven exit was followed by heavy slot reuse, which is
+/// why `spawn` (faultchild dies) followed by `caprelease` (20 spawn round
+/// trips) was the trigger.
+///
+/// Switching stacks here is sound precisely because `switch_to_next` never
+/// returns: nothing on the abandoned frame is ever read again, and the two ways
+/// out both reload `rsp` from elsewhere (`sched_resume`'s iretq, or
+/// `sched_return_to_kernel`'s per-core anchor). The per-core syscall stack is
+/// the natural home -- already per-core, already sized for kernel work, and it
+/// cannot be in use for anything else while this core has no process on it.
+unsafe fn switch_to_next_on_core_stack(cur_pos: usize, on_idle: NoWorkAction) -> ! {
+    // 16-align: the SysV ABI wants rsp 16-byte aligned at the `call`, and the
+    // syscall stacks are `[u8; N]` statics with no alignment guarantee.
+    let top = crate::syscall::stack_top(percpu::core_id()) & !0xF;
+    core::arch::asm!(
+        "mov rsp, {top}",
+        "call {entry}",
+        "ud2",
+        top = in(reg) top,
+        entry = sym switch_to_next_entry,
+        in("rdi") cur_pos,
+        in("rsi") on_idle as u64,
+        options(noreturn),
+    );
+}
+
+/// C-ABI landing pad for `switch_to_next_on_core_stack`'s stack switch.
+extern "C" fn switch_to_next_entry(cur_pos: usize, on_idle: u64) -> ! {
+    let action = if on_idle == NoWorkAction::ExitedReturnIfDone as u64 {
+        NoWorkAction::ExitedReturnIfDone
+    } else {
+        NoWorkAction::BlockedDeadlockIfNoOtherWork
+    };
+    // SAFETY: the caller held the BKL and no other locks, and a stack switch
+    // does not change that; we are now on this core's own stack.
+    unsafe { switch_to_next(cur_pos, action) }
+}
+
 unsafe fn switch_to_next(cur_pos: usize, on_idle: NoWorkAction) -> ! {
     let me = percpu::core_id() as u32;
     loop {
@@ -1329,7 +1386,7 @@ pub fn block_current(frame_ptr: u64) -> ! {
         table[cur].kernel_rsp = frame_ptr;
         table[cur].process = Some(running);
         table[cur].state = State::Blocked;
-        switch_to_next(cur_pos, NoWorkAction::BlockedDeadlockIfNoOtherWork)
+        switch_to_next_on_core_stack(cur_pos, NoWorkAction::BlockedDeadlockIfNoOtherWork)
     }
 }
 
