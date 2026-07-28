@@ -146,7 +146,10 @@ fn emit_hash(tag: &[u8], fb: &Framebuffer) {
 pub extern "C" fn _start(_idx: u64) -> ! {
     sys_write(b"shell: start\n");
 
-    let fb = match Framebuffer::map(FB_SLOT, MAP_BASE) {
+    // Rebindable: the mapping is torn down whenever the capability leaves this
+    // table, so every launch round-trip ends with a fresh `map` (ABI v2.8 fix,
+    // Design/fb_mapping.md D1/D3).
+    let mut fb = match Framebuffer::map(FB_SLOT, MAP_BASE) {
         Some(fb) => fb,
         None => {
             sys_write(b"shell: map failed\n");
@@ -217,13 +220,19 @@ pub extern "C" fn _start(_idx: u64) -> ! {
                         sys_write(b"shell: releasing the spent wait handle failed\n");
                         sys_exit(4);
                     }
-                    // The framebuffer *mapping* persisted across the transfer
-                    // (fb_map mappings are not torn down on cap transfer -- the
-                    // framebuffer is ~1000 pages, not tracked per-cap like a
-                    // pooled frame), and the shell was blocked on the join so the
-                    // app had the screen to itself. So redraw through the existing
-                    // mapping; the returned capability restored our authority to
-                    // hand it off again.
+                    // Re-map before drawing. The spawn transfer took the
+                    // framebuffer mapping down with the capability, so the old
+                    // mapping is gone and touching it would fault -- which is
+                    // the point: this shell can draw because it holds the
+                    // capability and mapped it, not because a page-table entry
+                    // happened to survive the handoff (Design/fb_mapping.md D3).
+                    fb = match Framebuffer::map(fb_slot, MAP_BASE) {
+                        Some(fb) => fb,
+                        None => {
+                            sys_write(b"shell: remap after launch failed\n");
+                            sys_exit(5);
+                        }
+                    };
                     draw_home(&fb, sel);
                     emit_hash(b"shell: back home hash ", &fb);
                 } else {

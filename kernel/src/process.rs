@@ -49,6 +49,69 @@ pub const USER_LAZY_END: u64 = 0x1900_0000;
 
 pub const MAX_USER_MAPS: usize = 16;
 
+/// Live framebuffer mappings tracked per process (Design/fb_mapping.md D2).
+///
+/// Four is headroom, not a measurement: every demo maps one region, and the
+/// shape that wants more than one is a process holding the whole screen *and* a
+/// band. The array costs 4 * 24 bytes against a process count in the single
+/// digits, which is not worth being clever about.
+pub const MAX_FB_MAPS: usize = 4;
+
+/// One `fb_map` result: `pages` pages mapped contiguously from `va_base`
+/// through the capability at `slot`.
+///
+/// A framebuffer region is contiguous by construction -- a band is the same
+/// object with an offset base and fewer rows -- so one record covers what would
+/// otherwise be ~1000 `proc.maps` entries. That is why these are tracked
+/// separately rather than in `proc.maps`, which stores one entry per page and
+/// exists to return pooled frames to the allocator. Framebuffer pages are
+/// firmware MMIO and are never pooled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FbMap {
+    pub va_base: u64,
+    pub pages: u32,
+    pub slot: usize,
+}
+
+/// Record a framebuffer mapping. Returns false if there is no free record.
+///
+/// Pure, so the in-kernel harness can reach it -- a syscall needs a current
+/// process and a live address space (Design/cap_release.md D4's precedent).
+pub fn fb_record(maps: &mut [Option<FbMap>; MAX_FB_MAPS], m: FbMap) -> bool {
+    for entry in maps.iter_mut() {
+        if entry.is_none() {
+            *entry = Some(m);
+            return true;
+        }
+    }
+    false
+}
+
+/// Take (and clear) every record naming `slot`, writing them into `out` and
+/// returning how many. A process may map one capability at more than one
+/// address, so this collects all of them rather than stopping at the first --
+/// the same reason `revoke_and_unmap` loops over all of `proc.maps`.
+///
+/// Pure for the same reason as `fb_record`: the unmapping itself needs an
+/// address space, so it is left to the caller.
+pub fn fb_take_slot(
+    maps: &mut [Option<FbMap>; MAX_FB_MAPS],
+    slot: usize,
+    out: &mut [FbMap; MAX_FB_MAPS],
+) -> usize {
+    let mut n = 0;
+    for entry in maps.iter_mut() {
+        if let Some(m) = *entry {
+            if m.slot == slot {
+                out[n] = m;
+                n += 1;
+                *entry = None;
+            }
+        }
+    }
+    n
+}
+
 /// Every process is minted a CPU-time capability at spawn, in this slot.
 /// It is the first mint into a fresh table, so it always lands at index 0;
 /// userspace relies on that the way Unix relies on fd 0. (libplinth mirrors
@@ -107,6 +170,10 @@ pub struct Process {
     /// Live frame_map results as (virtual address, capability slot), so
     /// frame_free and teardown can unmap them.
     pub maps: [Option<(u64, usize)>; MAX_USER_MAPS],
+    /// Live fb_map results, tracked separately from `maps` because a
+    /// framebuffer region is one contiguous run of ~1000 unpooled pages
+    /// (Design/fb_mapping.md D2).
+    pub fb_maps: [Option<FbMap>; MAX_FB_MAPS],
     /// The process's self-paging handler, if it registered one.
     pub fault: Option<FaultReg>,
     /// True while a fault is being serviced in the handler. A second fault
@@ -123,6 +190,7 @@ impl Process {
         Process {
             caps: CapTable::new(),
             maps: [None; MAX_USER_MAPS],
+            fb_maps: [None; MAX_FB_MAPS],
             fault: None,
             in_fault: false,
             l4: 0,
@@ -355,7 +423,34 @@ pub fn revoke_and_unmap(proc: &mut Process, slot: usize) -> Option<Capability> {
             }
         }
     }
+    // Same rule, other kind: handing a framebuffer away takes the access with
+    // the authority. Before Design/fb_mapping.md D1 this case was missing, so a
+    // process that transferred its framebuffer kept drawing through the
+    // surviving mapping -- which `shell-user` relied on by name.
+    if matches!(cap.object, CapObject::Framebuffer { .. }) {
+        unmap_fb_for_slot(proc, slot);
+    }
     Some(cap)
+}
+
+/// Unmap and forget every framebuffer mapping made through `slot`.
+///
+/// Nothing is freed. The pages name firmware MMIO and were never allocated
+/// from anywhere, so this must never route through the frame path -- doing so
+/// would hand ~1000 pages of MMIO to the frame allocator to be served later as
+/// ordinary memory (Design/fb_mapping.md D7). The frame baselines around every
+/// demo are what would catch that, and they must not move.
+pub fn unmap_fb_for_slot(proc: &mut Process, slot: usize) {
+    let l4 = proc.l4;
+    let mut taken = [FbMap { va_base: 0, pages: 0, slot: 0 }; MAX_FB_MAPS];
+    let n = fb_take_slot(&mut proc.fb_maps, slot, &mut taken);
+    for m in taken.iter().take(n) {
+        let mut i = 0u32;
+        while i < m.pages {
+            memory::unmap_user_page(l4, m.va_base + i as u64 * FRAME_SIZE);
+            i += 1;
+        }
+    }
 }
 
 /// Return everything the process held: frame_map mappings, capability-owned
@@ -393,6 +488,12 @@ pub fn teardown(mut proc: Process, boot_frames: &[Option<(u64, u64)>]) {
             crate::capability::ReleaseAction::DropEndpoint => {
                 crate::ipc::note_cap_removed(&cap, true);
             }
+            // A framebuffer mapping needs no unmapping here: the whole address
+            // space is about to go, and destroy_address_space reclaims the
+            // page-table frames wholesale. Walking ~1000 pages per framebuffer
+            // to unmap them individually first would be pure work. Nothing is
+            // freed either way -- the pages are firmware MMIO.
+            crate::capability::ReleaseAction::UnmapFramebuffer => {}
             // Nothing pooled: a CpuTime budget (spent or not) has nothing to
             // return, and the inline kinds name no allocation.
             crate::capability::ReleaseAction::DropSlot => {}

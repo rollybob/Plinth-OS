@@ -142,6 +142,15 @@ pub enum ReleaseAction {
     /// Drop one reference to an endpoint, freeing the endpoint slot if this
     /// was the last capability able to reach it.
     DropEndpoint,
+    /// Unmap every framebuffer mapping made through this slot. Nothing is
+    /// freed -- the pages name firmware MMIO and were never allocated from
+    /// anywhere -- but they must stop being reachable, because the authority
+    /// that justified the mapping is leaving (Design/fb_mapping.md D1).
+    ///
+    /// Deliberately NOT `FreeFrame`: routing a framebuffer through the frame
+    /// path would hand ~1000 pages of MMIO to the frame allocator, which would
+    /// later serve them as ordinary memory.
+    UnmapFramebuffer,
     /// Nothing pooled: emptying the slot is the whole of the release.
     DropSlot,
     /// Not releasable on request. Only `Reply`: it names a caller that is
@@ -163,17 +172,18 @@ pub fn release_action(object: &CapObject) -> ReleaseAction {
         CapObject::Ring { id } => ReleaseAction::ReleaseRing { id },
         CapObject::Endpoint { .. } => ReleaseAction::DropEndpoint,
         CapObject::Reply { .. } => ReleaseAction::Refuse,
+        // A Framebuffer names firmware MMIO -- nothing to free -- but its
+        // mapping must go with the authority. Until v2.8 it did not: the
+        // mapping outlived both release and transfer, so a process could keep
+        // drawing through pixels it no longer had any right to. That is closed
+        // (Design/fb_mapping.md D1); the invariant is that a live framebuffer
+        // mapping exists only while the process holds a capability naming it.
+        CapObject::Framebuffer { .. } => ReleaseAction::UnmapFramebuffer,
         // Pure inline data naming no pooled resource. A CpuTime budget is
-        // forfeit rather than returned -- CPU time is not poolable -- and a
-        // Framebuffer names firmware MMIO that is never allocated from
-        // anywhere. Releasing a Framebuffer surrenders the authority but NOT
-        // the mapping: fb_map pages are not tracked in `proc.maps` (the
-        // region is ~1000 pages), the same wrinkle a cap transfer already has
-        // (Design/shared_patterns.md #22, Design/cap_release.md D5).
+        // forfeit rather than returned -- CPU time is not poolable.
         CapObject::CpuTime { .. }
         | CapObject::BlockRange { .. }
-        | CapObject::EventSource { .. }
-        | CapObject::Framebuffer { .. } => ReleaseAction::DropSlot,
+        | CapObject::EventSource { .. } => ReleaseAction::DropSlot,
     }
 }
 

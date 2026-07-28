@@ -363,6 +363,14 @@ fn sys_fb_map(slot: u64, va: u64, info_ptr: u64) -> u64 {
         else {
             return ERR;
         };
+        // Reserve capacity before mapping anything. `fb_maps` is a fixed array,
+        // and discovering it full after ~1000 pages are already in place would
+        // leave either an untracked mapping -- the exact defect D1 closes -- or
+        // a rollback path to get wrong. The BKL is held across the whole
+        // syscall, so a record free here is still free at the insert below.
+        if proc.fb_maps.iter().all(|e| e.is_some()) {
+            return ERR;
+        }
         (proc.l4, phys_base, width, height, stride, bytes_per_pixel, format)
     };
 
@@ -425,6 +433,32 @@ fn sys_fb_map(slot: u64, va: u64, info_ptr: u64) -> u64 {
                 return ERR;
             }
             off += FRAME_SIZE;
+        }
+    }
+
+    // Track the mapping under its capability, so that losing the capability --
+    // by transfer or by cap_release -- tears the mapping down with it
+    // (Design/fb_mapping.md D1/D2). One record covers the whole contiguous run.
+    {
+        let mut cur = process::current().lock();
+        let Some(proc) = cur.as_mut() else {
+            return ERR;
+        };
+        let record = process::FbMap {
+            va_base: va,
+            pages: (span / FRAME_SIZE) as u32,
+            slot: slot as usize,
+        };
+        if !process::fb_record(&mut proc.fb_maps, record) {
+            // Unreachable: capacity was checked above under the same BKL hold.
+            // Unmap rather than leave a mapping the kernel has lost track of --
+            // an untracked mapping is precisely the bug being closed.
+            let mut off = 0u64;
+            while off < span {
+                memory::unmap_user_page(l4, va + off);
+                off += FRAME_SIZE;
+            }
+            return ERR;
         }
     }
 
@@ -509,8 +543,13 @@ fn sys_cap_release(slot: u64) -> u64 {
             // This is the second permanent-removal site after teardown.
             ipc::note_cap_removed(&cap, true);
         }
-        // Nothing pooled. Note that a Framebuffer's mapping deliberately
-        // survives: fb_map pages are not tracked in `proc.maps` (D5).
+        // The authority is leaving, so the access goes with it. Nothing is
+        // freed: the pages are firmware MMIO, never allocated from anywhere
+        // (Design/fb_mapping.md D1 -- this is what cap_release.md D5 deferred).
+        capability::ReleaseAction::UnmapFramebuffer => {
+            process::unmap_fb_for_slot(proc, slot as usize);
+        }
+        // Nothing pooled.
         capability::ReleaseAction::DropSlot => {}
         capability::ReleaseAction::Refuse => unreachable!("refused above"),
     }

@@ -13,6 +13,7 @@
 mod capability;
 mod elf;
 mod event_rings;
+mod fb_maps;
 mod frame_alloc;
 mod input;
 mod ipc;
@@ -76,6 +77,11 @@ const TESTS: &[TestCase] = &[
         name: "capability::slot_reuse_past_table_size",
         run: capability::slot_reuse_past_table_size,
     },
+    TestCase { name: "fb_maps::record_and_take", run: fb_maps::record_and_take },
+    TestCase { name: "fb_maps::take_is_slot_scoped", run: fb_maps::take_is_slot_scoped },
+    TestCase { name: "fb_maps::take_collects_duplicates", run: fb_maps::take_collects_duplicates },
+    TestCase { name: "fb_maps::full_table_refuses", run: fb_maps::full_table_refuses },
+    TestCase { name: "fb_maps::take_absent_is_zero", run: fb_maps::take_absent_is_zero },
     TestCase { name: "elf::valid_minimal", run: elf::valid_minimal },
     TestCase { name: "elf::valid_three_segments", run: elf::valid_three_segments },
     TestCase { name: "elf::too_small", run: elf::too_small },

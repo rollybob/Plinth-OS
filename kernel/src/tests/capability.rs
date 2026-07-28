@@ -208,21 +208,30 @@ pub fn release_action_per_kind(_ctx: &mut TestCtx) -> Result<(), &'static str> {
         "an Endpoint must drop a reference so free-at-zero can fire"
     );
 
-    // The kinds the D3b narrowing (2026-06-17) settled as owning nothing
-    // poolable. If a new one is added it must be classified deliberately,
-    // which is what this list is for.
-    for obj in [
-        CapObject::CpuTime { budget: 100 },
-        CapObject::BlockRange { dev: 0, start: 8, count: 4 },
-        CapObject::EventSource { id: 0 },
-        CapObject::Framebuffer {
+    // A Framebuffer owns nothing poolable either, but it is NOT a plain
+    // DropSlot: its mapping has to come down with the authority, or a process
+    // that transfers or releases the screen keeps drawing on it
+    // (Design/fb_mapping.md D1). Pinned separately from the list below so that
+    // regressing it back to DropSlot fails here rather than silently.
+    test_assert!(
+        release_action(&CapObject::Framebuffer {
             phys_base: 0x8000_0000,
             width: 1280,
             height: 800,
             stride: 1280,
             bytes_per_pixel: 4,
             format: 1,
-        },
+        }) == ReleaseAction::UnmapFramebuffer,
+        "a Framebuffer must unmap on release -- access must not outlive authority"
+    );
+
+    // The kinds the D3b narrowing (2026-06-17) settled as owning nothing
+    // poolable AND holding no mapping. If a new one is added it must be
+    // classified deliberately, which is what this list is for.
+    for obj in [
+        CapObject::CpuTime { budget: 100 },
+        CapObject::BlockRange { dev: 0, start: 8, count: 4 },
+        CapObject::EventSource { id: 0 },
     ] {
         test_assert!(
             release_action(&obj) == ReleaseAction::DropSlot,
