@@ -43,6 +43,27 @@ capability *back* -- and retires `frame_free` (nr 5) into it.
   it -- and the scripted shell tour now launches its app twice, since both bugs
   found on 2026-06-27 only appear on a relaunch.
 
+### Fixed
+- **A framebuffer mapping now dies with the capability that justified it.**
+  Previously, giving up a `Framebuffer` capability -- by `cap_release` or by
+  transferring it to another process -- surrendered the *authority* but left the
+  *access* in place: `fb_map` mappings are not tracked in `proc.maps` the way a
+  pooled frame's are (the region is ~1000 pages), so the pages stayed mapped and
+  writable and a process could keep drawing through pixels it no longer had any
+  right to. Losing the capability now tears the mapping down in the same
+  operation. **Observable change: a write through a surrendered framebuffer
+  mapping faults and terminates the process where it used to silently succeed.**
+  The only in-tree code relying on the old behaviour was the shell, which now
+  re-maps after its app hands the capability back. Deliberately not an ABI bump:
+  no call changed shape, and the old behaviour was a hole rather than a contract.
+  A framebuffer names firmware MMIO, so the unmap returns nothing to the frame
+  allocator -- the release path is pointedly not the `Frame` path, and the frame
+  baselines around every graphics demo are what hold that line. New
+  `gfxrevoke-user` is the proof: it maps its band, draws through it, releases the
+  capability, writes to the same address, and is page-faulted. Drawing *before*
+  the release is the load-bearing part -- a demo that only faulted afterwards
+  would pass even if the mapping had never been established.
+
 ### Changed
 - **`cargo xtask run` closes its window again when the shell quits.** The
   interactive path had omitted QEMU's isa-debug-exit device so the window would

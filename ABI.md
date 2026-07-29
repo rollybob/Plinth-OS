@@ -146,8 +146,10 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   `Frame` is unmapped and returned to the allocator, a `Ring` releases its
   kernel table slot, an `Endpoint` drops a reference (and the endpoint is
   reclaimed when the last one goes). The kinds that name no pooled resource --
-  `CpuTime`, `BlockRange`, `EventSource`, `Framebuffer` -- simply vacate the
-  slot. No rights are required: rights gate *use*, not removal.
+  `CpuTime`, `BlockRange`, `EventSource` -- simply vacate the slot. A
+  `Framebuffer` names firmware MMIO, so it returns nothing to any pool, but its
+  mapping is torn down with it (see below). No rights are required: rights gate
+  *use*, not removal.
 
   A capability table is a fixed 16 slots with no heap behind it, so a slot is a
   real resource. Until now the only way to empty one was `frame_free`, which
@@ -168,11 +170,23 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   awaiting it; dropping it would strand that caller forever. Reply, or exit --
   a dying server's caller is woken with `IPC_PEER_DIED`.
 
-- **Releasing a `Framebuffer` surrenders authority, not access.** `fb_map`
-  mappings are not tracked per-capability (the region is ~1000 pages), so pixels
-  stay writable through an existing mapping after the capability is gone. This
-  is the same property a capability *transfer* already has. Do not use release
-  as a revocation.
+- **Losing a `Framebuffer` capability tears its mapping down.** Release it or
+  transfer it away and the pixels it named stop being addressable in that
+  address space: the mapping goes in the same operation, and a store through the
+  old virtual address takes a `#PF` and terminates the process. Access does not
+  outlive authority.
+
+  This is a behaviour change, and the old behaviour was the surprising one: a
+  mapping used to survive both release and transfer, because `fb_map` mappings
+  are not tracked in `proc.maps` the way a pooled frame's are (the region is
+  ~1000 pages). A process could keep drawing through pixels it no longer had any
+  right to. Code written against that -- holding a mapping live across a hand-off
+  and drawing again afterwards -- must now re-map after re-acquiring the
+  capability. The in-tree shell does exactly that across its app launch.
+
+  No firmware page is returned to the frame allocator by any of this: the
+  framebuffer is MMIO, not pooled memory, and the release path is deliberately
+  not the `Frame` path.
 
 ## Syscall interface
 
