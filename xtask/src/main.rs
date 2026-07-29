@@ -51,7 +51,8 @@ const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
     "share", "rpc", "faultchild", "blk", "asyncblk", "blkwrite", "fsdemo", "diskhello", "evt",
     "evtstream", "unified", "kbd", "mouse", "rwfs", "stealer", "stealwork", "gfx", "gfxtext",
-    "gfxsplit", "gfxbound", "shell", "shellapp", "caprelease", "quietworker", "template", "bench",
+    "gfxsplit", "gfxbound", "gfxrevoke", "shell", "shellapp", "caprelease", "quietworker",
+    "template", "bench",
 ];
 
 /// Build all user crates, then the kernel + disk image.
@@ -1046,6 +1047,11 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     check_gfxsplit(&actual);
     check_frames_baseline(&actual, "gfxsplit");
     check_frames_baseline(&actual, "gfxbound");
+    // The D7 hazard (Design/fb_mapping.md): unmapping a framebuffer must not
+    // hand its firmware MMIO pages to the frame allocator. If the fb release
+    // path ever reuses the Frame path's unmap-AND-deallocate, `after` climbs by
+    // ~1000 and this is what catches it.
+    check_frames_baseline(&actual, "gfxrevoke");
     check_frames_baseline(&actual, "shell");
 }
 

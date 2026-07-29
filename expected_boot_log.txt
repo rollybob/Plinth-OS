@@ -379,6 +379,24 @@ plinth: [user fault] #PF
 plinth: terminating user process
 plinth: gfxbound demo: all done
 
+# Framebuffer revocation (D7, Design/fb_mapping.md) -- the other negative, and the
+# only thing that proves access does not outlive authority. gfxrevoke-user maps its
+# band, draws through it (so the mapping is demonstrably live), releases the
+# Framebuffer capability, then stores to the SAME address and is #PF-terminated.
+# The first write is what makes the second one evidence: a demo that only faulted
+# after the release would pass even if fb_map had silently done nothing. Where
+# gfxbound reaches outside its grant in space, this one reaches outside it in time.
+# No positive demo can cover this -- a mapping that wrongly outlives its capability
+# passes them all. The rip/addr in the #PF line vary, so only the stable prefix is
+# asserted. Frames are bracketed by xtask: the unmap must not hand the firmware's
+# MMIO pages to the frame allocator, so the count must come back unchanged.
+plinth: gfxrevoke demo: 1 processes
+gfxrevoke: mapped and drew through it
+gfxrevoke: released the capability, writing anyway
+plinth: [user fault] #PF
+plinth: terminating user process
+plinth: gfxrevoke demo: all done
+
 # Visual userspace skin (D8, Design/display_skin.md) -- the finale: a shell with a
 # splash, a home screen of app icons, and arrow-key navigation, all library-OS
 # policy over the whole-screen Framebuffer (slot 1) + the keyboard EventSource

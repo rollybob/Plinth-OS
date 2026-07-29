@@ -895,6 +895,34 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let after_bound = free_frames();
                 let _ = writeln!(serial, "plinth: {after_bound} frames free after gfxbound");
             }
+
+            // Negative, in time rather than space (D7, Design/fb_mapping.md):
+            // gfxrevoke-user maps its band, draws through it to prove the
+            // mapping is live, releases the capability, and writes to the same
+            // address again -- which now faults, because losing the capability
+            // tore the mapping down (D1). gfxbound shows a grant holder cannot
+            // reach outside its band; this shows it cannot reach its own band
+            // after giving the band up. The frame bracket is load-bearing here:
+            // the fb unmap must NOT return firmware MMIO pages to the frame
+            // allocator, so `after` must equal `before` exactly.
+            if let Some(top) = framebuffer::framebuffer_cap_band(0, half) {
+                const GFXREVOKE_BIN: &[u8] =
+                    include_bytes!(concat!(env!("OUT_DIR"), "/gfxrevoke-user"));
+                let before_revoke = free_frames();
+                let _ = writeln!(serial, "plinth: {before_revoke} frames free before gfxrevoke");
+                let topcap = Capability {
+                    object: top,
+                    rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+                };
+                scheduler::run(
+                    "gfxrevoke demo",
+                    &[GFXREVOKE_BIN],
+                    phys_offset,
+                    &[Some(topcap)],
+                );
+                let after_revoke = free_frames();
+                let _ = writeln!(serial, "plinth: {after_revoke} frames free after gfxrevoke");
+            }
         }
 
         // Visual userspace skin (D8, Design/display_skin.md) -- the finale: a
