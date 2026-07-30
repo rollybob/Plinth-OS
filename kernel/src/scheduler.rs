@@ -1487,15 +1487,6 @@ pub fn clear_origins_naming(slot: usize) -> usize {
     cleared
 }
 
-/// The lender's capability table, wherever the lender currently lives: suspended
-/// in its `TABLE` slot, or running on some core and therefore parked in
-/// `process::CURRENT`. `None` if no live process occupies that slot.
-///
-/// The second half is the same trap `clear_origins_naming` fell into. Reclaiming
-/// only through `TABLE` would silently fail whenever the lender happened to be
-/// running -- and "silently" means the capability is destroyed as if the lender's
-/// table had been full, which is a legitimate outcome (D4) and therefore
-/// indistinguishable from the bug.
 /// Test-only view of `with_lender_caps`, so the reach over a *running* lender is
 /// testable at the layer the bug lived at rather than one below it. Reports
 /// whether the lender was found at all, which is the distinction the reach bug
@@ -1517,6 +1508,15 @@ pub fn swap_current_slot(core: usize, slot: usize) -> usize {
     }
 }
 
+/// The lender's capability table, wherever the lender currently lives: suspended
+/// in its `TABLE` slot, or running on some core and therefore parked in
+/// `process::CURRENT`. `None` if no live process occupies that slot.
+///
+/// The second half is the same trap `clear_origins_naming` fell into. Reclaiming
+/// only through `TABLE` would silently fail whenever the lender happened to be
+/// running -- and "silently" means the capability is destroyed as if the lender's
+/// table had been full, which is a legitimate outcome (D4) and therefore
+/// indistinguishable from the bug.
 fn with_lender_caps<R>(lender: usize, f: impl FnOnce(&mut CapTable) -> R) -> Option<R> {
     // SAFETY: BKL held, IF=0; exclusive access to the process table.
     let suspended = unsafe {

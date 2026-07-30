@@ -37,9 +37,10 @@ use libplinth::{
 /// `fbreclaimchild-user`'s id in the kernel's SPAWNABLE table.
 const FBRECLAIMCHILD_ID: u64 = 5;
 
-/// Side of the hashed square, matching the other framebuffer demos so the
-/// numbers are comparable by eye in the boot log.
-const HASH_SIDE: u32 = 64;
+/// Side of the hashed square. 128 to match every other framebuffer demo (gfx,
+/// gfxtext, shell, shellapp), so the numbers are comparable by eye in the boot
+/// log. This said 64 while its comment claimed to match them, which it did not.
+const HASH_SIDE: u32 = 128;
 
 fn emit_hash(tag: &[u8], fb: &Framebuffer) {
     sys_write(tag);

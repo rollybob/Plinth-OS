@@ -421,12 +421,12 @@ plinth: gfxrevoke demo: all done
 # same D7 reason as gfxrevoke: reclamation must never route a framebuffer through
 # the Frame arm and hand ~1000 MMIO pages to the allocator.
 plinth: fbreclaim demo: 1 processes
-fbreclaim: lent hash 0x63f0997abbfec044
+fbreclaim: lent hash 0xf10a511b535ec044
 fbreclaimchild: holding the screen, now faulting
 plinth: [user fault] #PF
 plinth: terminating user process
 fbreclaim: child died, screen came back
-fbreclaim: reclaimed hash 0x29015dd7953b7784
+fbreclaim: reclaimed hash 0x69d3ede9a07b7784
 plinth: fbreclaim demo: all done
 
 # Visual userspace skin (D8, Design/display_skin.md) -- the finale: a shell with a

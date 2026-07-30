@@ -527,8 +527,16 @@ fn ipc_send(ep_slot: u64, msg: u64, cap_slot: u64, frame_ptr: u64) -> u64 {
 /// recv(ep_slot): return a waiting sender's message (rax) and, if it sent a
 /// capability, that cap's landing slot in this process's table (rdx; NO_CAP
 /// otherwise). Blocks until a sender appears.
+///
+/// **Every return path writes rdx**, including the error and dead-peer ones.
+/// That is not tidiness: `sys_recv_cap` declares rdx as a pure `out` operand, so
+/// it is uninitialised entering the gate, and ABI v2.9 made rdx meaningful on
+/// `IPC_PEER_DIED`. A path that returned without writing it would hand the
+/// caller whatever the compiler happened to leave in the register and invite it
+/// to read that as a capability slot.
 fn ipc_recv(ep_slot: u64, frame_ptr: u64) -> u64 {
     let Some(id) = endpoint_id_for(ep_slot, RIGHT_RECV) else {
+        write_rdx(frame_ptr, NO_CAP);
         return IPC_ERR;
     };
     if let Some(sender) = take_waiting_sender(id) {
@@ -559,6 +567,15 @@ fn ipc_recv(ep_slot: u64, frame_ptr: u64) -> u64 {
     // the only sender died before this recv was reached, e.g. a spawned worker
     // that faulted before the parent reached its wait). Atomic under IF=0.
     if endpoint_senders(id) == 0 {
+        // No capability came back on THIS path, and rdx must say so explicitly.
+        // A death-wake carrying a real landing slot goes through
+        // `scheduler::wake_with` (which writes the saved frame); this is the
+        // synchronous race where the sender was already gone before the recv, so
+        // reclamation -- if any happened -- ran before this process ever blocked
+        // and there is no wake to attach a slot to. A lender that reaches here
+        // still has the capability installed in its table, it just is not told
+        // where. That is the D5 limitation, not an extra one.
+        write_rdx(frame_ptr, NO_CAP);
         return IPC_PEER_DIED;
     }
     // Block as a receiver. A later sender does the transfer and wakes us with

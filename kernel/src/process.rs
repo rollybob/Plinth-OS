@@ -534,14 +534,23 @@ pub fn teardown(mut proc: Process, boot_frames: &[Option<(u64, u64)>]) {
             // to unmap them individually first would be pure work. Nothing is
             // freed either way -- the pages are firmware MMIO.
             crate::capability::ReleaseAction::UnmapFramebuffer => {}
-            // Reclamation is not wired yet (Design/cap_reclaim_build.md B4).
-            // Until it is, a lent framebuffer dies exactly as an owned one
-            // does, which is today's behaviour and keeps this slice inert.
-            // B4 replaces this arm: the capability must be installed in the
-            // lender's table by a pass that runs BEFORE `ipc::reap_dying`,
-            // because that is what wakes the lender, and D5 wants the wake to
-            // carry the landing slot. It cannot be done from here -- teardown
-            // runs after the wake.
+            // Nothing to do here, and deliberately so: the reclamation already
+            // happened. `scheduler::reclaim_lent_caps` copied this capability's
+            // VALUE out and installed it in the lender's table BEFORE
+            // `ipc::reap_dying` ran -- it has to, because `reap_dying` issues the
+            // wake that carries the landing slot (Design/cap_reclaim.md D5, and
+            // 6.5 for why the natural home here is too late).
+            //
+            // DO NOT move reclamation into this arm. Teardown runs after the
+            // wake, so the lender would already have been told empty-handed.
+            //
+            // This arm is reached, not dead: `reclaim_target` builds a fresh
+            // capability for the lender and leaves the dying process's own entry
+            // untouched, so draining the table still classifies it as
+            // `ReclaimTo`. A reclaim that found the lender's table full lands
+            // here too, and correctly just drops. No unmap is needed for the same
+            // reason the `UnmapFramebuffer` arm above needs none: the address
+            // space is about to be destroyed and the pages are firmware MMIO.
             crate::capability::ReleaseAction::ReclaimTo { .. } => {}
             // Nothing pooled: a CpuTime budget (spent or not) has nothing to
             // return, and the inline kinds name no allocation.

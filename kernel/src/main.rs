@@ -196,7 +196,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // and hands the framebuffer to -- Design/display_skin.md; shell-user
         // mirrors this id as SHELLAPP_ID), id 4 = quietworker (a silent
         // grantee, spawned in a loop by the cap_release demo -- a chatty child
-        // would add twenty lines to expected_boot_log for nothing).
+        // would add twenty lines to expected_boot_log for nothing), id 5 =
+        // fbreclaimchild (the child that FAULTS holding a transferred
+        // framebuffer, so the reclamation demo can prove the capability comes
+        // home -- Design/cap_reclaim.md D6; fbreclaim-user mirrors this id as
+        // FBRECLAIMCHILD_ID).
+        //
+        // Ids are positional, so appending is safe but INSERTING is not: every
+        // id after the insertion point shifts and the mirrored constants in the
+        // user crates go stale silently. Append only.
         const SPAWNABLE: &[&[u8]] = &[
             include_bytes!(concat!(env!("OUT_DIR"), "/grantee-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/faultchild-user")),

@@ -164,13 +164,28 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   general. Nothing is reclaimed from a *live* holder; there is no revocation
   protocol and no abort. And a voluntary `cap_release` of a borrowed framebuffer
   still destroys it, exactly as before -- only death returns it.
-- **Two limits worth knowing.** The landing slot only reaches a lender that is
-  *blocked* on the dying process; one that lent and went on doing something else
-  gets the capability silently, with no notification. And if the lender's own
-  16-slot table is full there is nowhere to put the capability, so it is
-  destroyed as it would have been anyway -- a hazard the lender controls, since
-  v2.8's `cap_release` is how it makes room. That is not hypothetical: a shell
-  that leaked one slot per launch used to die on its ninth spawn.
+- **Exactly which wait sees the landing slot.** Reclamation always happens; the
+  *notification* is narrower than "any blocked lender", so it is worth stating
+  precisely. The slot is delivered only to a lender blocked in **`recv` /
+  `recv_cap`** on a channel the dying process could reach. It is NOT delivered
+  to:
+  - a lender that lent and went on doing something else -- there is no wake to
+    carry it, so the capability arrives silently;
+  - a lender blocked in **`call`**, because that op's return convention has no
+    free register for it (`RSI` carries the reply word and `RDX` is discarded);
+  - a caller of the **`spawn_and_wait`** helper, which collapses the three-value
+    return to two and drops the slot on the floor.
+
+  In every one of those cases the capability *is* in the lender's table -- it
+  just has no way to learn where, and nothing enumerates a capability table.
+  A lender that wants the notification must wait with `recv_cap`.
+- **The other limit.** If the lender's own 16-slot table is full there is nowhere
+  to put the capability, so it is destroyed as it would have been anyway -- a
+  hazard the lender controls, since v2.8's `cap_release` is how it makes room.
+  Not hypothetical: a shell that leaked one slot per launch used to die on its
+  ninth spawn.
+- **Only one slot fits.** A lender that had lent the dying process *two*
+  capabilities is told about the first only. Both are in its table.
 
 ### v2.8 (giving a capability back)
 
@@ -374,8 +389,10 @@ Notes:
   slot where a transferred capability landed (or `NO_CAP` if none). A `recv`
   that picks up a `call` instead returns a one-shot **reply capability** in
   `RDX` -- use it with `reply`. A non-`IPC_OK` status (`IPC_PEER_DIED` if the
-  only counterpart died, `IPC_ERR` for a bad slot/right) means no message: the
-  `RSI`/`RDX` values are not valid.
+  only counterpart died, `IPC_ERR` for a bad slot/right) means no message, so
+  `RSI` is not valid. **`RDX` is always valid on `recv`**, on every status: it
+  is either a real slot or `NO_CAP`, never a leftover register (v2.9 -- see
+  below for when it can be a real slot on `IPC_PEER_DIED`).
 - **call(ep_slot, req)** requires `RIGHT_SEND`. It sends a request and blocks
   for a reply, returning `IPC_OK` in `RAX` and the reply word in `RSI`. The
   kernel mints the receiving server a one-shot reply capability naming this

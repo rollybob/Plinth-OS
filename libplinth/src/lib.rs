@@ -548,7 +548,17 @@ pub fn sys_recv(ep_slot: u64) -> (u64, u64) {
 /// cap_slot)`: `status` (rax) is `IPC_OK` / `IPC_PEER_DIED` / `IPC_ERR`, `msg`
 /// (rsi) is the message word, and `cap_slot` (rdx) is where a transferred
 /// capability landed in this process's table, or `NO_CAP` if none was sent.
-/// `msg` and `cap_slot` are meaningful only when `status == IPC_OK`.
+///
+/// `msg` is meaningful only when `status == IPC_OK`. **`cap_slot` is always
+/// meaningful** -- a real slot or `NO_CAP`, never a stale register. Since ABI
+/// v2.9 it can be a real slot on `IPC_PEER_DIED` too: if the peer died still
+/// holding a capability this process had transferred to it, the kernel returns
+/// that capability and reports where it landed here. "Your peer died, and here
+/// is the thing you lent it."
+///
+/// This is the only wait that receives that slot. `sys_call` has no register
+/// free for it and `spawn_and_wait` discards it, so a process that lends a
+/// capability and wants it back by name must wait with this function.
 #[inline]
 pub fn sys_recv_cap(ep_slot: u64) -> (u64, u64, u64) {
     let status: u64;
