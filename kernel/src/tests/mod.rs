@@ -70,6 +70,10 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "capability::event_source_rights", run: capability::event_source_rights },
     TestCase { name: "capability::release_action_per_kind", run: capability::release_action_per_kind },
     TestCase {
+        name: "capability::release_action_reclaims_only_lent_framebuffer",
+        run: capability::release_action_reclaims_only_lent_framebuffer,
+    },
+    TestCase {
         name: "capability::release_action_refuses_reply",
         run: capability::release_action_refuses_reply,
     },

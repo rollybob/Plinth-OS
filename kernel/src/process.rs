@@ -469,7 +469,7 @@ pub fn teardown(mut proc: Process, boot_frames: &[Option<(u64, u64)>]) {
         // shared decision function -- so a new capability kind cannot be
         // reclaimed correctly at death and leak on request, or vice versa
         // (Design/cap_release.md D4).
-        match crate::capability::release_action(&cap.object) {
+        match crate::capability::release_action(&cap) {
             // Frame capabilities are the only kind that owns a poolable
             // resource. The mappings were already torn down by the loop above.
             crate::capability::ReleaseAction::FreeFrame { addr } => {
@@ -494,6 +494,15 @@ pub fn teardown(mut proc: Process, boot_frames: &[Option<(u64, u64)>]) {
             // to unmap them individually first would be pure work. Nothing is
             // freed either way -- the pages are firmware MMIO.
             crate::capability::ReleaseAction::UnmapFramebuffer => {}
+            // Reclamation is not wired yet (Design/cap_reclaim_build.md B4).
+            // Until it is, a lent framebuffer dies exactly as an owned one
+            // does, which is today's behaviour and keeps this slice inert.
+            // B4 replaces this arm: the capability must be installed in the
+            // lender's table by a pass that runs BEFORE `ipc::reap_dying`,
+            // because that is what wakes the lender, and D5 wants the wake to
+            // carry the landing slot. It cannot be done from here -- teardown
+            // runs after the wake.
+            crate::capability::ReleaseAction::ReclaimTo { .. } => {}
             // Nothing pooled: a CpuTime budget (spent or not) has nothing to
             // return, and the inline kinds name no allocation.
             crate::capability::ReleaseAction::DropSlot => {}

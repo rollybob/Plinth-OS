@@ -507,7 +507,7 @@ fn sys_cap_release(slot: u64) -> u64 {
     let Ok(cap) = proc.caps.lookup(slot as usize, 0) else {
         return ERR;
     };
-    let action = capability::release_action(&cap.object);
+    let action = capability::release_action(&cap);
     if action == capability::ReleaseAction::Refuse {
         return ERR;
     }
@@ -547,6 +547,20 @@ fn sys_cap_release(slot: u64) -> u64 {
         // freed: the pages are firmware MMIO, never allocated from anywhere
         // (Design/fb_mapping.md D1 -- this is what cap_release.md D5 deferred).
         capability::ReleaseAction::UnmapFramebuffer => {
+            process::unmap_fb_for_slot(proc, slot as usize);
+        }
+        // A *voluntary* release of a borrowed framebuffer is treated exactly
+        // like releasing an owned one: unmap, and the capability is gone.
+        //
+        // This is deliberate, not an oversight, and it is the same asymmetry
+        // `Refuse` already has -- teardown reads that as "just drop" while this
+        // syscall reads it as an error. Reclamation was ruled for a holder that
+        // *dies* (Design/cap_reclaim.md), and sending a borrowed screen home on
+        // a voluntary release would change this syscall's observable behaviour,
+        // which the ruling did not sanction. Worth revisiting: an app that
+        // politely releases the screen instead of transferring it back still
+        // bricks the display, which is arguably the same bug D1 set out to fix.
+        capability::ReleaseAction::ReclaimTo { .. } => {
             process::unmap_fb_for_slot(proc, slot as usize);
         }
         // Nothing pooled.

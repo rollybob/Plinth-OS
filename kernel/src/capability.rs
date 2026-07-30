@@ -195,6 +195,22 @@ pub enum ReleaseAction {
     /// path would hand ~1000 pages of MMIO to the frame allocator, which would
     /// later serve them as ordinary memory.
     UnmapFramebuffer,
+    /// Unmap as `UnmapFramebuffer` does, but do **not** destroy the capability:
+    /// hand it back to the process at `lender` (Design/cap_reclaim.md D1/D2).
+    ///
+    /// This variant exists because `UnmapFramebuffer` conflates two things that
+    /// reclamation has to separate. The dying holder's mapping must still die
+    /// with it -- that is the fb_mapping D1 invariant, and `gfxrevoke-user` is
+    /// the regression test for it -- while the capability *value* survives to be
+    /// installed in the lender's table. "Unmap" and "the authority is gone" are
+    /// not the same event once a capability can be lent.
+    ///
+    /// Deliberately NOT `FreeFrame`, for the same reason `UnmapFramebuffer` is
+    /// not: a framebuffer names ~1000 pages of firmware MMIO, and routing them
+    /// into the frame allocator would have it serve them later as ordinary
+    /// memory (Design/fb_mapping.md D7). The frame baselines are what would
+    /// catch that, and they must not move.
+    ReclaimTo { lender: usize },
     /// Nothing pooled: emptying the slot is the whole of the release.
     DropSlot,
     /// Not releasable on request. Only `Reply`: it names a caller that is
@@ -210,8 +226,35 @@ pub enum ReleaseAction {
 /// woken any stranded caller by then). Pure so the in-kernel test harness can
 /// reach it -- a syscall needs a current process and a live address space,
 /// and the harness has neither.
-pub fn release_action(object: &CapObject) -> ReleaseAction {
-    match *object {
+///
+/// Takes the whole `Capability`, not just its object, because the decision now
+/// depends on `origin` (Design/cap_reclaim.md D6, ruled WIDEN rather than adding
+/// a sibling function). The payoff of `cap_release.md` D4 was that this policy is
+/// written exactly once, because two places make the decision and must not drift;
+/// a second function would have re-created the drift on day one.
+///
+/// **Callers interpret `ReclaimTo` differently, and that asymmetry is the point.**
+/// It is the same shape as `Refuse`, which teardown already maps to "just drop".
+/// Reclamation was ruled for capabilities whose holder *dies*
+/// (Design/cap_reclaim.md is titled for exactly that), so `sys_cap_release` --
+/// a live process voluntarily giving a capability up -- deliberately treats
+/// `ReclaimTo` as plain `UnmapFramebuffer`. Whether a *voluntary* release should
+/// also send a borrowed framebuffer home is a real question the ruling did not
+/// decide; it would change `cap_release`'s observable behaviour, so it is not
+/// being smuggled in here.
+pub fn release_action(cap: &Capability) -> ReleaseAction {
+    // Scope is `Framebuffer` only (Design/cap_reclaim.md D2, narrowed at ruling
+    // time). `EventSource` was in the draft and was cut: the kernel hands every
+    // process that needs input its own, `sys_spawn` moves exactly one capability
+    // so a lender would have to give up the screen to lend a keyboard, and no
+    // user crate lends one -- an arm with no caller and no test to distinguish it
+    // from dead code. It becomes a one-line change here once a lender exists.
+    if let CapObject::Framebuffer { .. } = cap.object {
+        if let Some(lender) = cap.origin {
+            return ReleaseAction::ReclaimTo { lender };
+        }
+    }
+    match cap.object {
         CapObject::Frame { addr } => ReleaseAction::FreeFrame { addr },
         CapObject::Ring { id } => ReleaseAction::ReleaseRing { id },
         CapObject::Endpoint { .. } => ReleaseAction::DropEndpoint,

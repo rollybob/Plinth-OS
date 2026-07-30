@@ -7,6 +7,11 @@ use crate::capability::{
 };
 use crate::test_assert;
 
+/// A kernel-minted capability: no lender.
+fn kernel_cap(object: CapObject) -> Capability {
+    Capability { object, rights: RIGHT_READ, origin: None }
+}
+
 /// A framebuffer-shaped capability, the kind reclamation exists for.
 fn fb_cap(origin: Option<usize>) -> Capability {
     Capability {
@@ -283,16 +288,17 @@ pub fn event_source_rights(_ctx: &mut TestCtx) -> Result<(), &'static str> {
 /// added with a reclaim path at death and a leak on request.
 pub fn release_action_per_kind(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     test_assert!(
-        release_action(&CapObject::Frame { addr: 0x4000 })
+        release_action(&kernel_cap(CapObject::Frame { addr: 0x4000 }))
             == ReleaseAction::FreeFrame { addr: 0x4000 },
         "a Frame must be returned to the allocator, at its own address"
     );
     test_assert!(
-        release_action(&CapObject::Ring { id: 2 }) == ReleaseAction::ReleaseRing { id: 2 },
+        release_action(&kernel_cap(CapObject::Ring { id: 2 }))
+            == ReleaseAction::ReleaseRing { id: 2 },
         "a Ring must release its kernel table slot, by its own id"
     );
     test_assert!(
-        release_action(&CapObject::Endpoint { id: 3 }) == ReleaseAction::DropEndpoint,
+        release_action(&kernel_cap(CapObject::Endpoint { id: 3 })) == ReleaseAction::DropEndpoint,
         "an Endpoint must drop a reference so free-at-zero can fire"
     );
 
@@ -302,14 +308,7 @@ pub fn release_action_per_kind(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     // (Design/fb_mapping.md D1). Pinned separately from the list below so that
     // regressing it back to DropSlot fails here rather than silently.
     test_assert!(
-        release_action(&CapObject::Framebuffer {
-            phys_base: 0x8000_0000,
-            width: 1280,
-            height: 800,
-            stride: 1280,
-            bytes_per_pixel: 4,
-            format: 1,
-        }) == ReleaseAction::UnmapFramebuffer,
+        release_action(&fb_cap(None)) == ReleaseAction::UnmapFramebuffer,
         "a Framebuffer must unmap on release -- access must not outlive authority"
     );
 
@@ -322,10 +321,55 @@ pub fn release_action_per_kind(_ctx: &mut TestCtx) -> Result<(), &'static str> {
         CapObject::EventSource { id: 0 },
     ] {
         test_assert!(
-            release_action(&obj) == ReleaseAction::DropSlot,
+            release_action(&kernel_cap(obj)) == ReleaseAction::DropSlot,
             "a capability naming no pooled resource must just vacate its slot"
         );
     }
+    Ok(())
+}
+
+/// Scope of reclamation (Design/cap_reclaim.md D2, narrowed at ruling time to
+/// `Framebuffer` alone). The decision reads `origin`, which is why the policy
+/// takes a whole `Capability` rather than a bare object (D6, ruled WIDEN).
+pub fn release_action_reclaims_only_lent_framebuffer(
+    _ctx: &mut TestCtx,
+) -> Result<(), &'static str> {
+    // A LENT framebuffer goes home, naming its lender.
+    test_assert!(
+        release_action(&fb_cap(Some(2))) == ReleaseAction::ReclaimTo { lender: 2 },
+        "a lent framebuffer must be reclaimed to the process that lent it"
+    );
+    // An OWNED one is unchanged -- this is the pre-reclamation behaviour and the
+    // fb_mapping D1 invariant that gfxrevoke-user guards.
+    test_assert!(
+        release_action(&fb_cap(None)) == ReleaseAction::UnmapFramebuffer,
+        "an owned framebuffer must still just unmap"
+    );
+
+    // D2's narrowing, pinned: no OTHER kind reclaims, however it got its origin.
+    // EventSource is the one that was explicitly cut from the draft, so it is the
+    // one most likely to be added back by accident.
+    for obj in [
+        CapObject::EventSource { id: 0 },
+        CapObject::CpuTime { budget: 100 },
+        CapObject::BlockRange { dev: 0, start: 8, count: 4 },
+    ] {
+        test_assert!(
+            release_action(&Capability { object: obj, rights: RIGHT_READ, origin: Some(2) })
+                == ReleaseAction::DropSlot,
+            "only a Framebuffer is in reclamation's scope -- D2 was narrowed deliberately"
+        );
+    }
+    // A lent Frame still returns to the allocator: pooled resources are correctly
+    // returned by death, and D2 rejected "a loan is a loan" on blast radius.
+    test_assert!(
+        release_action(&Capability {
+            object: CapObject::Frame { addr: 0x4000 },
+            rights: RIGHT_READ,
+            origin: Some(2),
+        }) == ReleaseAction::FreeFrame { addr: 0x4000 },
+        "a lent Frame must still be freed, not reclaimed -- every frame baseline depends on it"
+    );
     Ok(())
 }
 
@@ -337,7 +381,7 @@ pub fn release_action_per_kind(_ctx: &mut TestCtx) -> Result<(), &'static str> {
 /// and a server that dies is handled by `ipc::reap_dying`.
 pub fn release_action_refuses_reply(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     test_assert!(
-        release_action(&CapObject::Reply { caller: 1 }) == ReleaseAction::Refuse,
+        release_action(&kernel_cap(CapObject::Reply { caller: 1 })) == ReleaseAction::Refuse,
         "releasing a Reply was allowed -- it would strand the blocked caller"
     );
     Ok(())
