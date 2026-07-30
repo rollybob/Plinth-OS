@@ -120,6 +120,27 @@ pub enum CapObject {
 pub struct Capability {
     pub object: CapObject,
     pub rights: u8,
+    /// The process that lent this capability, as a process-table slot, or
+    /// `None` if the kernel minted it (Design/cap_reclaim.md D3).
+    ///
+    /// Set at transfer time so a holder's death can return an unre-mintable
+    /// capability to its lender instead of destroying it. `None` means "nobody
+    /// lent this" -- every kernel mint, and every capability that has come home
+    /// to its own origin (the homecoming rule: a stale origin pointing at a
+    /// process with no remaining claim is a lie the next death would act on).
+    ///
+    /// A slot, not a `ProcessId`, because this kernel has no such type -- but
+    /// note the safety argument that makes `Reply { caller }`'s slot sound (the
+    /// named caller is pinned Blocked and cannot exit) does NOT hold here: a
+    /// lender is not pinned and can exit while the borrower lives, after which
+    /// its slot may be reused by an unrelated process. What keeps this honest is
+    /// the exit-time sweep that clears every `origin` naming a departing slot
+    /// (Design/cap_reclaim_build.md section 0). Without that sweep this field is
+    /// a hazard, not a record.
+    ///
+    /// Nothing reads this yet -- it is introduced on its own so that the change
+    /// in `Process` size can be proven inert before any behaviour depends on it.
+    pub origin: Option<usize>,
 }
 
 /// What the kernel must do, beyond emptying the slot, when a capability
@@ -213,11 +234,17 @@ impl CapTable {
         CapTable { slots: [None; MAX_CAPS] }
     }
 
-    /// Install a capability in the first free slot; returns the slot index.
+    /// Install a kernel-minted capability in the first free slot; returns the
+    /// slot index. `origin` is `None`: nothing lent this.
+    ///
+    /// Deliberately keeps its two-argument signature so that none of its
+    /// existing call sites move when `origin` is introduced. The lending path
+    /// gets its own constructor rather than a third argument here, so that a
+    /// call site says which case it is instead of passing `None`.
     pub fn mint(&mut self, object: CapObject, rights: u8) -> Result<usize, CapError> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(Capability { object, rights });
+                *slot = Some(Capability { object, rights, origin: None });
                 return Ok(i);
             }
         }

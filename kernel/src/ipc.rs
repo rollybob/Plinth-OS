@@ -605,7 +605,7 @@ fn ipc_reply(reply_slot: u64, msg: u64) -> u64 {
 /// Mint a one-shot reply capability naming `caller` into the current (server)
 /// process. Returns its slot, or NO_CAP if the table is full.
 fn mint_reply_cap_into_current(caller: usize) -> u64 {
-    let cap = Capability { object: CapObject::Reply { caller }, rights: 0 };
+    let cap = Capability { object: CapObject::Reply { caller }, rights: 0, origin: None };
     let landing = {
         let mut guard = process::current().lock();
         guard
@@ -618,7 +618,7 @@ fn mint_reply_cap_into_current(caller: usize) -> u64 {
 /// Mint a one-shot reply capability naming `caller` into the blocked server at
 /// `server`. Returns its slot, or NO_CAP if that table is full.
 fn mint_reply_cap_into_blocked(server: usize, caller: usize) -> u64 {
-    let cap = Capability { object: CapObject::Reply { caller }, rights: 0 };
+    let cap = Capability { object: CapObject::Reply { caller }, rights: 0, origin: None };
     scheduler::mint_into_blocked(server, cap)
         .map(|l| l as u64)
         .unwrap_or(NO_CAP)

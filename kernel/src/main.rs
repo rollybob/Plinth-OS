@@ -371,6 +371,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let cap = Capability {
                     object: CapObject::Endpoint { id: ep },
                     rights: RIGHT_SEND | RIGHT_RECV,
+                    origin: None,
                 };
                 scheduler::run(
                     "ipc demo",
@@ -400,6 +401,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let cap = Capability {
                     object: CapObject::Endpoint { id: ep },
                     rights: RIGHT_SEND | RIGHT_RECV,
+                    origin: None,
                 };
                 scheduler::run(
                     "share demo",
@@ -430,10 +432,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let recv_cap = Capability {
                     object: CapObject::Endpoint { id: ep },
                     rights: RIGHT_RECV,
+                    origin: None,
                 };
                 let send_cap = Capability {
                     object: CapObject::Endpoint { id: ep },
                     rights: RIGHT_SEND,
+                    origin: None,
                 };
                 scheduler::run(
                     "rpc demo",
@@ -534,6 +538,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let range = Capability {
                 object: CapObject::BlockRange { dev: 0, start: 1, count: 4 },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             scheduler::run("blk demo", &[BLK_BIN], phys_offset, &[Some(range)]);
             let after_blk = free_frames();
@@ -557,6 +562,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let range = Capability {
                 object: CapObject::BlockRange { dev: 0, start: 0, count: 4 },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             scheduler::run("asyncblk demo", &[ASYNCBLK_BIN], phys_offset, &[Some(range)]);
             let after_async = free_frames();
@@ -589,10 +595,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let range = Capability {
                 object: CapObject::BlockRange { dev: 0, start: 8, count: 4 },
                 rights: capability::RIGHT_READ | capability::RIGHT_WRITE,
+                origin: None,
             };
             let rdonly_range = Capability {
                 object: CapObject::BlockRange { dev: 0, start: 12, count: 4 },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             scheduler::run(
                 "blkwrite demo",
@@ -625,6 +633,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let range = Capability {
                 object: CapObject::BlockRange { dev: 1, start: 0, count: cap },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             scheduler::run("fs demo", &[FSDEMO_BIN], phys_offset, &[Some(range)]);
             let after_fs = free_frames();
@@ -646,6 +655,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let source = Capability {
                 object: CapObject::EventSource { id: 0 },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             // 'A' make code (0x1E), delivered the moment the reader blocks.
             input::arm_synthetic(&[0x1E]);
@@ -672,6 +682,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let source = Capability {
                 object: CapObject::EventSource { id: 0 },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             // Set-1 make codes for 'a','b','c','d' -- must match evtstream-user's
             // SEQUENCE. Delivered one per block as the reader idles on input.
@@ -695,6 +706,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let source = Capability {
                 object: CapObject::EventSource { id: 0 },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             // Set-1 scancodes for "Hi\n": LShift make, h, LShift break, i, Enter.
             input::arm_synthetic(&[0x2A, 0x23, 0xAA, 0x17, 0x1C]);
@@ -724,10 +736,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let range = Capability {
                 object: CapObject::BlockRange { dev: 0, start: 0, count: 1 },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             let source = Capability {
                 object: CapObject::EventSource { id: 0 },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             // Set-1 make codes for 'x','y','z' -- must match unified-user's SEQUENCE.
             input::arm_synthetic(&[0x2D, 0x15, 0x2C]);
@@ -752,6 +766,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let source = Capability {
                 object: CapObject::EventSource { id: input::SOURCE_MOUSE as u8 },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             // Must match mouse-user's SEQUENCE: (dx, dy, buttons) per packet.
             input::arm_synthetic_mouse(&[(10, -5, 0x00), (-20, 15, 0x01), (3, 3, 0x02)]);
@@ -779,6 +794,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let range = Capability {
                 object: CapObject::BlockRange { dev: 0, start: 32, count: 64 },
                 rights: capability::RIGHT_READ | capability::RIGHT_WRITE,
+                origin: None,
             };
             scheduler::run("rwfs demo", &[RWFS_BIN], phys_offset, &[Some(range)]);
             let after_rwfs = free_frames();
@@ -805,6 +821,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let cap = Capability {
                 object: fbobj,
                 rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+                origin: None,
             };
             scheduler::run("gfx demo", &[GFX_BIN], phys_offset, &[Some(cap)]);
             let after_gfx = free_frames();
@@ -830,10 +847,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let fbcap = Capability {
                 object: fbobj,
                 rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+                origin: None,
             };
             let source = Capability {
                 object: CapObject::EventSource { id: 0 },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             // Set-1 make codes for "stage 3" + Enter -- must spell the line the
             // font renders (uppercased) and the smoke asserts.
@@ -867,8 +886,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let rights = capability::RIGHT_MAP | capability::RIGHT_WRITE;
                 let before_split = free_frames();
                 let _ = writeln!(serial, "plinth: {before_split} frames free before gfxsplit");
-                let topcap = Capability { object: top, rights };
-                let botcap = Capability { object: bottom, rights };
+                let topcap = Capability { object: top, rights, origin: None };
+                let botcap = Capability { object: bottom, rights, origin: None };
                 // Two-process run: process 0 gets the top band, process 1 the
                 // bottom (one grant each); RDI tells each which it is.
                 scheduler::run(
@@ -890,6 +909,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let topcap = Capability {
                     object: top,
                     rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+                    origin: None,
                 };
                 scheduler::run("gfxbound demo", &[GFXBOUND_BIN], phys_offset, &[Some(topcap)]);
                 let after_bound = free_frames();
@@ -913,6 +933,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let topcap = Capability {
                     object: top,
                     rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+                    origin: None,
                 };
                 scheduler::run(
                     "gfxrevoke demo",
@@ -946,10 +967,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let fbcap = Capability {
                 object: fbobj,
                 rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+                origin: None,
             };
             let source = Capability {
                 object: CapObject::EventSource { id: 0 },
                 rights: capability::RIGHT_READ,
+                origin: None,
             };
             // Set-1 scancodes driving the home screen: Right (0xE0 0x4D) ->
             // select BARS, Enter (0x1C) -> open its view, Backspace (0x0E) ->

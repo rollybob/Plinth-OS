@@ -748,6 +748,7 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
     let send_cap = Capability {
         object: CapObject::Endpoint { id: ep },
         rights: RIGHT_SEND,
+        origin: None,
     };
     if scheduler::spawn(binary, phys, &[Some(send_cap), transferred]).is_none() {
         // Could not create the child: it never minted send_cap, so the result
@@ -765,7 +766,8 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
     }
 
     // The caller's RECV handle on the result channel; recv on it = wait.
-    let recv_cap = Capability { object: CapObject::Endpoint { id: ep }, rights: RIGHT_RECV };
+    let recv_cap =
+        Capability { object: CapObject::Endpoint { id: ep }, rights: RIGHT_RECV, origin: None };
     let handle = {
         let mut cur = process::current().lock();
         cur.as_mut().and_then(|p| p.caps.mint(recv_cap.object, recv_cap.rights).ok())
