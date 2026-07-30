@@ -46,7 +46,7 @@ use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::VirtAddr;
 
 use crate::bkl;
-use crate::capability::Capability;
+use crate::capability::{self, CapTable, Capability};
 use crate::gdt;
 use crate::ipc;
 use crate::memory;
@@ -854,6 +854,13 @@ pub fn on_exit() -> ! {
     // counterpart this was. Runs BEFORE teardown drains the caps, so the reply
     // targets and endpoint queues are still intact; teardown then applies the
     // refcount decrements and frees the slot (hardening D5).
+    // Send home anything this process borrowed, BEFORE the wake below -- the
+    // lender's table has to be filled before the lender is told, because
+    // `reap_dying` is what tells it (Design/cap_reclaim.md D5, and section 6.5
+    // of that doc for why the obvious placement in `teardown` is too late).
+    let mut reclaimed = [(0usize, 0usize); capability::MAX_CAPS];
+    let n_reclaimed = reclaim_lent_caps(&proc.caps, cur, &mut reclaimed);
+    let _ = n_reclaimed; // B5 reports these landing slots on the death-wake.
     ipc::reap_dying(&proc.caps);
     // This slot's identity is about to become reusable, so no surviving
     // capability may keep naming it as a lender. Must run before the slot is
@@ -1361,6 +1368,66 @@ pub fn install_into_blocked(slot: usize, cap: Capability) -> Option<usize> {
         let table = &mut *addr_of_mut!(TABLE);
         table[slot].process.as_mut()?.caps.install(cap).ok()
     }
+}
+
+/// Return every capability the dying process at `dying_slot` borrowed to the
+/// process that lent it (Design/cap_reclaim.md D1).
+///
+/// Returns the `(lender_slot, landing_slot)` pairs, so the caller can tell each
+/// lender where its capability landed. Bounded by `MAX_CAPS` -- a dying process
+/// cannot have borrowed more capabilities than its table holds.
+///
+/// **This must run before `ipc::reap_dying`.** That is not a preference: D5 has
+/// the death-wake carry the landing slot, `reap_dying` is what issues that wake,
+/// and a reclamation done later (in `teardown`, where the rest of the per-slot
+/// release policy lives) would fill the lender's table only after the lender had
+/// already been woken empty-handed. The natural home for this is the wrong one.
+///
+/// The dying holder's mapping needs no explicit unmap here, for the same reason
+/// `teardown`'s `UnmapFramebuffer` arm is a no-op: the whole address space is
+/// about to be destroyed, and walking ~1000 framebuffer pages individually first
+/// would be pure work. What matters is that the capability VALUE is copied out
+/// before `teardown` drains the slot, which it is -- `Capability` is `Copy`.
+///
+/// Extending `ipc::reap_dying` instead was rejected: it takes the table by shared
+/// reference and is documented never to touch refcounts, while this needs `&mut`
+/// on a *different* process's table. Two different jobs.
+fn reclaim_lent_caps(
+    dying: &CapTable,
+    dying_slot: usize,
+    out: &mut [(usize, usize); capability::MAX_CAPS],
+) -> usize {
+    let mut n = 0;
+    for cap in dying.iter() {
+        let Some((lender, home)) = capability::reclaim_target(&cap, dying_slot) else {
+            continue;
+        };
+        // A dead lender never reaches here: its exit swept this origin to `None`
+        // (`clear_origins_naming`), so `release_action` would not have said
+        // `ReclaimTo` at all. That is how D4's first fallback is satisfied
+        // without a liveness check -- see Design/cap_reclaim_build.md section 0.
+        // SAFETY: single CPU, IF=0; exclusive access to the process table.
+        let landed = unsafe {
+            let table = &mut *addr_of_mut!(TABLE);
+            table
+                .get_mut(lender)
+                .and_then(|slot| slot.process.as_mut())
+                .and_then(|p| p.caps.reclaim(home))
+        };
+        // `None` = the lender's table is full (D4) and the capability dies as it
+        // would have anyway, or the slot holds no live process. Either way there
+        // is nothing to report and nothing to account.
+        if let Some(landing) = landed {
+            // A capability entered a table. A no-op for a `Framebuffer`, which is
+            // the whole of D2's scope today and carries no reference count --
+            // called anyway so that widening that scope to a refcounted kind
+            // cannot silently skip the accounting.
+            ipc::note_cap_added(&home);
+            out[n] = (lender, landing);
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Clear every `origin` naming `slot` from every live capability table.

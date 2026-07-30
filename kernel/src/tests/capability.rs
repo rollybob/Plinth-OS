@@ -2,7 +2,8 @@
 
 use super::TestCtx;
 use crate::capability::{
-    release_action, CapError, CapObject, CapTable, Capability, ReleaseAction, MAX_CAPS,
+    reclaim_target, release_action, CapError, CapObject, CapTable, Capability, ReleaseAction,
+    MAX_CAPS,
     RIGHT_CONSUME, RIGHT_MAP, RIGHT_READ, RIGHT_WRITE,
 };
 use crate::test_assert;
@@ -369,6 +370,68 @@ pub fn release_action_reclaims_only_lent_framebuffer(
             origin: Some(2),
         }) == ReleaseAction::FreeFrame { addr: 0x4000 },
         "a lent Frame must still be freed, not reclaimed -- every frame baseline depends on it"
+    );
+    Ok(())
+}
+
+/// Reclamation, as the pure decision plus the install (Design/cap_reclaim.md
+/// D1/D4). The process-table walk needs `static mut TABLE`, which the harness has
+/// no more than it has an address space, so the decision is what is tested here.
+pub fn reclaim_target_sends_lent_screen_home(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    // Process 3 dies holding a framebuffer that process 1 lent it.
+    let (lender, home) =
+        reclaim_target(&fb_cap(Some(1)), 3).ok_or("a lent framebuffer must be reclaimable")?;
+    test_assert!(lender == 1, "it must go home to the process that lent it");
+    test_assert!(
+        home.origin.is_none(),
+        "the reclaimed capability has come home, so its origin must clear -- \
+         an origin naming the dead borrower is the lie the next death acts on"
+    );
+    test_assert!(home.object == fb_cap(None).object, "the object itself must survive intact");
+    test_assert!(home.rights == fb_cap(None).rights, "rights must survive intact");
+
+    // An OWNED framebuffer is nobody's loan: it dies as before.
+    test_assert!(
+        reclaim_target(&fb_cap(None), 3).is_none(),
+        "an owned framebuffer must not be reclaimed anywhere"
+    );
+    // Out of scope per D2, however it got an origin.
+    test_assert!(
+        reclaim_target(
+            &Capability {
+                object: CapObject::EventSource { id: 0 },
+                rights: RIGHT_READ,
+                origin: Some(1)
+            },
+            3
+        )
+        .is_none(),
+        "only a Framebuffer is reclaimable today"
+    );
+    Ok(())
+}
+
+/// D4's second fallback: the lender's table is full, so there is nowhere to put
+/// the capability and it dies exactly as it does today. Not hypothetical -- the
+/// shell hit precisely this by leaking a slot per launch until the ninth spawn
+/// failed (the 2026-06-27 crash, before ABI v2.8's `cap_release` existed).
+pub fn reclaim_declines_when_lender_table_full(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut lender = CapTable::new();
+    for _ in 0..MAX_CAPS {
+        lender.mint(CapObject::Frame { addr: 0x1000 }, RIGHT_READ).map_err(|_| "fill failed")?;
+    }
+    let (_, home) = reclaim_target(&fb_cap(Some(1)), 3).ok_or("should be reclaimable")?;
+    test_assert!(
+        lender.reclaim(home).is_none(),
+        "a full table must decline the reclaim rather than displace something"
+    );
+
+    // With one slot free it lands, and the origin is still clear.
+    lender.revoke(0).map_err(|_| "revoke failed")?;
+    let landing = lender.reclaim(home).ok_or("a free slot must accept the reclaim")?;
+    test_assert!(
+        lender.lookup(landing, RIGHT_MAP).map_err(|_| "lookup")?.origin.is_none(),
+        "the reclaimed capability must be owned outright by its lender"
     );
     Ok(())
 }

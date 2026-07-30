@@ -74,6 +74,14 @@ const TESTS: &[TestCase] = &[
         run: capability::release_action_reclaims_only_lent_framebuffer,
     },
     TestCase {
+        name: "capability::reclaim_target_sends_lent_screen_home",
+        run: capability::reclaim_target_sends_lent_screen_home,
+    },
+    TestCase {
+        name: "capability::reclaim_declines_when_lender_table_full",
+        run: capability::reclaim_declines_when_lender_table_full,
+    },
+    TestCase {
         name: "capability::release_action_refuses_reply",
         run: capability::release_action_refuses_reply,
     },

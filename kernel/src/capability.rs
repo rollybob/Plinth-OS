@@ -220,6 +220,25 @@ pub enum ReleaseAction {
     Refuse,
 }
 
+/// Where a dying process's capability should go home to, and what it should look
+/// like when it gets there. `None` means it is not reclaimable and dies as usual.
+///
+/// Pure, and separated from the process-table walk on purpose: the walk needs
+/// `static mut TABLE` and the in-kernel harness has no process table, exactly as
+/// `release_action` and `process::fb_record` are pure for the same reason. This
+/// is the part with a decision in it, so this is the part the tests can reach.
+///
+/// The returned capability has come home, so `lent_to` clears its origin -- the
+/// lender owns it outright again, and an origin still naming the dead borrower
+/// would be a lie the *next* death would act on. Reusing `lent_to` rather than
+/// writing `origin: None` here is deliberate: there is one homecoming rule.
+pub fn reclaim_target(cap: &Capability, dying_slot: usize) -> Option<(usize, Capability)> {
+    match release_action(cap) {
+        ReleaseAction::ReclaimTo { lender } => Some((lender, cap.lent_to(dying_slot, lender))),
+        _ => None,
+    }
+}
+
 /// The release policy, as a pure decision. `syscall::sys_cap_release` runs it
 /// for one slot on request; `process::teardown` runs it for every slot at
 /// death (mapping `Refuse` to "just drop", since `reap_dying` has already
@@ -331,6 +350,19 @@ impl CapTable {
             }
         }
         Err(CapError::TableFull)
+    }
+
+    /// Install `cap` and return its slot, or `None` if the table is full.
+    ///
+    /// The reclamation half of a death: `Some` means the capability came home,
+    /// `None` is D4's second fallback -- the lender filled its own 16 slots, so
+    /// there is nowhere to put it and it dies as it would have anyway. That is a
+    /// hazard the lender controls rather than a trap, and not a hypothetical one:
+    /// the shell used to leak a slot per launch and the ninth spawn failed with
+    /// the table full (`shell-user`, "the 2026-06-27 crash"). ABI v2.8's
+    /// `cap_release` is what turned that from unfixable into routine.
+    pub fn reclaim(&mut self, cap: Capability) -> Option<usize> {
+        self.install(cap).ok()
     }
 
     /// Clear every `origin` naming `slot`, returning how many were cleared.
