@@ -74,6 +74,18 @@ const TESTS: &[TestCase] = &[
         run: capability::release_action_refuses_reply,
     },
     TestCase {
+        name: "capability::origin_recorded_on_transfer",
+        run: capability::origin_recorded_on_transfer,
+    },
+    TestCase {
+        name: "capability::origin_clears_on_homecoming",
+        run: capability::origin_clears_on_homecoming,
+    },
+    TestCase {
+        name: "capability::origin_cleared_when_lender_exits",
+        run: capability::origin_cleared_when_lender_exits,
+    },
+    TestCase {
         name: "capability::slot_reuse_past_table_size",
         run: capability::slot_reuse_past_table_size,
     },

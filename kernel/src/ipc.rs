@@ -619,7 +619,7 @@ fn mint_reply_cap_into_current(caller: usize) -> u64 {
 /// `server`. Returns its slot, or NO_CAP if that table is full.
 fn mint_reply_cap_into_blocked(server: usize, caller: usize) -> u64 {
     let cap = Capability { object: CapObject::Reply { caller }, rights: 0, origin: None };
-    scheduler::mint_into_blocked(server, cap)
+    scheduler::install_into_blocked(server, cap)
         .map(|l| l as u64)
         .unwrap_or(NO_CAP)
 }
@@ -642,16 +642,22 @@ fn transfer_current_to_blocked(receiver: usize, cap_slot: u64) -> u64 {
     // The revoke above is the give half of the move; account it (no free --
     // the matching mint below re-references the endpoint).
     note_cap_removed(&cap, false);
-    match scheduler::mint_into_blocked(receiver, cap) {
+    // The lender is recorded on the way in (Design/cap_reclaim.md D3), and the
+    // homecoming rule inside `lent_to` clears it when the capability is going
+    // back to whoever lent it.
+    let lent = cap.lent_to(scheduler::current_slot(), receiver);
+    match scheduler::install_into_blocked(receiver, lent) {
         Some(landing) => {
             note_cap_added(&cap);
             landing as u64
         }
         None => {
-            // Receiver's table is full: hand the capability back to the sender.
+            // Receiver's table is full: hand the capability back to the sender,
+            // verbatim -- the transfer did not happen, so the sender must get
+            // back exactly what it had, origin included, not `lent`.
             let mut guard = process::current().lock();
             if let Some(p) = guard.as_mut() {
-                let _ = p.caps.mint(cap.object, cap.rights);
+                let _ = p.caps.install(cap);
             }
             note_cap_added(&cap);
             NO_CAP
@@ -668,11 +674,12 @@ fn transfer_blocked_to_current(sender: usize, cap_slot: u64) -> u64 {
     };
     // Give half of the move; account it (no free -- the mint below re-refs).
     note_cap_removed(&cap, false);
+    // Same as the other direction: the blocked sender is the lender, and
+    // `lent_to` clears the origin if this is the capability coming home.
+    let lent = cap.lent_to(sender, scheduler::current_slot());
     let landing = {
         let mut guard = process::current().lock();
-        guard
-            .as_mut()
-            .and_then(|p| p.caps.mint(cap.object, cap.rights).ok())
+        guard.as_mut().and_then(|p| p.caps.install(lent).ok())
     };
     match landing {
         Some(l) => {
@@ -680,7 +687,9 @@ fn transfer_blocked_to_current(sender: usize, cap_slot: u64) -> u64 {
             l as u64
         }
         None => {
-            let _ = scheduler::mint_into_blocked(sender, cap);
+            // Verbatim, not `lent`: the move failed, so the still-blocked
+            // sender gets back precisely the capability it held.
+            let _ = scheduler::install_into_blocked(sender, cap);
             note_cap_added(&cap);
             NO_CAP
         }

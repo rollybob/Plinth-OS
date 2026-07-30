@@ -750,15 +750,28 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
         rights: RIGHT_SEND,
         origin: None,
     };
-    if scheduler::spawn(binary, phys, &[Some(send_cap), transferred]).is_none() {
+    // The caller is lending this capability to the child, so record the caller
+    // as its origin (Design/cap_reclaim.md D3). Kept separate from
+    // `transferred`, which stays the pristine original for the rollback below:
+    // if the spawn fails the move did not happen, and the caller must get back
+    // exactly the capability it had.
+    //
+    // Set here rather than inside `scheduler::spawn` because only this call site
+    // knows *which* grant is a lend -- `send_cap` beside it is a kernel mint and
+    // must keep `origin: None`. The homecoming rule cannot apply to a spawn: the
+    // child's slot is one that is free right now, and the exit-time sweep
+    // guarantees no live capability names a free slot, so `origin` can never
+    // already be the child's.
+    let lent = transferred.map(|cap| Capability { origin: Some(scheduler::current_slot()), ..cap });
+    if scheduler::spawn(binary, phys, &[Some(send_cap), lent]).is_none() {
         // Could not create the child: it never minted send_cap, so the result
         // endpoint is unreferenced -- reclaim the slot. Then undo the capability
-        // move by re-minting it back to the caller (re-accounting it).
+        // move by restoring it to the caller verbatim (re-accounting it).
         ipc::release_endpoint(ep);
         if let Some(cap) = transferred {
             let mut cur = process::current().lock();
             if let Some(p) = cur.as_mut() {
-                let _ = p.caps.mint(cap.object, cap.rights);
+                let _ = p.caps.install(cap);
             }
             ipc::note_cap_added(&cap);
         }

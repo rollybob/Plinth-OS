@@ -324,10 +324,10 @@ pub fn spawn_process(transferred: Option<Capability>) -> Process {
         .expect("fresh capability table cannot be full");
     debug_assert_eq!(slot, CPU_CAP_SLOT, "CPU-time capability landed in an unexpected slot");
     if let Some(cap) = transferred {
-        let granted = proc
-            .caps
-            .mint(cap.object, cap.rights)
-            .expect("fresh table has room for a grant");
+        // `install`, not `mint`: this is a capability *moving* into the new
+        // process, so its `origin` moves with it (Design/cap_reclaim.md D3).
+        let granted =
+            proc.caps.install(cap).expect("fresh table has room for a grant");
         debug_assert_eq!(granted, GRANT_SLOT, "granted capability landed in an unexpected slot");
     }
     proc

@@ -650,7 +650,11 @@ fn setup_process(
     // in mint order, so each is at a well-known slot (the first at
     // ENDPOINT_SLOT/GRANT_SLOT, the next after, ...).
     for cap in caps.iter().flatten() {
-        if proc.caps.mint(cap.object, cap.rights).is_err() {
+        // `install`, not `mint`: a spawn grant may be a capability the caller is
+        // *lending* to the child, and its `origin` -- set by the caller before it
+        // got here -- is part of what moves (Design/cap_reclaim.md D3). Kernel
+        // grants arrive with `origin: None` and are unaffected.
+        if proc.caps.install(*cap).is_err() {
             memory::destroy_address_space(l4);
             return Err("capability table full");
         }
@@ -851,6 +855,17 @@ pub fn on_exit() -> ! {
     // targets and endpoint queues are still intact; teardown then applies the
     // refcount decrements and frees the slot (hardening D5).
     ipc::reap_dying(&proc.caps);
+    // This slot's identity is about to become reusable, so no surviving
+    // capability may keep naming it as a lender. Must run before the slot is
+    // handed out again; runs here, next to the other death-time bookkeeping.
+    //
+    // Ordering note for the reclamation pass (Design/cap_reclaim_build.md B4):
+    // that pass belongs BEFORE `reap_dying`, because it has to fill the lender's
+    // table before the lender is woken -- `reap_dying` is what wakes it. This
+    // sweep is independent of that and can stay here: it clears origins that
+    // *name* the dying slot, whereas reclamation reads the origins *on* the
+    // dying process's own capabilities.
+    clear_origins_naming(cur);
     let boot_frames = unsafe { (*addr_of!(TABLE))[cur].boot_frames };
     let l4 = proc.l4;
     process::teardown(proc, &boot_frames);
@@ -1340,16 +1355,38 @@ pub fn wake_with(slot: usize, status: u64, payload: u64, landing: u64) {
 /// Mint `cap` into the table of the Blocked process at `slot`; returns its
 /// landing slot, or None if that process's capability table is full. Used by
 /// the IPC layer to deliver a transferred capability into a blocked receiver.
-pub fn mint_into_blocked(slot: usize, cap: Capability) -> Option<usize> {
+pub fn install_into_blocked(slot: usize, cap: Capability) -> Option<usize> {
     // SAFETY: single CPU, IF=0; the slot holds a Blocked process.
     unsafe {
         let table = &mut *addr_of_mut!(TABLE);
-        table[slot]
-            .process
-            .as_mut()?
-            .caps
-            .mint(cap.object, cap.rights)
-            .ok()
+        table[slot].process.as_mut()?.caps.install(cap).ok()
+    }
+}
+
+/// Clear every `origin` naming `slot` from every live capability table.
+///
+/// Called when a process exits, because `origin` records a process-table slot
+/// and the table reuses slots (Design/cap_reclaim_build.md section 0). A lender
+/// is not pinned the way `Reply { caller }`'s callee is: it can exit while its
+/// borrower lives, and if the origin outlived it, a later reclamation would mint
+/// the capability into whatever unrelated process had taken the slot.
+///
+/// Sweeping *every* table, including the departing process's own, is deliberate:
+/// it is cheap (`MAX_PROCESSES` * `MAX_CAPS`), exit is not a hot path, and a
+/// narrower rule would be one more thing to get wrong. Note this does NOT touch
+/// the origins *on* the dying process's capabilities -- those name its lenders
+/// and are what reclamation reads. The two directions are independent.
+pub fn clear_origins_naming(slot: usize) -> usize {
+    // SAFETY: single CPU, IF=0; exclusive access to the process table.
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        let mut cleared = 0;
+        for entry in table.iter_mut() {
+            if let Some(p) = entry.process.as_mut() {
+                cleared += p.caps.clear_origin(slot);
+            }
+        }
+        cleared
     }
 }
 

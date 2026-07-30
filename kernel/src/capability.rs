@@ -138,9 +138,32 @@ pub struct Capability {
     /// (Design/cap_reclaim_build.md section 0). Without that sweep this field is
     /// a hazard, not a record.
     ///
-    /// Nothing reads this yet -- it is introduced on its own so that the change
-    /// in `Process` size can be proven inert before any behaviour depends on it.
     pub origin: Option<usize>,
+}
+
+impl Capability {
+    /// This capability as it should appear in `dest`'s table after `source`
+    /// hands it over (Design/cap_reclaim.md D3).
+    ///
+    /// Ordinarily the new origin is `source`: whoever gave it away is who it
+    /// goes back to if the new holder dies.
+    ///
+    /// **The homecoming rule** is the exception: if the capability is going back
+    /// to the very process that lent it, the origin *clears*. It is owned
+    /// outright again, and an origin still naming a process with no remaining
+    /// claim would be a lie the next death would act on.
+    ///
+    /// Homecoming is decided by comparing *process slots*, never by noticing
+    /// that a capability returned to the slot it left from -- those are not the
+    /// same test, and only the first is correct. `shell-user` is the proof: its
+    /// framebuffer leaves `FB_SLOT`, the wait handle is minted into the freed
+    /// slot, and the app's hand-back lands wherever `recv_cap` chooses, so the
+    /// shell carries a mutable `fb_slot` across launches. A slot-identity test
+    /// would fail to clear the origin on every real hand-back.
+    pub fn lent_to(self, source: usize, dest: usize) -> Capability {
+        let origin = if self.origin == Some(dest) { None } else { Some(source) };
+        Capability { origin, ..self }
+    }
 }
 
 /// What the kernel must do, beyond emptying the slot, when a capability
@@ -242,13 +265,54 @@ impl CapTable {
     /// gets its own constructor rather than a third argument here, so that a
     /// call site says which case it is instead of passing `None`.
     pub fn mint(&mut self, object: CapObject, rights: u8) -> Result<usize, CapError> {
+        self.install(Capability { object, rights, origin: None })
+    }
+
+    /// Install a capability *verbatim* in the first free slot, preserving its
+    /// `origin`; returns the slot index.
+    ///
+    /// This is the sibling `mint` needs because `mint` reconstructs a capability
+    /// from `(object, rights)` and therefore silently drops the origin. Both are
+    /// wanted, and the distinction is exactly which case a call site is in:
+    ///
+    /// - **`mint`** -- the kernel is creating authority. No lender.
+    /// - **`install`** -- an existing capability is *moving*. Its origin is part
+    ///   of what moves, whether that is a transfer (with `lent_to` applied) or a
+    ///   best-effort restore after a failed transfer (verbatim, so the giver
+    ///   gets back precisely what it had).
+    pub fn install(&mut self, cap: Capability) -> Result<usize, CapError> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(Capability { object, rights, origin: None });
+                *slot = Some(cap);
                 return Ok(i);
             }
         }
         Err(CapError::TableFull)
+    }
+
+    /// Clear every `origin` naming `slot`, returning how many were cleared.
+    ///
+    /// Run against every live table when a process exits
+    /// (Design/cap_reclaim_build.md section 0). Without it, `origin` is a hazard
+    /// rather than a record: a lender can exit while its borrower lives, and the
+    /// process table reuses slots, so a surviving origin would eventually name
+    /// an unrelated process and reclamation would hand that stranger the screen.
+    ///
+    /// It also earns its keep a second way -- it makes D4's "the lender is dead"
+    /// fallback fall out for free. A dead lender's origin is already `None`, so
+    /// the reclamation path simply finds nothing to return to and drops as it
+    /// does today, with no liveness check to get wrong.
+    pub fn clear_origin(&mut self, slot: usize) -> usize {
+        let mut cleared = 0;
+        for entry in self.slots.iter_mut() {
+            if let Some(cap) = entry.as_mut() {
+                if cap.origin == Some(slot) {
+                    cap.origin = None;
+                    cleared += 1;
+                }
+            }
+        }
+        cleared
     }
 
     /// Iterate the live capabilities in this table (skipping empty slots), by
