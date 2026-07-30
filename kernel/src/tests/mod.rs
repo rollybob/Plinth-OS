@@ -172,6 +172,22 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "scheduler::none_when_alone", run: scheduler::none_when_alone },
     TestCase { name: "scheduler::never_picks_self", run: scheduler::never_picks_self },
     TestCase { name: "scheduler::round_robin_cycle", run: scheduler::round_robin_cycle },
+    TestCase {
+        name: "scheduler::origin_sweep_reaches_running_processes",
+        run: scheduler::origin_sweep_reaches_running_processes,
+    },
+    TestCase {
+        name: "scheduler::lender_lookup_finds_running_lender",
+        run: scheduler::lender_lookup_finds_running_lender,
+    },
+    TestCase {
+        name: "scheduler::lender_lookup_ignores_idle_core_slot_zero",
+        run: scheduler::lender_lookup_ignores_idle_core_slot_zero,
+    },
+    TestCase {
+        name: "scheduler::per_core_state_restored",
+        run: scheduler::per_core_state_restored,
+    },
 ];
 
 /// Run every registered test. Returns true if all passed.

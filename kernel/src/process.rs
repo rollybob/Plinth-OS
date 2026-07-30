@@ -230,6 +230,21 @@ pub fn with_current_on_core<R>(core: usize, f: impl FnOnce(&mut Process) -> R) -
     CURRENT.get(core)?.lock().as_mut().map(f)
 }
 
+/// Park `proc` in core `core`'s `CURRENT` slot and return whatever was there.
+///
+/// **Test-only.** The reach of `scheduler::clear_origins_naming` and
+/// `with_lender_caps` over *running* processes cannot be tested without staging
+/// one, and a running process lives here rather than in the scheduler's `TABLE`.
+/// The SMP bug those two had was invisible precisely because no test could reach
+/// this container; that is the gap this closes. Restore what you took.
+///
+/// Behind `feature = "tests"` so the production kernel is byte-identical.
+#[cfg(feature = "tests")]
+pub fn swap_current_on_core(core: usize, proc: Option<Process>) -> Option<Process> {
+    let mut guard = CURRENT[core].lock();
+    core::mem::replace(&mut *guard, proc)
+}
+
 /// The process on THIS core right now.
 pub fn current() -> &'static Mutex<Option<Process>> {
     // SAFETY: percpu::init has already run on every core by the time any

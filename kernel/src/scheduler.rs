@@ -1401,26 +1401,45 @@ fn reclaim_lent_caps(
         let Some((lender, home)) = capability::reclaim_target(&cap, dying_slot) else {
             continue;
         };
-        // A dead lender never reaches here: its exit swept this origin to `None`
-        // (`clear_origins_naming`), so `release_action` would not have said
-        // `ReclaimTo` at all. That is how D4's first fallback is satisfied
-        // without a liveness check -- see Design/cap_reclaim_build.md section 0.
-        // Through `with_lender_caps`, not `TABLE` directly: a lender that is
-        // RUNNING has had its `Process` moved out of its slot into the per-core
-        // `CURRENT`, so a `TABLE`-only lookup would find nothing and destroy the
-        // capability -- indistinguishable from D4's legitimate table-full case.
-        let landed = with_lender_caps(lender, |caps| caps.reclaim(home)).flatten();
-        // `None` = the lender's table is full (D4) and the capability dies as it
-        // would have anyway, or the slot holds no live process. Either way there
-        // is nothing to report and nothing to account.
-        if let Some(landing) = landed {
-            // A capability entered a table. A no-op for a `Framebuffer`, which is
-            // the whole of D2's scope today and carries no reference count --
-            // called anyway so that widening that scope to a refcounted kind
-            // cannot silently skip the accounting.
-            ipc::note_cap_added(&home);
-            out[n] = (lender, landing);
-            n += 1;
+        // Through `with_lender_caps`, not `TABLE` directly: a RUNNING lender has
+        // had its `Process` moved out of its slot into the per-core `CURRENT`, so
+        // a `TABLE`-only lookup finds nothing.
+        match with_lender_caps(lender, |caps| caps.reclaim(home)) {
+            Some(Some(landing)) => {
+                // A capability entered a table. A no-op for a `Framebuffer`, which
+                // is the whole of D2's scope today and carries no reference count
+                // -- called anyway so that widening that scope to a refcounted
+                // kind cannot silently skip the accounting.
+                ipc::note_cap_added(&home);
+                out[n] = (lender, landing);
+                n += 1;
+            }
+            // D4's second fallback, and a legitimate outcome: all 16 of the
+            // lender's slots are occupied, so there is nowhere to put this and it
+            // dies as it would have anyway. A hazard the lender controls, since
+            // v2.8's `cap_release` is how it makes room.
+            Some(None) => {}
+            // No live process at the lender's slot. This is supposed to be
+            // unreachable: a dead lender's exit swept this origin to `None`
+            // (`clear_origins_naming`), so `release_action` would never have said
+            // `ReclaimTo` in the first place. That is how D4's first fallback is
+            // satisfied without a liveness check to get wrong.
+            //
+            // Kept as a DISTINCT arm rather than folded in with table-full,
+            // because the two were briefly indistinguishable and that is exactly
+            // how the SMP reach bug hid: a lookup that missed a running lender
+            // destroyed the capability and looked like a full table. Silence is
+            // the wrong response to "my invariant is broken", so this is loud in
+            // the builds that can afford to be -- `debug_assert` fires under
+            // `xtask test`/`smoke` (debug kernel) and costs the production kernel
+            // nothing.
+            None => {
+                debug_assert!(
+                    false,
+                    "reclaim: no live process at lender slot -- the exit-time \
+                     origin sweep should have cleared this origin"
+                );
+            }
         }
     }
     n
@@ -1477,6 +1496,27 @@ pub fn clear_origins_naming(slot: usize) -> usize {
 /// running -- and "silently" means the capability is destroyed as if the lender's
 /// table had been full, which is a legitimate outcome (D4) and therefore
 /// indistinguishable from the bug.
+/// Test-only view of `with_lender_caps`, so the reach over a *running* lender is
+/// testable at the layer the bug lived at rather than one below it. Reports
+/// whether the lender was found at all, which is the distinction the reach bug
+/// blurred. See `process::swap_current_on_core`.
+#[cfg(feature = "tests")]
+pub fn lender_cap_count(lender: usize) -> Option<usize> {
+    with_lender_caps(lender, |caps| caps.iter().count())
+}
+
+/// Test-only setter for this map, needed to stage a running lender: a `Process`
+/// parked in a core's `CURRENT` is only *findable* if `CURRENT_SLOT` says which
+/// table slot it occupies. Returns the previous value; restore it.
+#[cfg(feature = "tests")]
+pub fn swap_current_slot(core: usize, slot: usize) -> usize {
+    // SAFETY: test harness, single core running, IF=0.
+    unsafe {
+        let map = &mut *addr_of_mut!(CURRENT_SLOT);
+        core::mem::replace(&mut map[core], slot)
+    }
+}
+
 fn with_lender_caps<R>(lender: usize, f: impl FnOnce(&mut CapTable) -> R) -> Option<R> {
     // SAFETY: BKL held, IF=0; exclusive access to the process table.
     let suspended = unsafe {
