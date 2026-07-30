@@ -51,7 +51,9 @@ const USER_CRATES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
     "share", "rpc", "faultchild", "blk", "asyncblk", "blkwrite", "fsdemo", "diskhello", "evt",
     "evtstream", "unified", "kbd", "mouse", "rwfs", "stealer", "stealwork", "gfx", "gfxtext",
-    "gfxsplit", "gfxbound", "gfxrevoke", "shell", "shellapp", "caprelease", "quietworker",
+    "gfxsplit", "gfxbound", "gfxrevoke",
+    "fbreclaim",
+    "fbreclaimchild", "shell", "shellapp", "caprelease", "quietworker",
     "template", "bench",
 ];
 
@@ -1052,6 +1054,14 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     // path ever reuses the Frame path's unmap-AND-deallocate, `after` climbs by
     // ~1000 and this is what catches it.
     check_frames_baseline(&actual, "gfxrevoke");
+    // Same D7 hazard, one step further out: reclamation moves a framebuffer
+    // capability between tables at death, so a path that reused the Frame arm's
+    // unmap-AND-deallocate would leak the firmware's MMIO into the allocator here
+    // too. Note what this does NOT prove -- gfxrevoke's baseline was flat in both
+    // arms of its own negative control, so a flat count says nothing about whether
+    // reclamation worked. The two differing hashes in the boot log are what say
+    // that; this only says nothing was leaked while doing it.
+    check_frames_baseline(&actual, "fbreclaim");
     check_frames_baseline(&actual, "shell");
 }
 

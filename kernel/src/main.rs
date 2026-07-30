@@ -203,6 +203,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             include_bytes!(concat!(env!("OUT_DIR"), "/stealwork-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/shellapp-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/quietworker-user")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/fbreclaimchild-user")),
         ];
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
@@ -943,6 +944,46 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 );
                 let after_revoke = free_frames();
                 let _ = writeln!(serial, "plinth: {after_revoke} frames free after gfxrevoke");
+            }
+
+            // Reclamation (Design/cap_reclaim.md D6): the case where the process
+            // that LOSES a framebuffer capability is not the one that gets it
+            // back. fbreclaim-user is granted the whole screen, draws and hashes
+            // a frame, transfers the capability to a child that FAULTS while
+            // holding it, and then draws and hashes a second frame through the
+            // capability the kernel returned to it.
+            //
+            // Both hashes matter. The first says the screen was genuinely ours
+            // before we lent it; the second says it is ours again. On the
+            // pre-reclamation kernel the second is unreachable, not merely
+            // different -- the only framebuffer capability in existence died with
+            // the child and no syscall mints another -- so this is a regression
+            // test rather than a demonstration. It also covers the ABI v2.9 half:
+            // without the landing slot on the death-wake the parent could not
+            // find what came back, since nothing enumerates a capability table.
+            //
+            // The frame bracket is load-bearing exactly as it is for gfxrevoke:
+            // reclamation must never route a framebuffer through the Frame arm,
+            // which would hand ~1000 pages of firmware MMIO to the allocator
+            // (D7), so `after` must equal `before` exactly.
+            if let Some(fbobj) = framebuffer::framebuffer_cap() {
+                const FBRECLAIM_BIN: &[u8] =
+                    include_bytes!(concat!(env!("OUT_DIR"), "/fbreclaim-user"));
+                let before_reclaim = free_frames();
+                let _ = writeln!(serial, "plinth: {before_reclaim} frames free before fbreclaim");
+                let fbcap = Capability {
+                    object: fbobj,
+                    rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+                    origin: None,
+                };
+                scheduler::run(
+                    "fbreclaim demo",
+                    &[FBRECLAIM_BIN],
+                    phys_offset,
+                    &[Some(fbcap)],
+                );
+                let after_reclaim = free_frames();
+                let _ = writeln!(serial, "plinth: {after_reclaim} frames free after fbreclaim");
             }
         }
 

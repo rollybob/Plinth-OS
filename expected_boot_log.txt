@@ -397,6 +397,38 @@ plinth: [user fault] #PF
 plinth: terminating user process
 plinth: gfxrevoke demo: all done
 
+# Framebuffer RECLAMATION (Design/cap_reclaim.md D6) -- the case where the process
+# that loses the capability is not the one that gets it back. fbreclaim-user is
+# granted the whole screen, draws and hashes a frame, TRANSFERS the capability to a
+# child, and the child FAULTS while holding it. By fault, not a clean exit: a clean
+# exit can be asked to hand the screen back (shellapp does exactly that), and the
+# failure this exists for is the one nobody can be asked to handle. Before
+# reclamation the child's death destroyed the only Framebuffer capability in
+# existence -- no syscall mints one -- so nothing could draw for the rest of the
+# boot, and clicking gfxbound in a shell-launched-apps world would have bricked the
+# display.
+#
+# Four lines carry the proof, in order. The child's "holding the screen" line comes
+# after a real draw through its mapping, so it demonstrably had the screen rather
+# than merely a slot. "screen came back" means the death-wake arrived with a real
+# capability slot instead of the NO_CAP a v2.8 kernel always returned (ABI v2.9) --
+# without that the parent could not have found it, since nothing enumerates a
+# capability table. And the two hashes DIFFER: the parent paints a different colour
+# the second time, so a stale mapping could not masquerade as the reclaimed one.
+#
+# On a pre-reclamation kernel the second hash is unreachable, not merely different,
+# which is what makes this a regression test. Frames are bracketed by xtask for the
+# same D7 reason as gfxrevoke: reclamation must never route a framebuffer through
+# the Frame arm and hand ~1000 MMIO pages to the allocator.
+plinth: fbreclaim demo: 1 processes
+fbreclaim: lent hash 0x63f0997abbfec044
+fbreclaimchild: holding the screen, now faulting
+plinth: [user fault] #PF
+plinth: terminating user process
+fbreclaim: child died, screen came back
+fbreclaim: reclaimed hash 0x29015dd7953b7784
+plinth: fbreclaim demo: all done
+
 # Visual userspace skin (D8, Design/display_skin.md) -- the finale: a shell with a
 # splash, a home screen of app icons, and arrow-key navigation, all library-OS
 # policy over the whole-screen Framebuffer (slot 1) + the keyboard EventSource
