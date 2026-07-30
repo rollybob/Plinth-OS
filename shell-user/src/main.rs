@@ -54,6 +54,15 @@ fn draw_splash(fb: &Framebuffer) {
     banner[PREFIX.len()..n].copy_from_slice(ABI_VERSION);
     // Well below the hashed top-left square, so the splash hash is unaffected.
     fb.draw_text_centered(info.width / 2, info.height / 2 + 36, &banner[..n], FG, BG, 2);
+    // ...which is exactly why the drawn banner needs a second, ASSERTED copy.
+    // Nothing in the suite can see a framebuffer region no hash covers, so for
+    // the whole of v2.8 the splash could have kept saying 2.7 (it did) with every
+    // test green. Emitting the SAME buffer to serial, from the same expression,
+    // means `expected_boot_log.txt` pins the version the binaries were actually
+    // built against and the two cannot drift apart again.
+    sys_write(b"shell: ");
+    sys_write(&banner[..n]);
+    sys_write(b"\n");
 }
 
 /// Rectangle (x, y, w, h) of icon `idx` in a 2x2 grid centered on screen.

@@ -426,7 +426,7 @@ fbreclaimchild: holding the screen, now faulting
 plinth: [user fault] #PF
 plinth: terminating user process
 fbreclaim: child died, screen came back
-fbreclaim: reclaimed hash 0x69d3ede9a07b7784
+fbreclaim: reclaimed hash 0xd12799246c3d6e04
 plinth: fbreclaim demo: all done
 
 # Visual userspace skin (D8, Design/display_skin.md) -- the finale: a shell with a
@@ -448,6 +448,13 @@ plinth: fbreclaim demo: all done
 # is identical to the first -- that sameness IS the assertion.
 plinth: shell demo: 1 processes
 shell: start
+# The ABI version the USER BINARIES were built against, emitted from the same
+# buffer the splash draws. The drawn banner sits below every hashed region, so
+# nothing in this suite could see it -- which is how the splash kept saying 2.7
+# through the whole v2.8 bump with all tests green. Pinning it here is what makes
+# that drift impossible rather than merely unlikely. Update on every ABI bump;
+# if this line and libplinth::ABI_VERSION ever disagree, one of them is a lie.
+shell: VERSION 2.9
 shell: splash hash 0x549089847b362325
 shell: home hash 0x4b82ddae83e366a5
 shell: view hash 0x2a82b4e08a822325

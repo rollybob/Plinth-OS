@@ -104,7 +104,13 @@ pub extern "C" fn _start(_id: u64) -> ! {
             sys_exit(5);
         }
     };
-    paint(&fb, 0x18, 0x10, 0x10);
+    // Deliberately not a permutation of the first colour, and a different
+    // channel AVERAGE. `libgfx` collapses a `FB_FMT_U8` framebuffer to
+    // `(r + g + b) / 3`, so any reordering of the same three values writes an
+    // identical byte -- the two hashes would match and this demo's whole proof
+    // would pass vacuously on such a display. The smoke config is BGR, so the
+    // original permutation happened to work; it was luck, not a choice.
+    paint(&fb, 0x60, 0x48, 0x30);
     emit_hash(b"fbreclaim: reclaimed hash ", &fb);
 
     sys_exit(0)

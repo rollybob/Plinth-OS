@@ -1,0 +1,25 @@
+# Line endings.
+#
+# Every text file is stored LF in the repository and checked out LF everywhere.
+#
+# Why this file exists: without it, checkout behaviour is decided by whatever
+# `core.autocrlf` each clone happens to have set. On this machine it is `true`,
+# so most of the tree lands CRLF -- but files created fresh by an editor arrive
+# LF, and the result is a working tree that mixes both. `kernel/src/scheduler.rs`
+# was LF while every other kernel source was CRLF; the fbreclaim crates came out
+# LF too. That inconsistency never shows up as a diff, because git normalises to
+# LF on the way in either way, which is exactly what makes it easy to accumulate
+# and confusing to hit: a byte-oriented edit (a scripted patch, an exact-match
+# replacement) behaves differently from file to file for no visible reason, and
+# twice corrupted a file into `\r\r\n` line endings before it was noticed.
+#
+# LF rather than CRLF because that is what is already stored, what CI builds on,
+# and what a Linux contributor would expect from a Rust repository. Expect the
+# next checkout to rewrite the working-tree endings of most files; that is the
+# point, and it produces no commit.
+* text=auto eol=lf
+
+# Binary and generated artifacts: never touch these.
+*.png binary
+*.img binary
+*.patch -text

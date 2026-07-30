@@ -22,18 +22,11 @@
 #![no_main]
 
 use libgfx::Framebuffer;
-use libplinth::{sys_exit, sys_write, MAP_BASE};
-
-/// Where a *spawn* transfer lands in a child: one slot after ENDPOINT_SLOT, not
-/// `GRANT_SLOT`. A spawned child gets the result-channel send capability first,
-/// so the transferred capability is the slot after it -- `shellapp-user` names
-/// the same constant for the same reason. `GRANT_SLOT` is the boot-tour case,
-/// where there is no result channel ahead of the grant.
-const XFER_SLOT: u64 = 2;
+use libplinth::{sys_exit, sys_write, MAP_BASE, SPAWN_GRANT_SLOT};
 
 #[no_mangle]
 pub extern "C" fn _start(_id: u64) -> ! {
-    let fb = match Framebuffer::map(XFER_SLOT, MAP_BASE) {
+    let fb = match Framebuffer::map(SPAWN_GRANT_SLOT, MAP_BASE) {
         Some(fb) => fb,
         None => {
             sys_write(b"fbreclaimchild: map failed\n");

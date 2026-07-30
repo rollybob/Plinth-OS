@@ -160,6 +160,24 @@ impl Capability {
     /// slot, and the app's hand-back lands wherever `recv_cap` chooses, so the
     /// shell carries a mutable `fb_slot` across launches. A slot-identity test
     /// would fail to clear the origin on every real hand-back.
+    /// **Known limit -- re-lending forfeits the original lender's claim.** With
+    /// one level tracked (D4) and no derivation tree (D1 declined one), a
+    /// sub-loan cannot be represented, and the homecoming rule above assumes the
+    /// process being returned to is the outright owner. When it is not, the
+    /// assumption is silently wrong:
+    ///
+    /// A lends to B (`origin = A`); B hands it to C (`origin = B` -- A's claim is
+    /// already gone here, which one-level tracking intends); C hands it back to B,
+    /// which reads as a homecoming, so `origin` clears and B now owns outright a
+    /// capability it only ever borrowed. A's later death sweeps nothing.
+    ///
+    /// The correct value on that last step is `Some(A)` -- what the origin was
+    /// before B lent it out -- and nothing records it. Fixing this needs the
+    /// derivation tree, so it is a limit rather than a defect, but it is NOT what
+    /// the homecoming rule's wording implies and it should be settled before
+    /// anything relies on it. Unreachable today: nothing re-lends a framebuffer,
+    /// and only `Framebuffer` is in scope. Tracked as K-013 in
+    /// Design/known_bugs.md.
     pub fn lent_to(self, source: usize, dest: usize) -> Capability {
         let origin = if self.origin == Some(dest) { None } else { Some(source) };
         Capability { origin, ..self }

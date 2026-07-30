@@ -11,11 +11,9 @@
 #![no_main]
 
 use libgfx::Framebuffer;
-use libplinth::{sys_exit, sys_send_cap, sys_write, write_hex, ENDPOINT_SLOT, MAP_BASE};
-
-/// The transferred framebuffer lands one slot after the spawn result endpoint
-/// (ABI: a `spawn` transfer lands in the slot after `ENDPOINT_SLOT`).
-const FB_SLOT: u64 = 2;
+use libplinth::{
+    sys_exit, sys_send_cap, sys_write, write_hex, ENDPOINT_SLOT, MAP_BASE, SPAWN_GRANT_SLOT,
+};
 
 const HASH_SIDE: u32 = 128;
 
@@ -23,7 +21,7 @@ const HASH_SIDE: u32 = 128;
 pub extern "C" fn _start(_idx: u64) -> ! {
     sys_write(b"shellapp: start\n");
 
-    let fb = match Framebuffer::map(FB_SLOT, MAP_BASE) {
+    let fb = match Framebuffer::map(SPAWN_GRANT_SLOT, MAP_BASE) {
         Some(fb) => fb,
         None => {
             sys_write(b"shellapp: map failed\n");
@@ -49,7 +47,7 @@ pub extern "C" fn _start(_idx: u64) -> ! {
     // the shell receives; then we exit. The hash above was taken while the
     // framebuffer was still mapped here.
     sys_write(b"shellapp: returning the screen\n");
-    sys_send_cap(ENDPOINT_SLOT, 0, FB_SLOT);
+    sys_send_cap(ENDPOINT_SLOT, 0, SPAWN_GRANT_SLOT);
 
     sys_exit(0)
 }

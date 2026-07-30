@@ -1406,10 +1406,22 @@ fn reclaim_lent_caps(
         // a `TABLE`-only lookup finds nothing.
         match with_lender_caps(lender, |caps| caps.reclaim(home)) {
             Some(Some(landing)) => {
-                // A capability entered a table. A no-op for a `Framebuffer`, which
-                // is the whole of D2's scope today and carries no reference count
-                // -- called anyway so that widening that scope to a refcounted
-                // kind cannot silently skip the accounting.
+                // Account it as the MOVE it is: the dying holder loses the
+                // capability and the lender gains it, so both halves are needed
+                // and they net to zero. This mirrors `transfer_current_to_blocked`
+                // exactly, and `false` is right for the same reason there -- the
+                // count dips transiently between the two calls and the endpoint
+                // must not be freed out from under an in-flight move.
+                //
+                // Both halves are no-ops for a `Framebuffer`, which is the whole
+                // of D2's scope today, so this changes nothing now. It matters if
+                // that scope ever widens to a refcounted kind, and it is the
+                // removal that matters: `teardown` will NOT account this
+                // capability's departure, because a reclaimed capability lands in
+                // the `ReclaimTo` arm, which does nothing. With only the addition
+                // the refcount would be permanently one too high and the endpoint
+                // would never be freed.
+                ipc::note_cap_removed(&cap, false);
                 ipc::note_cap_added(&home);
                 out[n] = (lender, landing);
                 n += 1;

@@ -58,10 +58,27 @@ pub const PAGE_SIZE: u64 = 4096;
 /// fd 0 is on Unix. Pass it to sys_cpu_charge.
 pub const CPU_CAP_SLOT: u64 = 0;
 
-/// A capability a parent transfers into a child via sys_spawn lands here,
-/// in the child's table -- the next slot after the CPU budget. A spawned
-/// child reads its inherited capability from this slot.
+/// The kernel's first grant to a **scheduler-launched** process (the boot tour's
+/// `scheduler::run`) lands here -- the next slot after the CPU budget.
+///
+/// **This is NOT where a `sys_spawn` transfer lands.** See `SPAWN_GRANT_SLOT`.
+/// This doc used to say it was, which cost two crates a debugging session each:
+/// a spawned child is minted its result-channel send capability first, so an
+/// inherited capability is one slot further on.
 pub const GRANT_SLOT: u64 = 1;
+
+/// Where a capability transferred by **`sys_spawn`** lands in the child's table.
+///
+/// Two slots are already taken by the time the transfer is minted: the CPU-time
+/// budget at `CPU_CAP_SLOT`, then the result-channel send capability at
+/// `ENDPOINT_SLOT`. So an inherited capability is the third mint, not the second.
+///
+/// This is the one first-grant constant that is **not** 1, and it is the reason
+/// the others being equal is a trap rather than a convenience: a spawned child
+/// that reaches for `GRANT_SLOT`/`FB_SLOT` compiles, runs, and fails at the first
+/// use with nothing to point at. Both `shellapp-user` and `fbreclaimchild-user`
+/// hit exactly that and each carried a private `= 2` until this existed.
+pub const SPAWN_GRANT_SLOT: u64 = 2;
 
 /// An endpoint capability the kernel grants a scheduler-launched IPC process
 /// lands here too -- the next mint after the CPU budget. Pass it to
@@ -226,9 +243,10 @@ pub fn sys_cpu_charge(slot: u64, amount: u64) -> u64 {
 /// sets up a result channel: the child receives a send capability to it (at
 /// ENDPOINT_SLOT) and this process receives the matching receive capability --
 /// the returned handle. `sys_recv(handle)` collects the child's result (and is
-/// the wait). `transfer_slot` optionally moves one capability into the child
-/// (landing at GRANT_SLOT); pass `NO_CAP` for none. Returns the handle, or
-/// SYS_ERR. Non-blocking -- the child runs alongside the caller.
+/// the wait). `transfer_slot` optionally moves one capability into the child,
+/// landing at **`SPAWN_GRANT_SLOT`** -- not `GRANT_SLOT`, because the send
+/// capability above is minted first; pass `NO_CAP` for none. Returns the handle,
+/// or SYS_ERR. Non-blocking -- the child runs alongside the caller.
 #[inline]
 pub fn sys_spawn(child_id: u64, transfer_slot: u64) -> u64 {
     syscall3(9, child_id, transfer_slot, 0)
