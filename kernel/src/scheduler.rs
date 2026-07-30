@@ -860,8 +860,7 @@ pub fn on_exit() -> ! {
     // of that doc for why the obvious placement in `teardown` is too late).
     let mut reclaimed = [(0usize, 0usize); capability::MAX_CAPS];
     let n_reclaimed = reclaim_lent_caps(&proc.caps, cur, &mut reclaimed);
-    let _ = n_reclaimed; // B5 reports these landing slots on the death-wake.
-    ipc::reap_dying(&proc.caps);
+    ipc::reap_dying(&proc.caps, &reclaimed[..n_reclaimed]);
     // This slot's identity is about to become reusable, so no surviving
     // capability may keep naming it as a lender. Must run before the slot is
     // handed out again; runs here, next to the other death-time bookkeeping.
@@ -1406,14 +1405,11 @@ fn reclaim_lent_caps(
         // (`clear_origins_naming`), so `release_action` would not have said
         // `ReclaimTo` at all. That is how D4's first fallback is satisfied
         // without a liveness check -- see Design/cap_reclaim_build.md section 0.
-        // SAFETY: single CPU, IF=0; exclusive access to the process table.
-        let landed = unsafe {
-            let table = &mut *addr_of_mut!(TABLE);
-            table
-                .get_mut(lender)
-                .and_then(|slot| slot.process.as_mut())
-                .and_then(|p| p.caps.reclaim(home))
-        };
+        // Through `with_lender_caps`, not `TABLE` directly: a lender that is
+        // RUNNING has had its `Process` moved out of its slot into the per-core
+        // `CURRENT`, so a `TABLE`-only lookup would find nothing and destroy the
+        // capability -- indistinguishable from D4's legitimate table-full case.
+        let landed = with_lender_caps(lender, |caps| caps.reclaim(home)).flatten();
         // `None` = the lender's table is full (D4) and the capability dies as it
         // would have anyway, or the slot holds no live process. Either way there
         // is nothing to report and nothing to account.
@@ -1438,23 +1434,79 @@ fn reclaim_lent_caps(
 /// borrower lives, and if the origin outlived it, a later reclamation would mint
 /// the capability into whatever unrelated process had taken the slot.
 ///
-/// Sweeping *every* table, including the departing process's own, is deliberate:
-/// it is cheap (`MAX_PROCESSES` * `MAX_CAPS`), exit is not a hot path, and a
-/// narrower rule would be one more thing to get wrong. Note this does NOT touch
-/// the origins *on* the dying process's capabilities -- those name its lenders
-/// and are what reclamation reads. The two directions are independent.
+/// Sweeping *every* table is deliberate: it is cheap (`MAX_PROCESSES` *
+/// `MAX_CAPS`), exit is not a hot path, and a narrower rule would be one more
+/// thing to get wrong. Note this does NOT touch the origins *on* the dying
+/// process's capabilities -- those name its lenders and are what reclamation
+/// reads. The two directions are independent.
+///
+/// **"Every table" means `TABLE` *and* the per-core `CURRENT`.** The first cut of
+/// this function walked `TABLE` alone, which was wrong under `-smp` and silently
+/// so: `resume_process` moves a running process's `Process` out of its slot and
+/// into `process::CURRENT`, leaving `process = None` behind, so a borrower
+/// executing on another core was skipped entirely. Its `origin` then outlived its
+/// lender, the lender's slot was recycled by `find_free_slot`, and reclamation
+/// would hand the screen to a process that never lent anything -- exactly the
+/// hazard section 0 of the build plan chose this sweep to eliminate. Single-core
+/// runs are immune (the only running process at `on_exit` is the dying one),
+/// which is why the tests and `smoke-smp` did not catch it.
 pub fn clear_origins_naming(slot: usize) -> usize {
-    // SAFETY: single CPU, IF=0; exclusive access to the process table.
+    let mut cleared = 0;
+    // Suspended and blocked processes: their `Process` is in its own slot.
+    // SAFETY: BKL held, IF=0; exclusive access to the process table.
     unsafe {
         let table = &mut *addr_of_mut!(TABLE);
-        let mut cleared = 0;
         for entry in table.iter_mut() {
             if let Some(p) = entry.process.as_mut() {
                 cleared += p.caps.clear_origin(slot);
             }
         }
-        cleared
     }
+    // Running processes, including on other cores. Safe from `on_exit`, which has
+    // already taken its own process out of `CURRENT`, so this cannot self-deadlock.
+    process::for_each_current(|p| cleared += p.caps.clear_origin(slot));
+    cleared
+}
+
+/// The lender's capability table, wherever the lender currently lives: suspended
+/// in its `TABLE` slot, or running on some core and therefore parked in
+/// `process::CURRENT`. `None` if no live process occupies that slot.
+///
+/// The second half is the same trap `clear_origins_naming` fell into. Reclaiming
+/// only through `TABLE` would silently fail whenever the lender happened to be
+/// running -- and "silently" means the capability is destroyed as if the lender's
+/// table had been full, which is a legitimate outcome (D4) and therefore
+/// indistinguishable from the bug.
+fn with_lender_caps<R>(lender: usize, f: impl FnOnce(&mut CapTable) -> R) -> Option<R> {
+    // SAFETY: BKL held, IF=0; exclusive access to the process table.
+    let suspended = unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        table.get_mut(lender).and_then(|s| s.process.as_ref()).is_some()
+    };
+    if suspended {
+        // SAFETY: as above.
+        return unsafe {
+            let table = &mut *addr_of_mut!(TABLE);
+            table.get_mut(lender).and_then(|s| s.process.as_mut()).map(|p| f(&mut p.caps))
+        };
+    }
+    // Running: `CURRENT_SLOT` is the core -> table-slot map. The core is located
+    // first and `f` applied once afterwards, both because `f` is `FnOnce` and
+    // because an idle core's `CURRENT_SLOT` still reads 0 from initialisation --
+    // matching on it alone would false-hit slot 0 and then give up on a lender
+    // that was really running elsewhere.
+    let mut found = None;
+    for core in 0..percpu::MAX_CORES {
+        // SAFETY: scalar read of the per-core current-slot map; BKL held.
+        if unsafe { (*addr_of!(CURRENT_SLOT))[core] } != lender {
+            continue;
+        }
+        if process::with_current_on_core(core, |_| ()).is_some() {
+            found = Some(core);
+            break;
+        }
+    }
+    process::with_current_on_core(found?, |p| f(&mut p.caps))
 }
 
 /// Revoke (and, if a mapped frame, unmap) the capability at `cap_slot` from

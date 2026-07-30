@@ -367,7 +367,7 @@ pub fn free_endpoint_count() -> usize {
 ///   (b) the dying process holds the last sender (or receiver) capability on an
 ///       endpoint whose queue holds blocked receivers (or senders): those peers
 ///       can never rendezvous -- wake them all.
-pub(crate) fn reap_dying(caps: &CapTable) {
+pub(crate) fn reap_dying(caps: &CapTable, reclaimed: &[(usize, usize)]) {
     // Tally this process's own per-endpoint references, and wake any caller it
     // still owed a reply.
     let mut dying_senders = [0u32; MAX_ENDPOINTS];
@@ -376,7 +376,7 @@ pub(crate) fn reap_dying(caps: &CapTable) {
         match cap.object {
             CapObject::Reply { caller } => {
                 if scheduler::is_blocked(caller) {
-                    scheduler::wake_with(caller, IPC_PEER_DIED, 0, NO_CAP);
+                    scheduler::wake_with(caller, IPC_PEER_DIED, 0, landing_for(caller, reclaimed));
                 }
             }
             CapObject::Endpoint { id } if id < MAX_ENDPOINTS => {
@@ -399,15 +399,46 @@ pub(crate) fn reap_dying(caps: &CapTable) {
         // SAFETY: scalar read of the single-CPU table; copy out before waking.
         let ep = unsafe { (*addr_of!(ENDPOINTS))[id] };
         if ep.in_use && ep.death_strands_peers(dying_senders[id], dying_receivers[id]) {
-            wake_all_stranded(id);
+            wake_all_stranded(id, reclaimed);
         }
     }
+}
+
+/// The slot a capability reclaimed from the dying process landed in, for the
+/// lender at `slot`, or `NO_CAP` if nothing came back to it (ABI v2.9, D5).
+///
+/// Reclamation is useless if the lender cannot find what came back, and there is
+/// no op to enumerate a capability table -- adding one would be a far larger
+/// surface than this problem deserves. The existing three-value IPC return
+/// already carries the field: `recv`/`recv_cap` yield `(status, msg, cap_slot)`,
+/// and `cap_slot` already means "where the capability landed". "Your peer died,
+/// and here is the thing you lent it" is a natural reading of it.
+///
+/// Two limitations, stated rather than papered over:
+///
+/// - This reaches only a lender that is **blocked** on the dying process. A
+///   lender that lent and wandered off gets the capability installed silently.
+///   The shell always waits, so the case the shell demo shows is covered; the
+///   general case is not.
+/// - Only ONE landing slot fits in the return, so a lender that had lent the
+///   dying process *two* capabilities (the whole screen and a band, say) learns
+///   about the first only. Both are in its table; only one is reported.
+fn landing_for(slot: usize, reclaimed: &[(usize, usize)]) -> u64 {
+    let mut i = 0;
+    while i < reclaimed.len() {
+        let (lender, landing) = reclaimed[i];
+        if lender == slot {
+            return landing as u64;
+        }
+        i += 1;
+    }
+    NO_CAP
 }
 
 /// Drain endpoint `id`'s entire wait queue, waking each blocked waiter with
 /// `IPC_PEER_DIED`. The caller has established that the queued side has lost its
 /// only possible counterpart.
-fn wake_all_stranded(id: usize) {
+fn wake_all_stranded(id: usize, reclaimed: &[(usize, usize)]) {
     loop {
         // SAFETY: single CPU, IF=0; ENDPOINTS and WAIT_LINKS are distinct
         // statics, so the borrows below do not alias.
@@ -416,7 +447,9 @@ fn wake_all_stranded(id: usize) {
             scheduler::with_wait_links(|links| eps[id].queue.dequeue(links))
         };
         match woken {
-            Some(slot) => scheduler::wake_with(slot, IPC_PEER_DIED, 0, NO_CAP),
+            Some(slot) => {
+                scheduler::wake_with(slot, IPC_PEER_DIED, 0, landing_for(slot, reclaimed))
+            }
             None => break,
         }
     }

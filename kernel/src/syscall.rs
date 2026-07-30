@@ -773,9 +773,11 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
     // Set here rather than inside `scheduler::spawn` because only this call site
     // knows *which* grant is a lend -- `send_cap` beside it is a kernel mint and
     // must keep `origin: None`. The homecoming rule cannot apply to a spawn: the
-    // child's slot is one that is free right now, and the exit-time sweep
-    // guarantees no live capability names a free slot, so `origin` can never
-    // already be the child's.
+    // child's slot is one that is free right now, and `clear_origins_naming`
+    // clears every origin naming a slot as its process exits, so no live
+    // capability names a free slot. That sweep has to reach running processes on
+    // other cores for this to hold -- see `scheduler::clear_origins_naming`,
+    // where walking `TABLE` alone was a real bug.
     let lent = transferred.map(|cap| Capability { origin: Some(scheduler::current_slot()), ..cap });
     if scheduler::spawn(binary, phys, &[Some(send_cap), lent]).is_none() {
         // Could not create the child: it never minted send_cap, so the result

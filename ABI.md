@@ -1,4 +1,4 @@
-# Plinth ABI v2.8
+# Plinth ABI v2.9
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -138,6 +138,39 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   multiplexes the raw region and never touches a pixel -- fonts, layout, and
   compositing are library-OS policy (`libgfx`), exactly as keymaps and on-disk
   formats are. Purely additive: no existing call changed.
+
+### v2.9 (getting a lent capability back when the borrower dies)
+
+- **A `Framebuffer` capability that was *transferred* now returns to whoever
+  transferred it when the holder dies**, instead of being destroyed. The kernel
+  records the giver on the capability at transfer time; if the holder dies still
+  owning it, the capability is installed in the giver's table.
+- **`recv`/`recv_cap` may now report a capability slot alongside
+  `IPC_PEER_DIED`.** Previously a death-wake always returned `NO_CAP` in `RDX`.
+  Now it returns the slot where the returned capability landed, so a parent that
+  lent the screen to a child and is waiting on that child can find it again.
+  Nothing new is added to the ABI surface: `RDX` already meant "where the
+  capability landed", and this gives it that meaning on one more status.
+- **Why this is a version bump and the v2.8 framebuffer fix was not.** That was a
+  defect fix -- the contract always meant a capability authorises access, so no
+  correctly-written caller could have relied on the old behaviour. This one adds
+  information a correct v2.8 caller may not expect, so it is compatibility-
+  relevant even though nothing in-tree depended on the old guarantee.
+- **What it deliberately does not do.** Only `Framebuffer` is returned this way,
+  because it is the one kind no syscall can mint: a lost one cannot be replaced
+  for the rest of the boot, which is what makes losing it terminal rather than
+  merely costly. Kinds that own pooled resources (`Frame`, `Ring`) are still
+  released to their pools at death -- a loan is *not* treated as a loan in
+  general. Nothing is reclaimed from a *live* holder; there is no revocation
+  protocol and no abort. And a voluntary `cap_release` of a borrowed framebuffer
+  still destroys it, exactly as before -- only death returns it.
+- **Two limits worth knowing.** The landing slot only reaches a lender that is
+  *blocked* on the dying process; one that lent and went on doing something else
+  gets the capability silently, with no notification. And if the lender's own
+  16-slot table is full there is nowhere to put the capability, so it is
+  destroyed as it would have been anyway -- a hazard the lender controls, since
+  v2.8's `cap_release` is how it makes room. That is not hypothetical: a shell
+  that leaked one slot per launch used to die on its ninth spawn.
 
 ### v2.8 (giving a capability back)
 
@@ -296,8 +329,13 @@ convention mirrors the syscall one:
 - Results come back as a **status in `RAX`** -- `IPC_OK = 0`,
   `IPC_PEER_DIED = 2`, or `IPC_ERR = 1` (bad slot or missing right) -- the
   **message payload in `RSI`** (`recv`/`call`), and the transferred-capability
-  slot in `RDX` (`recv`). The payload and cap slot are meaningful only when the
-  status is `IPC_OK`. Splitting status from the payload means no message word,
+  slot in `RDX` (`recv`). The payload is meaningful only when the status is
+  `IPC_OK`. **The cap slot is meaningful on `IPC_OK` and, since v2.9, on
+  `IPC_PEER_DIED` too** -- a death-wake carries the slot where a capability the
+  waiter had lent the dead process was returned, or `NO_CAP` if none was. Code
+  written against v2.8 that treats `IPC_PEER_DIED` as implying
+  `RDX == NO_CAP` is wrong on v2.9; that is why this bumped the version.
+  Splitting status from the payload means no message word,
   not even `u64::MAX`, can be mistaken for an error or a dead peer.
 - The handler returns via `iretq`, which restores every register except the
   result registers; for forward compatibility treat `RCX`, `R8`-`R11` (and

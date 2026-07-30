@@ -21,6 +21,28 @@ capability *back* -- and retires `frame_free` (nr 5) into it.
 ## [Unreleased]
 
 ### Added
+- **A lent framebuffer survives the borrower's death (ABI v2.9).** Transferring
+  the screen to a process that then crashed destroyed the only `Framebuffer`
+  capability in existence, and nothing in userspace could draw again for the rest
+  of the boot -- no syscall mints one. The clickable-apps direction made that
+  lethal rather than theoretical: `gfxbound` is a demo whose whole purpose is to
+  fault while holding a framebuffer grant, so turning demos into apps the shell
+  launches meant clicking one would brick the display. The kernel now records who
+  transferred a capability, and returns it to them if the holder dies still
+  holding it.
+
+  A death-wake can therefore now carry a capability slot: `recv`/`recv_cap`
+  return the landing slot alongside `IPC_PEER_DIED` where they previously always
+  returned `NO_CAP`. That is a compatibility-relevant addition rather than a
+  defect fix -- a correct v2.8 caller could have assumed a death-wake never
+  brings a capability -- which is why it bumps the ABI where the v2.8 framebuffer
+  correction did not.
+
+  Scope is deliberately narrow. Only `Framebuffer`, the one kind no syscall can
+  re-mint. `Frame` and `Ring` still return to their pools at death, so no frame
+  or endpoint baseline moves. Reclamation from a *live* holder does not exist.
+  And a voluntary `cap_release` of a borrowed framebuffer still destroys it --
+  only death sends it home.
 - **`cap_release` (ABI v2.8): a capability can finally be given back.** A
   capability table is a fixed 16 slots with no heap behind it, so a slot is a
   real, exhaustible resource -- but until now the only call that could empty one

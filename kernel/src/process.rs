@@ -205,6 +205,31 @@ impl Process {
 static CURRENT: [Mutex<Option<Process>>; crate::percpu::MAX_CORES] =
     [const { Mutex::new(None) }; crate::percpu::MAX_CORES];
 
+/// Run `f` over the process on EVERY core, not just this one.
+///
+/// Exists because a *running* process is not in the scheduler's `TABLE`:
+/// `resume_process` moves the `Process` out of its slot and parks it here, so
+/// that slot reads `process = None` for as long as it runs. Any pass that means
+/// "every live capability table" is therefore wrong if it walks `TABLE` alone --
+/// it silently skips whatever is executing on another core. That was a real bug
+/// in the first cut of the `origin` sweep (Design/cap_reclaim_build.md section 0).
+///
+/// **Callers must not already hold a `current()` guard**, or this deadlocks on
+/// their own core. Safe from `on_exit`, which has already taken its process out.
+pub fn for_each_current(mut f: impl FnMut(&mut Process)) {
+    for slot in CURRENT.iter() {
+        if let Some(p) = slot.lock().as_mut() {
+            f(p);
+        }
+    }
+}
+
+/// Run `f` over the process running on core `core`, if there is one. Returns
+/// `None` if that core is idle. Same locking caveat as `for_each_current`.
+pub fn with_current_on_core<R>(core: usize, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
+    CURRENT.get(core)?.lock().as_mut().map(f)
+}
+
 /// The process on THIS core right now.
 pub fn current() -> &'static Mutex<Option<Process>> {
     // SAFETY: percpu::init has already run on every core by the time any
