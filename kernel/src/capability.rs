@@ -160,26 +160,35 @@ impl Capability {
     /// slot, and the app's hand-back lands wherever `recv_cap` chooses, so the
     /// shell carries a mutable `fb_slot` across launches. A slot-identity test
     /// would fail to clear the origin on every real hand-back.
-    /// **Known limit -- re-lending forfeits the original lender's claim.** With
-    /// one level tracked (D4) and no derivation tree (D1 declined one), a
-    /// sub-loan cannot be represented, and the homecoming rule above assumes the
-    /// process being returned to is the outright owner. When it is not, the
-    /// assumption is silently wrong:
+    /// **Which level is tracked: the ROOT lender, not the most recent giver**
+    /// (D8, ruled 2026-07-30). An origin that is already `Some` survives the hop;
+    /// only an unborrowed capability records a new one.
     ///
-    /// A lends to B (`origin = A`); B hands it to C (`origin = B` -- A's claim is
-    /// already gone here, which one-level tracking intends); C hands it back to B,
-    /// which reads as a homecoming, so `origin` clears and B now owns outright a
-    /// capability it only ever borrowed. A's later death sweeps nothing.
+    /// That is what keeps a sub-loan honest without the derivation tree D1
+    /// declined. A lends to B (`origin = A`); B hands it on to C (`origin` stays
+    /// `A`); C hands it back to B -- **not** a homecoming, because B is not the
+    /// origin, so B holds it while still owing A. Only the hand-back to A clears.
+    /// A dying holder at any depth therefore returns the capability to the
+    /// process that owns it rather than to an intermediary that never did, which
+    /// is what reclamation is for.
     ///
-    /// The correct value on that last step is `Some(A)` -- what the origin was
-    /// before B lent it out -- and nothing records it. Fixing this needs the
-    /// derivation tree, so it is a limit rather than a defect, but it is NOT what
-    /// the homecoming rule's wording implies and it should be settled before
-    /// anything relies on it. Unreachable today: nothing re-lends a framebuffer,
-    /// and only `Framebuffer` is in scope. Tracked as K-013 in
-    /// Design/known_bugs.md.
+    /// Until D8 the origin was overwritten on every hop, so that third step read
+    /// as a homecoming: `origin` cleared and B ended up owning outright a
+    /// capability it had only borrowed, with A's claim silently gone and A's
+    /// death sweeping nothing (K-013). Note what the fix did not need -- the
+    /// tree. Only the decision not to overwrite. This is still exactly one
+    /// `Option<usize>` and still one level; the level is now the root.
     pub fn lent_to(self, source: usize, dest: usize) -> Capability {
-        let origin = if self.origin == Some(dest) { None } else { Some(source) };
+        let origin = if self.origin == Some(dest) {
+            // Home: the owner holds it outright again.
+            None
+        } else if self.origin.is_some() {
+            // Already on loan. Passing it on moves the capability, not the claim.
+            self.origin
+        } else {
+            // A first loan, from an outright owner.
+            Some(source)
+        };
         Capability { origin, ..self }
     }
 }

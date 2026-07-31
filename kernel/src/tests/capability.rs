@@ -66,10 +66,43 @@ pub fn origin_clears_on_homecoming(_ctx: &mut TestCtx) -> Result<(), &'static st
     test_assert!(again.origin == Some(1), "a relaunch must record the lender again");
     test_assert!(again.lent_to(2, 1).origin.is_none(), "the second hand-back must clear too");
 
-    // Passing it on to a THIRD process is not a homecoming: one level is tracked,
-    // so the origin becomes whoever gave it away most recently (D4).
+    // Passing it on to a THIRD process is not a homecoming, and does not move the
+    // claim either: one level is tracked and that level is the ROOT lender, so the
+    // origin still names the shell (D8, amending which level D4 left unspecified).
     let onward = lent.lent_to(2, 3);
-    test_assert!(onward.origin == Some(2), "a hand-on records the most recent giver");
+    test_assert!(onward.origin == Some(1), "a hand-on must not move the claim off the root lender");
+    Ok(())
+}
+
+/// **K-013: re-lending must not launder the original lender's claim.**
+///
+/// The sequence that used to end with a borrower owning the screen outright.
+/// Written as the literal scenario from the bug entry rather than as an
+/// abstraction, so a regression here reads as "K-013 is back" and not as a
+/// puzzle about origins.
+///
+/// A(1) lends to B(2); B hands on to C(3); C hands back to B. Before D8 the
+/// middle step overwrote the origin with B, which made the last step look like a
+/// homecoming -- origin cleared, B owned outright a screen it had borrowed, and
+/// A's death swept nothing.
+pub fn relending_preserves_the_root_lenders_claim(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let a_to_b = fb_cap(None).lent_to(1, 2);
+    test_assert!(a_to_b.origin == Some(1), "the first loan records A");
+
+    let b_to_c = a_to_b.lent_to(2, 3);
+    test_assert!(b_to_c.origin == Some(1), "handing on must leave A's claim intact");
+
+    let c_to_b = b_to_c.lent_to(3, 2);
+    test_assert!(
+        c_to_b.origin == Some(1),
+        "returning to the middleman is NOT a homecoming -- B still owes A"
+    );
+
+    // Only the real owner clears it.
+    test_assert!(
+        c_to_b.lent_to(2, 1).origin.is_none(),
+        "the hand-back to A must clear the origin"
+    );
     Ok(())
 }
 

@@ -94,6 +94,10 @@ const TESTS: &[TestCase] = &[
         run: capability::origin_clears_on_homecoming,
     },
     TestCase {
+        name: "capability::relending_preserves_the_root_lenders_claim",
+        run: capability::relending_preserves_the_root_lenders_claim,
+    },
+    TestCase {
         name: "capability::origin_cleared_when_lender_exits",
         run: capability::origin_cleared_when_lender_exits,
     },
