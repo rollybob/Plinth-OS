@@ -106,6 +106,20 @@ struct Slot {
     /// plain `send` (which a receiver wakes). Set when blocking, read by the
     /// receiver to decide whether to wake the sender or mint it a reply cap.
     pending_call: bool,
+    /// Where a capability reclaimed to this process landed in its own table,
+    /// or `NO_CAP` for none pending (ipc.rs owns the sentinel). Written by
+    /// `reclaim_lent_caps` when a borrower dies (Design/cap_reclaim.md D7);
+    /// read-and-cleared by whichever path reports it first -- the death-wake in
+    /// `reap_dying` if this process was already blocked, or `ipc_recv`'s
+    /// synchronous dead-peer return if it arrived late.
+    ///
+    /// This lives on the `Slot` rather than the `Process` on purpose. A running
+    /// process has its `Process` moved out into the per-core `CURRENT`, but its
+    /// `Slot` stays in `TABLE`, so a lender can be recorded against whether it
+    /// is running, Ready or Blocked -- there is no reach problem of the kind
+    /// K-001 was. It is also reset by `Slot::empty()`, which is what stops a
+    /// stale landing surviving into a recycled slot.
+    pending_landing: u64,
 }
 
 impl Slot {
@@ -118,6 +132,7 @@ impl Slot {
             pending_msg: 0,
             pending_cap: u64::MAX,
             pending_call: false,
+            pending_landing: u64::MAX,
         }
     }
 }
@@ -858,9 +873,8 @@ pub fn on_exit() -> ! {
     // lender's table has to be filled before the lender is told, because
     // `reap_dying` is what tells it (Design/cap_reclaim.md D5, and section 6.5
     // of that doc for why the obvious placement in `teardown` is too late).
-    let mut reclaimed = [(0usize, 0usize); capability::MAX_CAPS];
-    let n_reclaimed = reclaim_lent_caps(&proc.caps, cur, &mut reclaimed);
-    ipc::reap_dying(&proc.caps, &reclaimed[..n_reclaimed]);
+    reclaim_lent_caps(&proc.caps, cur);
+    ipc::reap_dying(&proc.caps);
     // This slot's identity is about to become reusable, so no surviving
     // capability may keep naming it as a lender. Must run before the slot is
     // handed out again; runs here, next to the other death-time bookkeeping.
@@ -1323,6 +1337,41 @@ pub fn take_pending_call(slot: usize) -> bool {
     unsafe { (*addr_of!(TABLE))[slot].pending_call }
 }
 
+/// Record that a reclaimed capability landed at `landing` in `slot`'s table
+/// (Design/cap_reclaim.md D7). **First write wins**: a lender that had lent the
+/// dying process two capabilities keeps the first, which preserves D5's one-slot
+/// limit exactly rather than quietly changing which one is reported. Both are in
+/// its table either way; only one is named.
+pub fn set_reclaim_landing(slot: usize, landing: u64) {
+    // SAFETY: single CPU, IF=0; scalar write to the process table.
+    // `u64::MAX` rather than a named NO_CAP: the sentinel is ipc.rs's and is
+    // private there, so this file spells it the same way `Slot::empty` does.
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        if table[slot].pending_landing == u64::MAX {
+            table[slot].pending_landing = landing;
+        }
+    }
+}
+
+/// Take the pending landing slot for `slot`, or `NO_CAP` if none. **Clears it.**
+///
+/// Read-and-clear is load-bearing, not tidiness. The landing must be reported
+/// exactly once: a second report could name a slot the lender has since released
+/// or overwritten, which would be a fresh lie rather than the missing-information
+/// this exists to fix. It also collapses the case where one lender is both a
+/// reply target and a stranded endpoint waiter -- `reap_dying` reaches it twice,
+/// and the capability landed once.
+pub fn take_reclaim_landing(slot: usize) -> u64 {
+    // SAFETY: as above.
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        let landing = table[slot].pending_landing;
+        table[slot].pending_landing = u64::MAX;
+        landing
+    }
+}
+
 /// Is the process in `slot` Blocked? `reply` uses this to confirm the caller a
 /// reply capability names is still awaiting its reply before waking it.
 pub fn is_blocked(slot: usize) -> bool {
@@ -1391,12 +1440,7 @@ pub fn install_into_blocked(slot: usize, cap: Capability) -> Option<usize> {
 /// Extending `ipc::reap_dying` instead was rejected: it takes the table by shared
 /// reference and is documented never to touch refcounts, while this needs `&mut`
 /// on a *different* process's table. Two different jobs.
-fn reclaim_lent_caps(
-    dying: &CapTable,
-    dying_slot: usize,
-    out: &mut [(usize, usize); capability::MAX_CAPS],
-) -> usize {
-    let mut n = 0;
+fn reclaim_lent_caps(dying: &CapTable, dying_slot: usize) {
     for cap in dying.iter() {
         let Some((lender, home)) = capability::reclaim_target(&cap, dying_slot) else {
             continue;
@@ -1423,8 +1467,10 @@ fn reclaim_lent_caps(
                 // would never be freed.
                 ipc::note_cap_removed(&cap, false);
                 ipc::note_cap_added(&home);
-                out[n] = (lender, landing);
-                n += 1;
+                // Record where it landed on the lender's own slot, so the fact
+                // outlives this call and both delivery paths read it from one
+                // place (Design/cap_reclaim.md D7). First write wins.
+                set_reclaim_landing(lender, landing as u64);
             }
             // D4's second fallback, and a legitimate outcome: all 16 of the
             // lender's slots are occupied, so there is nowhere to put this and it
@@ -1454,7 +1500,6 @@ fn reclaim_lent_caps(
             }
         }
     }
-    n
 }
 
 /// Clear every `origin` naming `slot` from every live capability table.

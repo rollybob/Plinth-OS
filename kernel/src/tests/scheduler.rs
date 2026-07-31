@@ -210,3 +210,68 @@ pub fn round_robin_cycle(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     test_assert!(pick_next(&s, 3) == Some(0), "3 -> 0 (wrap)");
     Ok(())
 }
+
+// ---- Design/cap_reclaim.md D7: the pending reclamation landing slot ----------
+//
+// The sentinel spelled the way scheduler.rs spells it -- `NO_CAP` is ipc.rs's and
+// is private there.
+const NO_LANDING: u64 = u64::MAX;
+
+/// A scratch slot for the D7 tests. High enough that the boot tour is not using
+/// it, and every test below ends by taking (which clears), so none leaves state.
+const SCRATCH: usize = MAX_PROCESSES - 1;
+
+/// A slot nobody has recorded against reports nothing.
+///
+/// This is the honest `NO_CAP` case, and it has to keep working: D7's whole point
+/// is distinguishing "nothing came back to you" from "something did and we did not
+/// say where", so a fix that reported a landing unconditionally would be as wrong
+/// as the bug.
+pub fn reclaim_landing_absent_by_default(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let _ = scheduler::take_reclaim_landing(SCRATCH); // clear any residue
+    test_assert!(
+        scheduler::take_reclaim_landing(SCRATCH) == NO_LANDING,
+        "an unwritten slot must report NO_CAP, not a stale or zero landing"
+    );
+    Ok(())
+}
+
+/// Taking a landing CLEARS it, so it is reported exactly once.
+///
+/// Load-bearing rather than tidy. `reap_dying` can reach one process twice -- as a
+/// reply target and as a stranded endpoint waiter -- and the capability landed
+/// once. Worse, a second report could name a slot the lender has since released or
+/// overwritten, which would be a fresh lie in place of the missing information D7
+/// exists to supply.
+pub fn reclaim_landing_take_clears(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let _ = scheduler::take_reclaim_landing(SCRATCH);
+    scheduler::set_reclaim_landing(SCRATCH, 7);
+    test_assert!(
+        scheduler::take_reclaim_landing(SCRATCH) == 7,
+        "first take must report the landing"
+    );
+    test_assert!(
+        scheduler::take_reclaim_landing(SCRATCH) == NO_LANDING,
+        "second take must report NO_CAP -- a landing is reported once"
+    );
+    Ok(())
+}
+
+/// First write wins when one lender is owed two capabilities.
+///
+/// This preserves D5's one-slot limit exactly as `landing_for` implemented it (it
+/// returned the first matching pair), rather than quietly changing which of the
+/// two a lender hears about. Both capabilities are in its table either way; only
+/// one is named. Asserting it pins the choice so a later "obvious" change to
+/// last-write-wins has to argue with a test.
+pub fn reclaim_landing_first_write_wins(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let _ = scheduler::take_reclaim_landing(SCRATCH);
+    scheduler::set_reclaim_landing(SCRATCH, 3);
+    scheduler::set_reclaim_landing(SCRATCH, 9);
+    test_assert!(
+        scheduler::take_reclaim_landing(SCRATCH) == 3,
+        "the first recorded landing must survive the second"
+    );
+    let _ = scheduler::take_reclaim_landing(SCRATCH);
+    Ok(())
+}

@@ -66,6 +66,23 @@ capability *back* -- and retires `frame_free` (nr 5) into it.
   found on 2026-06-27 only appear on a relaunch.
 
 ### Fixed
+- **A reclaimed capability is reported to its lender whether or not the lender
+  was already waiting.** ABI v2.9 promises that an `IPC_PEER_DIED` return names
+  the slot a reclaimed capability landed in. The kernel only kept that promise
+  for a lender that was *already blocked* when the borrower died: one that
+  reached `recv` a moment later took a different path internally and was handed
+  `NO_CAP`, even though reclamation had already put the capability in its table.
+  The same call therefore returned different answers depending on scheduling, and
+  a lender told `NO_CAP` had no way to find what it had been given, since nothing
+  enumerates a capability table. The landing slot is now recorded when the
+  reclamation happens and read by both return paths, so the two orderings agree.
+  **Observable change: `IPC_PEER_DIED` may now carry a real slot where it
+  previously carried `NO_CAP`** -- which is what v2.9 always specified, so no
+  correctly-written caller can have depended on the old value. Not an ABI bump:
+  this delivers meaning the contract already had, rather than adding new meaning
+  to a return value. The narrower limits are unchanged and still documented in
+  [ABI.md](ABI.md) -- `call` and `spawn_and_wait` still cannot receive the slot,
+  and only one landing is reported per lender.
 - **A framebuffer mapping now dies with the capability that justified it.**
   Previously, giving up a `Framebuffer` capability -- by `cap_release` or by
   transferring it to another process -- surrendered the *authority* but left the

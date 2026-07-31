@@ -165,16 +165,22 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   protocol and no abort. And a voluntary `cap_release` of a borrowed framebuffer
   still destroys it, exactly as before -- only death returns it.
 - **Exactly which wait sees the landing slot.** Reclamation always happens; the
-  *notification* is narrower than "any blocked lender", so it is worth stating
-  precisely. The slot is delivered only to a lender blocked in **`recv` /
-  `recv_cap`** on a channel the dying process could reach. It is NOT delivered
-  to:
-  - a lender that lent and went on doing something else -- there is no wake to
-    carry it, so the capability arrives silently;
+  *notification* is narrower, so it is worth stating precisely. The slot is
+  delivered to a lender that waits with **`recv` / `recv_cap`** on a channel the
+  dying process could reach -- **whether it was already blocked when the death
+  happened or only reached the call afterwards.** Those two orderings return the
+  same thing, which was not true before 2026-07-30: the late arrival used to get
+  `NO_CAP` even though the capability had come home, so the same call returned
+  different answers depending on scheduling. That was a defect, not a contract,
+  and it is fixed without an ABI change.
+
+  It is still NOT delivered to:
   - a lender blocked in **`call`**, because that op's return convention has no
     free register for it (`RSI` carries the reply word and `RDX` is discarded);
   - a caller of the **`spawn_and_wait`** helper, which collapses the three-value
-    return to two and drops the slot on the floor.
+    return to two and drops the slot on the floor;
+  - a lender that never waits on the channel at all -- there is no return value
+    to carry it, so the capability arrives silently.
 
   In every one of those cases the capability *is* in the lender's table -- it
   just has no way to learn where, and nothing enumerates a capability table.

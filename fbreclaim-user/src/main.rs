@@ -20,16 +20,21 @@
 //! -- the child died, which is expected -- carrying a real slot in place of the
 //! `NO_CAP` a v2.8 kernel always returned.
 //!
-//! **This demo has a race, and it is the kernel's, not the demo's (K-023).**
-//! The landing slot reaches only a lender already BLOCKED on the dying process,
-//! because that is the only peer `reap_dying` wakes. If the child faults before
-//! this process reaches its `recv` below, the capability is reclaimed into our
-//! table anyway -- verified 2026-07-30, at slot 2, drawable, hashing identically
-//! to the success case -- but the `recv` takes a different path in the kernel
-//! and returns `NO_CAP`, so we cannot find what we were given. That is
-//! `Design/cap_reclaim.md` D5's stated limitation, reached by the demo built to
-//! prove D5. It is why this demo passes most of the time rather than always, and
-//! why a green run here is weaker evidence than it appears.
+//! **This demo used to have a race, and it was the kernel's, not the demo's.**
+//! Until 2026-07-30 the landing slot reached only a lender already BLOCKED on the
+//! dying process, because that is the only peer `reap_dying` wakes. If the child
+//! faulted before this process reached its `recv` below, the capability was
+//! reclaimed into our table anyway -- measured, at slot 2, drawable, hashing
+//! identically to the success case -- but `recv` took a different path in the
+//! kernel and returned `NO_CAP`, so we could not find what we had been given.
+//! That was K-023, and it made this demo pass most of the time rather than
+//! always.
+//!
+//! `Design/cap_reclaim.md` D7 closed it: the landing slot is recorded on the
+//! lender's scheduler slot and BOTH delivery paths read it from there, so the
+//! result no longer depends on which of us reached the kernel first. The demo is
+//! therefore ordering-independent by construction rather than by luck -- if it
+//! ever goes intermittent again, that is a real regression and not the weather.
 //!
 //! Compare the other two framebuffer negatives. `gfxbound-user` reaches outside
 //! its grant in space; `gfxrevoke-user` reaches outside its own grant in time,

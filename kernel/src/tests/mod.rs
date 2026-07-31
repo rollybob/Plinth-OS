@@ -173,6 +173,18 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "scheduler::never_picks_self", run: scheduler::never_picks_self },
     TestCase { name: "scheduler::round_robin_cycle", run: scheduler::round_robin_cycle },
     TestCase {
+        name: "scheduler::reclaim_landing_absent_by_default",
+        run: scheduler::reclaim_landing_absent_by_default,
+    },
+    TestCase {
+        name: "scheduler::reclaim_landing_take_clears",
+        run: scheduler::reclaim_landing_take_clears,
+    },
+    TestCase {
+        name: "scheduler::reclaim_landing_first_write_wins",
+        run: scheduler::reclaim_landing_first_write_wins,
+    },
+    TestCase {
         name: "scheduler::origin_sweep_reaches_running_processes",
         run: scheduler::origin_sweep_reaches_running_processes,
     },

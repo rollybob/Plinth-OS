@@ -367,7 +367,7 @@ pub fn free_endpoint_count() -> usize {
 ///   (b) the dying process holds the last sender (or receiver) capability on an
 ///       endpoint whose queue holds blocked receivers (or senders): those peers
 ///       can never rendezvous -- wake them all.
-pub(crate) fn reap_dying(caps: &CapTable, reclaimed: &[(usize, usize)]) {
+pub(crate) fn reap_dying(caps: &CapTable) {
     // Tally this process's own per-endpoint references, and wake any caller it
     // still owed a reply.
     let mut dying_senders = [0u32; MAX_ENDPOINTS];
@@ -376,7 +376,8 @@ pub(crate) fn reap_dying(caps: &CapTable, reclaimed: &[(usize, usize)]) {
         match cap.object {
             CapObject::Reply { caller } => {
                 if scheduler::is_blocked(caller) {
-                    scheduler::wake_with(caller, IPC_PEER_DIED, 0, landing_for(caller, reclaimed));
+                    let landing = scheduler::take_reclaim_landing(caller);
+                    scheduler::wake_with(caller, IPC_PEER_DIED, 0, landing);
                 }
             }
             CapObject::Endpoint { id } if id < MAX_ENDPOINTS => {
@@ -399,46 +400,25 @@ pub(crate) fn reap_dying(caps: &CapTable, reclaimed: &[(usize, usize)]) {
         // SAFETY: scalar read of the single-CPU table; copy out before waking.
         let ep = unsafe { (*addr_of!(ENDPOINTS))[id] };
         if ep.in_use && ep.death_strands_peers(dying_senders[id], dying_receivers[id]) {
-            wake_all_stranded(id, reclaimed);
+            wake_all_stranded(id);
         }
     }
 }
 
-/// The slot a capability reclaimed from the dying process landed in, for the
-/// lender at `slot`, or `NO_CAP` if nothing came back to it (ABI v2.9, D5).
-///
-/// Reclamation is useless if the lender cannot find what came back, and there is
-/// no op to enumerate a capability table -- adding one would be a far larger
-/// surface than this problem deserves. The existing three-value IPC return
-/// already carries the field: `recv`/`recv_cap` yield `(status, msg, cap_slot)`,
-/// and `cap_slot` already means "where the capability landed". "Your peer died,
-/// and here is the thing you lent it" is a natural reading of it.
-///
-/// Two limitations, stated rather than papered over:
-///
-/// - This reaches only a lender that is **blocked** on the dying process. A
-///   lender that lent and wandered off gets the capability installed silently.
-///   The shell always waits, so the case the shell demo shows is covered; the
-///   general case is not.
-/// - Only ONE landing slot fits in the return, so a lender that had lent the
-///   dying process *two* capabilities (the whole screen and a band, say) learns
-///   about the first only. Both are in its table; only one is reported.
-fn landing_for(slot: usize, reclaimed: &[(usize, usize)]) -> u64 {
-    let mut i = 0;
-    while i < reclaimed.len() {
-        let (lender, landing) = reclaimed[i];
-        if lender == slot {
-            return landing as u64;
-        }
-        i += 1;
-    }
-    NO_CAP
-}
+// `landing_for` lived here until 2026-07-30 (Design/cap_reclaim.md D7). It
+// scanned a slice of (lender, landing) pairs that `on_exit` threaded through to
+// this module, which meant the landing slot only existed for the duration of the
+// death-wake -- so a lender that had not yet blocked could not be told, and
+// `ipc_recv`'s synchronous dead-peer path returned `NO_CAP` even though the
+// capability was sitting in that lender's table (K-023). The pair is now recorded
+// on the lender's scheduler slot by `reclaim_lent_caps` and taken from there by
+// whichever path reports it first, so the slice, the array in `on_exit` and this
+// function are all gone. See `scheduler::take_reclaim_landing`.
 
 /// Drain endpoint `id`'s entire wait queue, waking each blocked waiter with
 /// `IPC_PEER_DIED`. The caller has established that the queued side has lost its
 /// only possible counterpart.
-fn wake_all_stranded(id: usize, reclaimed: &[(usize, usize)]) {
+fn wake_all_stranded(id: usize) {
     loop {
         // SAFETY: single CPU, IF=0; ENDPOINTS and WAIT_LINKS are distinct
         // statics, so the borrows below do not alias.
@@ -448,7 +428,8 @@ fn wake_all_stranded(id: usize, reclaimed: &[(usize, usize)]) {
         };
         match woken {
             Some(slot) => {
-                scheduler::wake_with(slot, IPC_PEER_DIED, 0, landing_for(slot, reclaimed))
+                let landing = scheduler::take_reclaim_landing(slot);
+                scheduler::wake_with(slot, IPC_PEER_DIED, 0, landing)
             }
             None => break,
         }
@@ -567,15 +548,22 @@ fn ipc_recv(ep_slot: u64, frame_ptr: u64) -> u64 {
     // the only sender died before this recv was reached, e.g. a spawned worker
     // that faulted before the parent reached its wait). Atomic under IF=0.
     if endpoint_senders(id) == 0 {
-        // No capability came back on THIS path, and rdx must say so explicitly.
-        // A death-wake carrying a real landing slot goes through
-        // `scheduler::wake_with` (which writes the saved frame); this is the
-        // synchronous race where the sender was already gone before the recv, so
-        // reclamation -- if any happened -- ran before this process ever blocked
-        // and there is no wake to attach a slot to. A lender that reaches here
-        // still has the capability installed in its table, it just is not told
-        // where. That is the D5 limitation, not an extra one.
-        write_rdx(frame_ptr, NO_CAP);
+        // The synchronous race: the only sender died before this recv was
+        // reached, so there was no blocked peer for `reap_dying` to wake and no
+        // wake to attach a landing slot to. Reclamation still ran -- it is
+        // unconditional in `on_exit` -- and recorded where the capability landed
+        // on this process's own scheduler slot, so the answer is taken from there
+        // rather than invented here (Design/cap_reclaim.md D7).
+        //
+        // Until 2026-07-30 this wrote `NO_CAP` unconditionally and the comment
+        // explained why that was correct. It was not: whenever a capability had
+        // come home, the value was false. That is K-023 -- `fbreclaim`'s parent
+        // was told nothing came back while the framebuffer sat in its own table
+        // two slots away, mappable and drawable. `NO_CAP` is still what a lender
+        // that was owed nothing gets, which is the honest case this now
+        // distinguishes from the dishonest one.
+        let landing = scheduler::take_reclaim_landing(scheduler::current_slot());
+        write_rdx(frame_ptr, landing);
         return IPC_PEER_DIED;
     }
     // Block as a receiver. A later sender does the transfer and wakes us with
