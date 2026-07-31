@@ -20,6 +20,17 @@
 //! -- the child died, which is expected -- carrying a real slot in place of the
 //! `NO_CAP` a v2.8 kernel always returned.
 //!
+//! **This demo has a race, and it is the kernel's, not the demo's (K-023).**
+//! The landing slot reaches only a lender already BLOCKED on the dying process,
+//! because that is the only peer `reap_dying` wakes. If the child faults before
+//! this process reaches its `recv` below, the capability is reclaimed into our
+//! table anyway -- verified 2026-07-30, at slot 2, drawable, hashing identically
+//! to the success case -- but the `recv` takes a different path in the kernel
+//! and returns `NO_CAP`, so we cannot find what we were given. That is
+//! `Design/cap_reclaim.md` D5's stated limitation, reached by the demo built to
+//! prove D5. It is why this demo passes most of the time rather than always, and
+//! why a green run here is weaker evidence than it appears.
+//!
 //! Compare the other two framebuffer negatives. `gfxbound-user` reaches outside
 //! its grant in space; `gfxrevoke-user` reaches outside its own grant in time,
 //! after releasing it. This one is the case where the process that loses the
@@ -86,10 +97,16 @@ pub extern "C" fn _start(_id: u64) -> ! {
         sys_exit(3);
     }
     if cap_slot == NO_CAP {
-        // The pre-reclamation behaviour, stated loudly rather than exiting 0 and
-        // looking like a pass: the child's death destroyed the screen and nothing
-        // can draw for the rest of the boot.
-        sys_write(b"fbreclaim: NOT reclaimed -- the screen died with the child\n");
+        // Stated loudly rather than exiting 0 and looking like a pass. Say only
+        // what is actually known here, which is less than it looks: the wake
+        // carried no slot. Whether the capability still EXISTS is not
+        // observable from this process, because there is no op to enumerate a
+        // capability table -- and the two kernels that reach this line disagree
+        // about the answer. On a pre-reclamation kernel it really is gone. On
+        // this one it is almost certainly sitting in our table unfound, because
+        // we lost the race in K-023. A message that picked either story would be
+        // false half the time; this one is true in both.
+        sys_write(b"fbreclaim: no landing slot -- the death-wake reported nothing\n");
         sys_exit(4);
     }
     sys_write(b"fbreclaim: child died, screen came back\n");
