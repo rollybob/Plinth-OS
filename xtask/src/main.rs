@@ -4,12 +4,18 @@
 //! `cargo xtask build` -- build only
 //! `cargo xtask run-gdb` -- boot paused with a GDB server on :1234
 //! `cargo xtask smoke` -- boot with captured serial output and assert that
-//!                        every line in expected_boot_log.txt appears in order
+//!                        every line in expected_boot_log.txt appears in order,
+//!                        AND that nothing the file does not account for appears
+//!                        at all (see check_smoke_output)
 //! `cargo xtask smoke-smp` -- the same assertion battery as `smoke`, rerun
 //!                        once per PLINTH_SMP core count in SMP_TEST_CORE_COUNTS
 //!                        (Stage B2.4, design D8) -- the multi-core regression
-//!                        net `smoke`'s own -smp 1 byte-exact transcript can't
-//!                        be, since cross-core interleaving isn't deterministic
+//!                        net `smoke`'s own -smp 1 transcript check can't be,
+//!                        since cross-core interleaving isn't deterministic.
+//!                        Note the transcript check is NOT "byte-exact", a
+//!                        phrase several commit messages have used for it: 172
+//!                        of the 352 captured lines are excused by name in
+//!                        expected_boot_log.txt's allowlist
 //! `cargo xtask test`  -- build with --features tests, run the in-kernel
 //!                        suite, parse [PASS]/[FAIL]/[SUITE] tags
 //! `cargo xtask bench` -- build with --features bench, run the BKL contention
@@ -567,32 +573,100 @@ fn run_capture(uefi_path: &Path) -> String {
     output
 }
 
-/// Assert that every non-blank, non-comment line in expected_boot_log.txt
-/// appears in `actual`, in order. Unexpected lines between matches are
-/// ignored. Matching is substring-based so that partial-line merges still
-/// count; expected strings are specific enough to avoid false positives.
+/// Assert that the captured serial output matches expected_boot_log.txt, in
+/// both directions:
+///
+/// 1. **Every expectation appears, in order.** Non-blank, non-comment lines in
+///    the expectations file are matched as substrings against `actual`,
+///    advancing a cursor, so partial-line merges still count and expected
+///    strings need only be specific enough to avoid false positives.
+/// 2. **Nothing else appears.** Any actual line that satisfied no expectation
+///    and matches no `#!allow` pattern fails the run.
+///
+/// Direction 2 is K-003, and it is the whole point of this function being
+/// longer than it looks like it should be. Without it the gate was a plain
+/// subsequence match: unmatched output was skipped over silently, so a whole
+/// new demo could print eight lines of new kernel output and smoke stayed
+/// green. That is what happened while adding `fbreclaim`. New kernel output is
+/// now unverified-by-default and has to be either asserted or explicitly
+/// excused.
+///
+/// `#!allow <substring>` lines in expected_boot_log.txt declare output that is
+/// real but not deterministic enough to assert -- addresses, frame counts,
+/// geometry that shifts with the QEMU version. They are ordinary `#` comments
+/// to the expectation parser, so the allowlist lives in the same file as the
+/// thing it excuses, and every entry is a written-down admission of what this
+/// gate does not cover.
 fn check_smoke_output(actual: &str, expected_path: &Path) {
     let src = std::fs::read_to_string(expected_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", expected_path.display(), e));
 
-    let expected: Vec<&str> = src
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect();
+    let mut expected: Vec<&str> = Vec::new();
+    let mut allowed: Vec<&str> = Vec::new();
+    for line in src.lines().map(str::trim) {
+        if let Some(pattern) = line.strip_prefix("#!allow ") {
+            let pattern = pattern.trim();
+            assert!(
+                !pattern.is_empty(),
+                "empty #!allow pattern in {} -- an empty substring matches every line, \
+                 which would disable the unexpected-output check entirely",
+                expected_path.display()
+            );
+            allowed.push(pattern);
+        } else if !line.is_empty() && !line.starts_with('#') {
+            expected.push(line);
+        }
+    }
 
     let actual_lines: Vec<&str> = actual.lines().collect();
+    let mut satisfied = vec![false; actual_lines.len()];
     let mut cursor = 0;
     let mut failed = false;
 
     for want in &expected {
         match actual_lines[cursor..].iter().position(|l| l.contains(want)) {
-            Some(pos) => cursor += pos + 1,
+            Some(pos) => {
+                satisfied[cursor + pos] = true;
+                cursor += pos + 1;
+            }
             None => {
                 eprintln!("smoke: missing: {want:?}");
                 failed = true;
             }
         }
+    }
+
+    // Expectations are checked first and win ties, so an `#!allow` pattern can
+    // never swallow a line an expectation was counting on.
+    let mut unexpected: Vec<(usize, &str)> = Vec::new();
+    let mut allowed_count = 0usize;
+    for (i, line) in actual_lines.iter().enumerate() {
+        if satisfied[i] || line.trim().is_empty() {
+            continue;
+        }
+        if allowed.iter().any(|pattern| line.contains(*pattern)) {
+            allowed_count += 1;
+            continue;
+        }
+        unexpected.push((i + 1, *line));
+    }
+
+    if !unexpected.is_empty() {
+        eprintln!(
+            "smoke: {} unexpected line(s) -- output that no expectation covers \
+             and no #!allow excuses:",
+            unexpected.len()
+        );
+        for (lineno, line) in &unexpected {
+            eprintln!("smoke:   line {lineno}: {line:?}");
+        }
+        eprintln!(
+            "smoke: assert these in {} if they are deterministic, or add a \
+             `#!allow <substring>` line there -- with a comment saying why they \
+             cannot be asserted -- if they are not.",
+            expected_path.display()
+        );
+        failed = true;
     }
 
     if failed {
@@ -604,7 +678,15 @@ fn check_smoke_output(actual: &str, expected_path: &Path) {
         eprintln!("--- end output ---");
         std::process::exit(1);
     }
-    println!("smoke: ok ({} lines verified)", expected.len());
+    // Deliberately not "N lines verified", which counted the expectations file
+    // and told you nothing about the run. These three numbers describe the boot
+    // that actually happened, and the middle one is the honest measure of how
+    // much of it this gate does not check.
+    println!(
+        "smoke: ok ({} expectations matched, {allowed_count} lines allowed, {} lines captured)",
+        expected.len(),
+        actual_lines.len()
+    );
 }
 
 /// Number of scheduler-demo processes and lines each prints. Must match

@@ -1,5 +1,22 @@
-# Smoke test contract: every non-blank, non-comment line below must appear
-# in the captured serial output, in order. See xtask check_smoke_output.
+# Smoke test contract, both directions. See xtask check_smoke_output.
+#
+#   1. Every non-blank, non-comment line below must appear in the captured
+#      serial output, in order. Matching is substring-based, so an expectation
+#      may be a stable PREFIX of a line whose tail varies.
+#   2. Nothing else may appear. Any captured line that satisfies no expectation
+#      and matches no `#!allow` pattern fails the run.
+#
+# Direction 2 was added 2026-07-30 (K-003). Before it, this gate was a plain
+# subsequence match: unmatched output was skipped silently, so new kernel output
+# was unverified until someone remembered to add it here. It did not notice a
+# whole new demo printing eight new lines. At the moment it was turned on it
+# found 179 captured lines that nothing checked -- roughly half the boot.
+#
+# `#!allow <substring>` lines declare output that is real but cannot be
+# asserted. They are ordinary comments to the expectation parser, so they live
+# in this file rather than in xtask. The allowlist is at the BOTTOM, and it is
+# the honest statement of what this gate does not cover -- keep it short, and
+# prefer asserting a stable prefix over allowing a whole line.
 
 plinth: kernel entry
 plinth: frame allocator ready
@@ -28,6 +45,12 @@ plinth: acpi: 1 cpu(s), 1 ioapic(s)
 
 plinth: timer armed
 
+# AP bring-up count. Asserted only because check_smoke_output does not run under
+# smoke-smp (see that file's -smp 1 note above) -- at -smp 1 the BSP brings up no
+# APs and this line is fixed. If the transcript check is ever extended to the SMP
+# lane, this is one of the lines that has to move to the allowlist.
+plinth: smp: 0 ap(s) online
+
 # Console input bring-up (Stage 1): the i8042 keyboard comes up as the first
 # event source and IRQ1 is unmasked. Scancodes flow through input::record, which
 # routes them to any ring subscribed to the source (event_rings.md); the evt/kbd
@@ -49,8 +72,10 @@ plinth: mouse ready (i8042 port 2, IRQ12)
 # deterministic ramp, the archive disk only as a distinct, readable second
 # device (the kernel does not parse the archive format; that is the FS libOS's
 # job). Only stable summary lines are asserted: the per-BAR / per-capability
-# lines carry addresses that can shift across QEMU versions, and device 1's
-# capacity line is omitted because the archive size tracks the user ELFs.
+# lines carry addresses that can shift across QEMU versions. Device 1 is
+# asserted only up to its queue size: it is the archive disk, and its capacity
+# tracks the size of the user ELFs packed into it, so the tail of that line
+# moves whenever diskhello or hello does. Device 0's capacity is a fixed 2048.
 plinth: scanning PCI bus
 plinth: virtio-blk found at 00:03.0
 plinth: virtio-blk found at 00:04.0
@@ -64,6 +89,7 @@ plinth: virtio-blk[0] ready (queue 0, size 64, capacity 2048 sectors)
 # (MSIX_VECTOR_BASE + device index, no addresses), so a silent regression back
 # to INTx would change or drop these lines.
 plinth: virtio-blk[0] msix vector 0x30
+plinth: virtio-blk[1] ready (queue 0, size 64,
 plinth: virtio-blk[1] msix vector 0x31
 plinth: virtio-blk[0] sector 0 read ok (ramp verified)
 plinth: virtio-blk[1] sector 0 read ok (distinct disk)
@@ -166,7 +192,14 @@ plinth: rpc demo: all done
 # spawns a worker as an independent scheduled process, the worker sends its
 # result over the channel spawn set up, and the parent collects it with recv
 # (the join). The returned value is checked by xtask; frame counts must match.
+# The demo also runs faultchild, which faults on purpose so the parent can
+# observe IPC_PEER_DIED and reap it (check_reap asserts the parent's side). The
+# kernel's two lines for that fault are asserted here; the rip/addr tail varies
+# with code layout, so the expectation stops at the fault kind, the same way the
+# crash demo's does above.
 plinth: spawn demo: 1 processes
+plinth: [user fault] #PF
+plinth: terminating user process
 plinth: spawn demo: all done
 
 # cap_release regression (Design/cap_release.md, ABI v2.8): a released capability
@@ -200,6 +233,7 @@ plinth: steal demo: 0 steals across 1 cores
 # is denied a read one sector past its range. The frame counts around the demo
 # must match (check_frames_baseline) -- the I/O frame is reclaimed at teardown.
 plinth: blk demo: 1 processes
+blk: start
 blk: read ok b0=1 b1=2 b5=6
 blk: out-of-range rejected
 plinth: blk demo: all done
@@ -211,6 +245,7 @@ plinth: blk demo: all done
 # so correctness is asserted inside the demo, never transcript-matched. Frame
 # counts around it must match (its I/O + ring frames are reclaimed at teardown).
 plinth: asyncblk demo: 1 processes
+asyncblk: start
 asyncblk: ok (4 reads overlapped, each frame verified)
 plinth: asyncblk demo: all done
 
@@ -225,6 +260,7 @@ plinth: asyncblk demo: all done
 # asserts a write through it is rejected with BLK_E_RIGHTS -- the negative
 # case for the rights-direction check.
 plinth: blkwrite demo: 1 processes
+blkwrite: start
 blkwrite: ok (write+read-back verified)
 blkwrite: rdonly write rejected
 plinth: blkwrite demo: all done
@@ -472,3 +508,79 @@ shell: quit
 plinth: shell demo: all done
 
 plinth: boot ok
+
+# ===========================================================================
+# The allowlist: what this gate does NOT check
+# ===========================================================================
+#
+# Every captured line matching one of these is excused from direction 2. This
+# list is a liability, not a feature -- each entry is output that ships without
+# the transcript checking it. Shorten it when you can; prefer asserting a stable
+# prefix above to adding a pattern here.
+#
+# Patterns are matched as substrings against untrimmed captured lines, and the
+# pattern itself is trimmed, so a pattern cannot rely on surrounding whitespace.
+# Expectations are matched FIRST and win ties, so a pattern here can never
+# swallow a line an assertion above was counting on.
+#
+# --- Firmware and bootloader, before the kernel's first line ----------------
+# OVMF and the bootloader crate both narrate, and every line of it carries
+# addresses, segment offsets or an image size. None of it is ours.
+#!allow BdsDxe:
+#!allow INFO :
+#!allow TRACE:
+# The three continuation lines of the bootloader's multi-line `Pointer { .. }`
+# struct dump. `}` is the loosest pattern in this file -- it matches any line
+# containing a closing brace. Nothing the kernel prints does. If that ever
+# changes, this is the entry that will quietly stop pulling its weight.
+#!allow addr: 0x
+#!allow metadata:
+#!allow }
+#
+# --- Hardware discovery detail ----------------------------------------------
+# Deliberately unasserted for the reasons given in the bring-up sections above:
+# these lines carry physical addresses, BAR assignments and region counts that
+# shift with the QEMU version or the machine config. The stable summary line
+# after each group IS asserted, which is what catches a bring-up regression.
+#!allow memory regions (
+#!allow stride
+#!allow acpi cpu:
+#!allow acpi ioapic:
+#!allow acpi iso:
+#!allow acpi lapic base
+#!allow acpi source overrides:
+#!allow plinth: pci 00:
+#!allow bar1 mem32
+#!allow bar4 mem64
+#!allow virtio cap
+#!allow notify multiplier
+#!allow interrupt line
+#!allow msix table_size
+#
+# --- Frame and endpoint baselines -------------------------------------------
+# Checked properly by xtask's check_frames_baseline / check_endpoints_baseline,
+# which compare the before/after pair around each demo. The absolute counts move
+# whenever the kernel image crosses a page boundary, so they must not be pinned
+# here -- see the 2026-07-29 log, where growing Process moved every one of them.
+#!allow frames free
+#!allow endpoints free
+#
+# --- Demo output covered by a dedicated xtask checker -----------------------
+# Each of these is asserted by name in run_smoke_checks, in a way the transcript
+# cannot be: per-process ordering, a parsed return value, or a count. Their
+# interleaving is genuinely nondeterministic under preemption, which is why they
+# are checked by shape rather than by position. `ping` and `pong` are the two
+# loosest patterns here -- short enough to appear inside a longer word.
+#!allow spin[
+#!allow ping
+#!allow pong
+#!allow share:
+#!allow server: served
+#!allow client: call
+#!allow worker: computing result
+#!allow spawner:
+#!allow faultchild:
+#!allow caprelease:
+#!allow stealwork[
+#!allow stealer:
+#!allow gfxsplit[
