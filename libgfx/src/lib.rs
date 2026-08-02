@@ -99,6 +99,60 @@ impl Framebuffer {
         }
     }
 
+    /// Read pixel (x, y) back as its raw native bytes, packed little-endian into
+    /// a u32. Out-of-bounds reads yield 0.
+    ///
+    /// Deliberately raw rather than `-> (r, g, b)`: this exists for save-under
+    /// (Design/clickable_apps.md C4), where a saved pixel must be restored
+    /// *exactly*. Round-tripping through (r, g, b) is lossy -- `FB_FMT_U8`
+    /// averages the three channels on the way in and cannot recover them, and an
+    /// unknown layout keeps only red -- so a save/restore built on `put_pixel`
+    /// would silently discolour the screen under the cursor on those formats.
+    /// Raw bytes in, the same raw bytes out, whatever the format.
+    ///
+    /// `bytes_per_pixel` is at most 4 on every format this supports, so a u32
+    /// holds a whole pixel.
+    #[inline]
+    pub fn read_pixel_raw(&self, x: u32, y: u32) -> u32 {
+        if x >= self.info.width || y >= self.info.height {
+            return 0;
+        }
+        let bpp = self.info.bytes_per_pixel.min(4);
+        let p = (self.base + self.offset(x, y)) as *const u8;
+        let mut raw = 0u32;
+        let mut i = 0u32;
+        // SAFETY: (x, y) is in bounds, so [p, p+bpp) lies within the mapped
+        // framebuffer. Volatile for the same reason put_pixel writes volatile.
+        while i < bpp {
+            let byte = unsafe { p.add(i as usize).read_volatile() };
+            raw |= (byte as u32) << (i * 8);
+            i += 1;
+        }
+        raw
+    }
+
+    /// Write back a pixel previously captured by `read_pixel_raw`, byte for byte.
+    /// Out-of-bounds (x, y) is ignored.
+    ///
+    /// The inverse of `read_pixel_raw` and the restore half of save-under. Takes
+    /// no colour interpretation at all -- it is the caller's job to pass a value
+    /// that came from `read_pixel_raw` on a framebuffer with the same format.
+    #[inline]
+    pub fn write_pixel_raw(&self, x: u32, y: u32, raw: u32) {
+        if x >= self.info.width || y >= self.info.height {
+            return;
+        }
+        let bpp = self.info.bytes_per_pixel.min(4);
+        let p = (self.base + self.offset(x, y)) as *mut u8;
+        let mut i = 0u32;
+        // SAFETY: (x, y) is in bounds, so [p, p+bpp) lies within the mapped
+        // framebuffer.
+        while i < bpp {
+            unsafe { p.add(i as usize).write_volatile((raw >> (i * 8)) as u8) };
+            i += 1;
+        }
+    }
+
     /// FNV-1a hash over the `side` x `side` square at the origin, read back
     /// through the mapping byte by byte (via the row stride, so it is
     /// resolution-independent). This is the determinism proof (Design/display.md

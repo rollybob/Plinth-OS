@@ -14,6 +14,7 @@ path = "src/main.rs"
 libplinth = { path = "../libplinth" }
 libgfx = { path = "../libgfx" }
 libinput = { path = "../libinput" }
+libos = { path = "../libos" }
 
 [profile.dev]
 panic = "abort"

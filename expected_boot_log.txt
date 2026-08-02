@@ -466,10 +466,11 @@ fbreclaim: reclaimed hash 0xd12799246c3d6e04
 plinth: fbreclaim demo: all done
 
 # Visual userspace skin (D8, Design/display_skin.md) -- the finale: a shell with a
-# splash, a home screen of app icons, and arrow-key navigation, all library-OS
-# policy over the whole-screen Framebuffer (slot 1) + the keyboard EventSource
-# (slot 2). A scripted scancode sequence drives it: select+open the BARS view,
-# back out, select APP, launch it TWICE. APP is a real spawned process (shellapp):
+# splash, a home screen of app icons, arrow-key navigation and a MOUSE POINTER,
+# all library-OS policy over the whole-screen Framebuffer (slot 1), the keyboard
+# EventSource (slot 2) and the mouse EventSource (slot 3). Scripted scancode AND
+# mouse-packet sequences drive it: select+open the BARS view, back out, select APP,
+# launch it, CLICK it, launch it again. APP is a real spawned process (shellapp):
 # the shell hands it the framebuffer via spawn capability transfer; it draws,
 # hashes, and transfers the framebuffer BACK over the spawn result channel before
 # exiting (the display capability as transferable focus, shell -> app -> shell).
@@ -482,6 +483,32 @@ plinth: fbreclaim demo: all done
 # not come back to FB_SLOT (the shell must track where recv_cap landed it), and
 # the spent wait handle used to be unreleasable. Every line of the second launch
 # is identical to the first -- that sameness IS the assertion.
+#
+# Clickable apps, slice 1 (Design/clickable_apps.md). Two things are new here and
+# both are asserted on serial rather than in a frame hash, deliberately (C4):
+#
+#   - "cursor over ..." reports which icon the pointer is over, emitted only when
+#     that ANSWER changes. The pointer lives outside the hashed 128x128 top-left
+#     square, so no hash can see it -- the same blind spot that let the splash
+#     version banner read 2.7 for the whole of v2.8 with every test green. These
+#     lines are what make the pointer visible to the suite at all.
+#   - "click icon 3" reports what the click RESOLVED TO, not where it landed in
+#     pixels (C7). The scripted packet journey is in fixed icon-to-icon deltas
+#     from an icon centre, so it is resolution-independent by construction -- but
+#     if it ever stops being, this line says "none" and smoke fails loudly instead
+#     of the click silently missing and every hash still matching.
+#
+# The pointer is hidden while each hash is taken, so all four hashes below are
+# byte-identical to their pre-pointer values. That is hash hygiene, not the
+# pointer's assertion strategy; the two lines above are the assertion.
+#
+# The click is purely ADDITIVE to the keyboard trajectory: the two synthetic
+# queues advance together, one entry per idle pass, and the pointer sequence
+# carries two leading zero packets so the click lands after the scripted Down
+# rather than before it. Before that delay was added the click selected APP
+# itself, the Down moved the selection back off, and the tour lost its second
+# launch. Hence THREE launches here -- keyboard, pointer, keyboard -- and the
+# middle one is the only one a human could have caused with a mouse.
 plinth: shell demo: 1 processes
 shell: start
 # The ABI version the USER BINARIES were built against, emitted from the same
@@ -493,7 +520,25 @@ shell: start
 shell: VERSION 2.9
 shell: splash hash 0x549089847b362325
 shell: home hash 0x4b82ddae83e366a5
+# The pointer is parked on the centre of the selected icon at startup, so it
+# begins over icon 0. That is also what makes the journey below resolution-
+# independent: from an icon centre every other icon is a fixed delta away.
+shell: cursor over icon 0
 shell: view hash 0x2a82b4e08a822325
+# The journey: right across the gap between the columns (over nothing), onto
+# icon 1, then down onto icon 3. Four packets, three changes of answer.
+shell: cursor over none
+shell: cursor over icon 1
+shell: cursor over icon 3
+shell: launching app
+shellapp: start
+shellapp: framebuffer hash 0x41ff80e28d622325
+shellapp: returning the screen
+shell: back home hash 0x4b82ddae83e366a5
+# The pointer launch. Everything after this line is identical to a keyboard
+# launch, which is the point: the click reaches the SAME launch path (I7), it
+# does not have one of its own.
+shell: click icon 3
 shell: launching app
 shellapp: start
 shellapp: framebuffer hash 0x41ff80e28d622325

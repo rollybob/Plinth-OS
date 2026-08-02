@@ -1023,6 +1023,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 rights: capability::RIGHT_READ,
                 origin: None,
             };
+            // The mouse EventSource, granted as a THIRD capability so the shell
+            // can hit-test clicks (Design/clickable_apps.md slice 1). Granted
+            // unconditionally, unlike the mouse demo above, which is gated on
+            // `mouse::present()`: the source exists in the kernel's table whether
+            // or not the i8042's second port answered, so subscribing always
+            // succeeds and simply never fires without hardware. That keeps the
+            // shell's slot numbering FIXED -- a conditional grant would shift
+            // MOUSE_SLOT depending on the machine, which is the K-009 failure mode
+            // with a hardware trigger. shell-user mirrors these as KBD_SLOT = 2
+            // and MOUSE_SLOT = 3; the grant order below is what defines them.
+            let mousecap = Capability {
+                object: CapObject::EventSource { id: input::SOURCE_MOUSE as u8 },
+                rights: capability::RIGHT_READ,
+                origin: None,
+            };
             // Set-1 scancodes driving the home screen: Right (0xE0 0x4D) ->
             // select BARS, Enter (0x1C) -> open its view, Backspace (0x0E) ->
             // back, Down (0xE0 0x50) -> select APP, Enter (0x1C) -> launch it,
@@ -1039,7 +1054,53 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // that takes ~9 launches and is caprelease-user's job instead.
             #[cfg(not(feature = "interactive"))]
             input::arm_synthetic(&[0xE0, 0x4D, 0x1C, 0x0E, 0xE0, 0x50, 0x1C, 0x1C, 0x10]);
-            scheduler::run("shell demo", &[SHELL_BIN], phys_offset, &[Some(fbcap), Some(source)]);
+            // The pointer journey, in packets the shell turns into motion. It
+            // starts on the centre of icon 0 (the shell parks it there), so every
+            // delta here is a FIXED icon-to-icon step -- ICON_W + ICON_GAP = 248
+            // across, ICON_H + ICON_GAP = 168 down -- and lands on icon 3 at ANY
+            // resolution, even though the grid origin is centred and this file
+            // does not know the resolution. Split across two packets each because
+            // a PS/2 delta is a signed byte.
+            //
+            // dy is NEGATIVE to move DOWN the screen: PS/2 reports +Y as up, and
+            // the shell (not the kernel) is what decides that means screen-up.
+            //
+            // The last two packets are a button press and its release: a click on
+            // icon 3, which is APP, so the pointer launches the app exactly as
+            // Enter does. Delivery is interleaved with the scancodes above --
+            // `deliver_synthetic` and `deliver_synthetic_mouse` both fire on each
+            // idle-on-input pass -- so the two sequences alternate rather than
+            // running one after the other.
+            //
+            // The two leading zero packets are a deliberate DELAY, not padding.
+            // Both synthetic queues advance one entry per idle-on-input pass, so
+            // the pointer's position in this array is its position in time
+            // relative to the scancodes above. Without the delay the click lands
+            // before the scripted Down, sets the selection to APP itself, and the
+            // Down that follows moves it back off -- which costs the tour the
+            // deliberate SECOND launch that guards the relaunch bugs of
+            // 2026-06-27. Two zero packets put the click after the Down instead,
+            // so the keyboard trajectory is exactly what it was before the pointer
+            // existed and the click is purely additive. A zero packet moves
+            // nothing, changes no hit-test answer and presses no button, so it
+            // emits nothing.
+            #[cfg(not(feature = "interactive"))]
+            input::arm_synthetic_mouse(&[
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (127, 0, 0x00),
+                (121, 0, 0x00),
+                (0, -127, 0x00),
+                (0, -41, 0x00),
+                (0, 0, 0x01),
+                (0, 0, 0x00),
+            ]);
+            scheduler::run(
+                "shell demo",
+                &[SHELL_BIN],
+                phys_offset,
+                &[Some(fbcap), Some(source), Some(mousecap)],
+            );
             let after_shell = free_frames();
             let _ = writeln!(serial, "plinth: {after_shell} frames free after shell");
         }

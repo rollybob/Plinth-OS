@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "libos"
+version = "0.1.0"
+dependencies = [
+ "libplinth",
+]
+
+[[package]]
 name = "libplinth"
 version = "0.1.0"
 
@@ -26,5 +33,6 @@ version = "0.1.0"
 dependencies = [
  "libgfx",
  "libinput",
+ "libos",
  "libplinth",
 ]

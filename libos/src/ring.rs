@@ -558,6 +558,67 @@ where
     }
 }
 
+/// Which side of a `select2` resolved first.
+pub enum Either<A, B> {
+    A(A),
+    B(B),
+}
+
+/// Await two futures and resolve as soon as **either** completes -- the "or" to
+/// `join2`'s "and".
+///
+/// This is what a UI event loop needs and `join2` cannot express: a shell waiting
+/// on a keyboard stream and a mouse stream wants whichever packet arrives first,
+/// not both. Both subscriptions ride one ring and one `ring_wait`, exactly as the
+/// module header describes; only the combinator differs.
+///
+/// **The loser is not lost.** When one side wins, the other's future is dropped
+/// without ever having consumed a completion -- but the reactor's `done` table is
+/// owned by the *reactor*, not by the future, and `take` removes an entry only on
+/// a cookie match. So an event that arrived for the losing side stays queued and
+/// is returned by the next `select2` over the same stream. This is the property
+/// that makes dropping a half-finished `NextEvent` safe, and it is why a stream's
+/// `arm` flag lives on the `EventStream` rather than on `NextEvent`.
+///
+/// **Biased toward `a`.** `a` is polled first, so if both are ready in the same
+/// wake, `a` wins and `b` waits for the next call. With two finite scripted
+/// sequences (the smoke case) this only fixes the interleaving; with two live
+/// devices a saturated `a` would starve `b`. Callers that need fairness should
+/// alternate the argument order. Documented rather than fixed, because the shell
+/// drains one event per iteration and neither device can saturate it.
+pub struct Select2<A: Future, B: Future> {
+    a: A,
+    b: B,
+}
+
+/// Join two unlike futures into a first-past-the-post race. See `Select2`.
+pub fn select2<A, B>(a: A, b: B) -> Select2<A, B>
+where
+    A: Future + Unpin,
+    B: Future + Unpin,
+{
+    Select2 { a, b }
+}
+
+impl<A, B> Future for Select2<A, B>
+where
+    A: Future + Unpin,
+    B: Future + Unpin,
+{
+    type Output = Either<A::Output, B::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut(); // both fields Unpin, so Select2 is Unpin
+        if let Poll::Ready(v) = Pin::new(&mut me.a).poll(cx) {
+            return Poll::Ready(Either::A(v));
+        }
+        if let Poll::Ready(v) = Pin::new(&mut me.b).poll(cx) {
+            return Poll::Ready(Either::B(v));
+        }
+        Poll::Pending
+    }
+}
+
 // A no-op waker: the executor re-polls its whole future tree after each reap, so
 // the waker has nothing to do. (RawWaker boilerplate for a do-nothing Waker.)
 const NOOP_VTABLE: RawWakerVTable =
