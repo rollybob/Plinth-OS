@@ -558,6 +558,23 @@ pub extern "C" fn _start(_idx: u64) -> ! {
     // `recv_cap`, which mints it into the next free slot -- NOT back at FB_SLOT.
     // So we must remember where it landed and transfer THAT slot next time, or a
     // second launch would hand the app the stale wait-handle instead.
+    //
+    // The observed values are 1 -> 7 on the first launch and 7 -> 7 on every one
+    // after, and that stability is MISLEADING. It invites the conclusion that only
+    // the first launch migrates anything, so the second launch adds no coverage
+    // and the D7 relaunch guard is weaker than it claims. That conclusion is
+    // wrong, and it was reached and retracted on 2026-08-01 -- recorded here
+    // because the numbers will look just as suspicious to the next person who
+    // prints them.
+    //
+    // The guard is not about the migration RECURRING. It is about whether this
+    // shell USES the migrated value on the next transfer, and that is observable
+    // only on a relaunch. Verified rather than argued: reporting a stale slot here
+    // while leaving the remap correct lets the first launch complete normally and
+    // makes the SECOND fail -- the app receives the wrong capability, never maps
+    // the framebuffer and never draws. Breaking the remap instead is too blunt to
+    // show this; it fails at the first launch and proves only that some slot
+    // matters.
     let mut fb_slot = FB_SLOT;
 
     let mut keymap = Keymap::new();
