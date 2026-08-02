@@ -99,7 +99,132 @@ fn build_user_crate(name: &str) {
     let size = std::fs::metadata(&elf_path)
         .unwrap_or_else(|e| panic!("failed to stat {name}-user ELF: {e}"))
         .len();
-    println!("{name}-user: {size} bytes (ELF)");
+    let layout = check_user_elf(name, &elf_path);
+    println!("{name}-user: {size} bytes (ELF, {layout})");
+}
+
+// --- static ELF layout gate ------------------------------------------------
+//
+// Every user binary must satisfy three properties that the linker script is
+// responsible for and that nothing else checks. Run here, in build_user_crate,
+// so it fires on EVERY path that builds user code (build/run/smoke/smoke-smp/
+// bench/test) and cannot be forgotten by adding a crate.
+//
+// Why this exists (2026-08-01). All three properties were violated in this tree
+// and only one of the violations was ever noticed:
+//
+//   1. Page-aligned PT_LOAD. An unplaced .got or an unaligned .bss becomes its
+//      own misaligned segment and the kernel's loader refuses the binary at
+//      spawn. This one IS caught today -- but only indirectly, and only for
+//      crates the boot tour actually spawns: the demo prints "setup of process
+//      0 failed" and the K-003 gate rejects it as unaccounted output. A crate
+//      that is built but not booted (template) is invisible to that.
+//   2. No segment both writable and executable. Never violated, checked because
+//      the linker script's whole reason for aligning section groups is per-page
+//      W^X, and an assertion of a property is worth more than a comment about it.
+//   3. No writable .rodata. This one shipped. rwfs-user folded .got into
+//      .rodata, an input section's flags propagated to the output section, and
+//      744 bytes of constants carried the write bit for however long. Nothing
+//      failed. Nothing could have: no test, no hash and no boot line is a
+//      function of a section's write bit. It was found by reading ELF headers
+//      by hand while fixing something else.
+//
+// The gate is deliberately over the BUILT ARTEFACT rather than over the linker
+// script's text. A script can be correct and the toolchain still surprise it --
+// which is exactly what an orphan section is.
+
+/// Page size the kernel's loader enforces segment alignment against.
+const PAGE_SIZE: u64 = 4096;
+
+/// Read a little-endian integer of `N` bytes at `off`, or panic naming the file.
+fn elf_num(bytes: &[u8], off: usize, n: usize, what: &str, name: &str) -> u64 {
+    let end = off + n;
+    assert!(end <= bytes.len(), "{name}-user: ELF truncated reading {what} at {off:#x}");
+    let mut v = 0u64;
+    for (i, b) in bytes[off..end].iter().enumerate() {
+        v |= (*b as u64) << (8 * i);
+    }
+    v
+}
+
+/// Assert the three layout properties above. Returns a short description for the
+/// build line so a passing check is visible rather than merely silent.
+fn check_user_elf(name: &str, path: &Path) -> String {
+    let b = std::fs::read(path)
+        .unwrap_or_else(|e| panic!("failed to read {name}-user ELF: {e}"));
+
+    assert!(b.len() >= 64, "{name}-user: too short to be an ELF");
+    assert_eq!(&b[0..4], b"\x7fELF", "{name}-user: not an ELF");
+    assert_eq!(b[4], 2, "{name}-user: not 64-bit ELF");
+    assert_eq!(b[5], 1, "{name}-user: not little-endian ELF");
+
+    let mut problems: Vec<String> = Vec::new();
+
+    // --- program headers: alignment and W^X ---
+    let phoff = elf_num(&b, 0x20, 8, "e_phoff", name) as usize;
+    let phentsize = elf_num(&b, 0x36, 2, "e_phentsize", name) as usize;
+    let phnum = elf_num(&b, 0x38, 2, "e_phnum", name) as usize;
+    let mut loads = 0usize;
+    for i in 0..phnum {
+        let o = phoff + i * phentsize;
+        if elf_num(&b, o, 4, "p_type", name) != 1 {
+            continue; // PT_LOAD only
+        }
+        loads += 1;
+        let flags = elf_num(&b, o + 4, 4, "p_flags", name);
+        let vaddr = elf_num(&b, o + 16, 8, "p_vaddr", name);
+        if vaddr % PAGE_SIZE != 0 {
+            problems.push(format!(
+                "PT_LOAD at {vaddr:#x} is not page-aligned (the loader will reject this \
+                 binary with \"elf: segment vaddr not page-aligned\"; an unplaced section \
+                 in user.ld is the usual cause)"
+            ));
+        }
+        // PF_X = 1, PF_W = 2.
+        if flags & 1 != 0 && flags & 2 != 0 {
+            problems.push(format!("PT_LOAD at {vaddr:#x} is both writable and executable"));
+        }
+    }
+    if loads == 0 {
+        problems.push("no PT_LOAD segments".to_string());
+    }
+
+    // --- section headers: .rodata must not be writable ---
+    let shoff = elf_num(&b, 0x28, 8, "e_shoff", name) as usize;
+    let shentsize = elf_num(&b, 0x3A, 2, "e_shentsize", name) as usize;
+    let shnum = elf_num(&b, 0x3C, 2, "e_shnum", name) as usize;
+    let shstrndx = elf_num(&b, 0x3E, 2, "e_shstrndx", name) as usize;
+    if shnum > 0 && shoff != 0 {
+        let strtab = elf_num(&b, shoff + shstrndx * shentsize + 24, 8, "shstrtab off", name) as usize;
+        for i in 0..shnum {
+            let o = shoff + i * shentsize;
+            let name_off = strtab + elf_num(&b, o, 4, "sh_name", name) as usize;
+            let end = b[name_off..].iter().position(|c| *c == 0).unwrap_or(0);
+            let sec = std::str::from_utf8(&b[name_off..name_off + end]).unwrap_or("");
+            // SHF_WRITE = 0x1, SHF_ALLOC = 0x2.
+            let flags = elf_num(&b, o + 8, 8, "sh_flags", name);
+            if sec == ".rodata" && flags & 0x2 != 0 && flags & 0x1 != 0 {
+                let size = elf_num(&b, o + 32, 8, "sh_size", name);
+                problems.push(format!(
+                    ".rodata is WRITABLE ({size} bytes) -- a writable input section such as \
+                     .got has been folded into it, and its flags propagated to the output \
+                     section. Put .got in .data (see user.ld), not .rodata"
+                ));
+            }
+        }
+    }
+
+    if !problems.is_empty() {
+        eprintln!("elfcheck: {name}-user FAILED:");
+        for p in &problems {
+            eprintln!("elfcheck:   {p}");
+        }
+        eprintln!("elfcheck: the layout contract lives in user.ld, shared by every user crate.");
+        std::process::exit(1);
+    }
+
+    let plural = if loads == 1 { "segment" } else { "segments" };
+    format!("{loads} {plural}, layout ok")
 }
 
 // Registers every non-noreturn syscall asm! block in libplinth must
