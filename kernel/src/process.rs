@@ -23,7 +23,7 @@ use crate::memory;
 use crate::usermode;
 
 /// The window an ELF image's PT_LOAD segments must fall within. The base
-/// matches the user crates' linker.ld; the end sits below the stack and map
+/// matches the user crates' shared user.ld; the end sits below the stack and map
 /// windows, so a segment can never collide with them -- the loader only has
 /// to check containment in this range (see elf::parse).
 pub const USER_IMAGE_BASE: u64 = 0x40_0000;

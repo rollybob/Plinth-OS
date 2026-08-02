@@ -602,8 +602,9 @@ A Plinth program is a **static, non-PIE `ET_EXEC` ELF64** for x86-64:
   pages total); oversize images are rejected.
 
 The reference `*-user` crates do this with a `build.rs` that passes
-`-no-pie` and a `linker.ld` that page-aligns `.text`, `.rodata`, and
-`.data` (see any `*-user/` crate as a template).
+`-no-pie` and a SHARED `user.ld` at the repo root that page-aligns `.text`,
+`.rodata`, `.data` and `.bss` (one script for every crate; see any `*-user/`
+crate as a template).
 
 ## Process entry state
 

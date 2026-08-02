@@ -35,8 +35,10 @@ template-user/
   Cargo.toml          package + libplinth dependency, panic = "abort"
   .cargo/config.toml  build-std (core) for the bare-metal target
   build.rs            passes the linker script and -no-pie
-  linker.ld           load address + page-aligned segments
   src/main.rs         _start + panic handler
+
+user.ld               SHARED by every *-user crate: load address +
+                      page-aligned segments (repo root, not per-crate)
 ```
 
 The program itself is small:
@@ -81,10 +83,23 @@ that, and they are the only non-obvious part of the build:
 - **`build.rs` passes `-no-pie`.** The `x86_64-unknown-none` target emits a
   position-independent executable (`ET_DYN`) by default; the loader rejects
   that. `-no-pie` makes it a true `ET_EXEC`.
-- **`linker.ld` page-aligns each section group** (`. = ALIGN(0x1000)`
-  before `.rodata` and `.data`). The linker otherwise packs `.text`,
+- **`user.ld` page-aligns each section group** (`. = ALIGN(0x1000)` before
+  `.rodata`, `.data` and `.bss`). The linker otherwise packs `.text`,
   `.rodata`, and `.data` into shared pages, which breaks per-page W^X. The
   load address (`. = 0x400000`) must stay inside the image window.
+  It also places `.got` explicitly, in `.data`. An unplaced `.got` is an
+  orphan section: the linker parks it after `.rodata` at an unaligned
+  address, and since it is writable that becomes its own misaligned
+  `PT_LOAD`, which the loader rejects with `elf: segment vaddr not
+  page-aligned` -- an error that names ELF while the cause is the script.
+  Putting it in `.rodata` instead also boots, but makes the whole rodata
+  segment writable and silently costs the binary W^X on its constants.
+- **There is ONE script for all of them**, at the repo root. It was 39
+  per-crate copies until 2026-08-01; the `.got` problem above had been
+  diagnosed once, fixed in 3 of the 39, and the version that spread was the
+  writable-`.rodata` one. Merging them surfaced a second latent bug the
+  same day (`.bss` had no `ALIGN`, which only ever mattered for a crate with
+  both a non-page-multiple `.data` and a non-empty `.bss`).
 
 Do not set these via `RUSTFLAGS` or `.cargo` config `rustflags`: that
 recompiles `core` through build-std. Keep `-no-pie` in `build.rs`, where it
