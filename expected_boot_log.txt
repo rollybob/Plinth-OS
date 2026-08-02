@@ -534,6 +534,7 @@ shell: launching app
 shellapp: start
 shellapp: framebuffer hash 0x41ff80e28d622325
 shellapp: returning the screen
+shell: app returned the screen
 shell: back home hash 0x4b82ddae83e366a5
 # The pointer launch. Everything after this line is identical to a keyboard
 # launch, which is the point: the click reaches the SAME launch path (I7), it
@@ -543,11 +544,44 @@ shell: launching app
 shellapp: start
 shellapp: framebuffer hash 0x41ff80e28d622325
 shellapp: returning the screen
+shell: app returned the screen
 shell: back home hash 0x4b82ddae83e366a5
 shell: launching app
 shellapp: start
 shellapp: framebuffer hash 0x41ff80e28d622325
 shellapp: returning the screen
+shell: app returned the screen
+shell: back home hash 0x4b82ddae83e366a5
+# Clickable apps, slice 2 -- the demonstration the whole cap_reclaim milestone was
+# built for (Design/clickable_apps.md C6), and the first time it has existed.
+#
+# The pointer moves one column left onto CRASH and clicks. CRASH is a real app
+# (fbreclaimchild, SPAWNABLE id 5): it maps the screen, draws to prove the mapping
+# is genuinely live in ITS address space, and then faults while still holding the
+# framebuffer capability. Nothing is handed back -- there is nobody left to hand it.
+#
+# The kernel reclaims the capability during teardown and reports the slot it landed
+# in on the death wake itself (ABI v2.9), so the shell's IPC_PEER_DIED branch remaps
+# there and redraws. "app died holding the screen" is the branch being taken, and
+# the "back home hash" that follows is byte-identical to every other one in this
+# file -- INCLUDING the cooperative ones above. That sameness is the assertion: the
+# shell recovers from an app that crashed exactly as completely as from one that
+# exited politely, and cannot tell the difference by the time it has redrawn.
+#
+# Before reclamation this sequence was unrecoverable. No syscall mints a
+# framebuffer, so a shell that launched a crashing app lost the display for the
+# rest of the boot -- which is precisely why clickable apps could not ship first.
+shell: cursor over none
+shell: cursor over icon 2
+shell: click icon 2
+shell: launching app
+fbreclaimchild: holding the screen, now faulting
+# The fault itself, truncated before the rip/addr as everywhere else in this file:
+# those shift with the binary. This is a DELIBERATE crash, so these two lines are
+# the demo working, not a defect.
+plinth: [user fault] #PF
+plinth: terminating user process
+shell: app died holding the screen
 shell: back home hash 0x4b82ddae83e366a5
 shell: quit
 plinth: shell demo: all done

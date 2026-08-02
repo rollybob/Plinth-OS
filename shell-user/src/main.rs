@@ -1,14 +1,21 @@
 //! The shell -- the visual userspace skin (D8, Design/display_skin.md): a splash,
 //! a home screen of app icons, keyboard navigation, a mouse cursor, and
-//! launching by click (Design/clickable_apps.md slice 1).
+//! launching by click (Design/clickable_apps.md slices 1 and 2).
 //!
 //! It holds the whole-screen `Framebuffer` (FB_SLOT), the keyboard `EventSource`
-//! (KBD_SLOT) and the mouse `EventSource` (MOUSE_SLOT). Three icons are
-//! shell-drawn "views"; the fourth is a real app the shell `spawn`s, handing it
-//! the framebuffer and getting it back over the spawn result channel (D6c) -- the
-//! display capability as transferable focus. Scripted scancode and mouse-packet
-//! sequences (armed kernel-side) drive it deterministically; each fixed frame's
-//! top-left square is hashed to serial.
+//! (KBD_SLOT) and the mouse `EventSource` (MOUSE_SLOT). Two icons are shell-drawn
+//! "views"; the other two are real apps the shell `spawn`s, handing each the
+//! framebuffer -- the display capability as transferable focus. Scripted scancode
+//! and mouse-packet sequences (armed kernel-side) drive it deterministically; each
+//! fixed frame's top-left square is hashed to serial.
+//!
+//! **The two apps differ in how they give the screen back, and that is the point.**
+//! APP (`shellapp`) transfers the capability back over the spawn result channel and
+//! exits cleanly (D6c). CRASH (`fbreclaimchild`) faults while still holding it and
+//! hands back nothing; the kernel reclaims the capability on teardown and reports
+//! where it landed on the death wake (ABI v2.9). The shell's recovery is identical
+//! either way, down to the frame hash -- which is what makes a crashing app
+//! survivable rather than terminal for the display (C6).
 //!
 //! All of it -- splash, layout, icons, the pointer, hit-testing, the launch
 //! handoff -- is unprivileged policy over the framebuffer/keyboard/mouse
@@ -32,7 +39,7 @@ use libos::ring::{self, Either};
 use libplinth::{
     event_code, event_kind, event_value, mouse_buttons, mouse_dx, mouse_dy, sys_cap_release,
     sys_exit, sys_recv_cap, sys_spawn, sys_write, write_dec, write_hex, ABI_VERSION, EVENT_KEY,
-    EVENT_MOUSE_MOVE, FB_SLOT, IPC_OK, MAP_BASE, NO_CAP, SYS_ERR,
+    EVENT_MOUSE_MOVE, FB_SLOT, IPC_OK, IPC_PEER_DIED, MAP_BASE, NO_CAP, SYS_ERR,
 };
 
 /// The keyboard EventSource lands in the slot after the framebuffer, and the
@@ -42,13 +49,39 @@ use libplinth::{
 /// the K-009 shape -- so both ends carry a comment naming the other.
 const KBD_SLOT: u64 = 2;
 const MOUSE_SLOT: u64 = 3;
-/// shellapp's index in the kernel's SPAWNABLE table (see main.rs).
-const SHELLAPP_ID: u64 = 3;
 const HASH_SIDE: u32 = 128;
 
-/// A 2x2 icon grid; index = row*2 + col. Three views + one real app.
-const ICON_LABELS: [&[u8]; 4] = [b"INFO", b"BARS", b"GREET", b"APP"];
-const APP_ICON: usize = 3;
+/// A 2x2 icon grid; index = row*2 + col. Two shell-drawn views + two real apps.
+const ICON_LABELS: [&[u8]; 4] = [b"INFO", b"BARS", b"CRASH", b"APP"];
+
+/// Which icons launch a real process, and which `SPAWNABLE` id each one is
+/// (Design/clickable_apps.md C3). `None` is a shell-drawn view.
+///
+/// This table is library-OS policy and deliberately NOT a kernel registry: the
+/// kernel exposes `SPAWNABLE` ids and `sys_spawn`, and which of them are offered
+/// to a user, under what name and in what order, is presentation. A kernel-side
+/// app registry would be the kernel deciding what a user may launch, which is N3
+/// arbitration.
+///
+/// The cost, disclosed rather than hidden (N7): these ids mirror the ORDER of the
+/// kernel's `SPAWNABLE` array in main.rs, and nothing checks that they agree. That
+/// array carries an "append only" warning naming this hazard, and K-009 is what it
+/// looks like when it bites. Two entries is still comfortably a comment's worth of
+/// coupling; a generated table is the answer if this grows.
+const ICON_APPS: [Option<u64>; 4] = [
+    None,                       // INFO  -- shell-drawn view
+    None,                       // BARS  -- shell-drawn view
+    Some(FBRECLAIMCHILD_ID),    // CRASH -- faults while holding the screen
+    Some(SHELLAPP_ID),          // APP   -- draws and hands the screen back
+];
+
+/// shellapp's index in the kernel's SPAWNABLE table (see main.rs). It draws and
+/// transfers the framebuffer back, then exits cleanly.
+const SHELLAPP_ID: u64 = 3;
+/// fbreclaimchild's index in the same table. It maps the screen, draws to prove
+/// it really holds it, and then FAULTS while still holding it -- the case the
+/// whole reclamation milestone exists for (Design/cap_reclaim.md D6, C6 here).
+const FBRECLAIMCHILD_ID: u64 = 5;
 
 /// Icon cell geometry. The *spacing* (`ICON_W + ICON_GAP`, `ICON_H + ICON_GAP`)
 /// is resolution-independent even though the grid ORIGIN is centred, which is
@@ -319,6 +352,7 @@ fn emit_hash(tag: &[u8], fb: &Framebuffer, cur: &mut Cursor) {
 fn launch_app(
     stale_fb: Framebuffer,
     fb_slot: u64,
+    app_id: u64,
     sel: usize,
     cur: &mut Cursor,
 ) -> (Framebuffer, u64) {
@@ -334,17 +368,45 @@ fn launch_app(
     // handoff, and must use the one returned at the end.
     drop(stale_fb);
     sys_write(b"shell: launching app\n");
-    let handle = sys_spawn(SHELLAPP_ID, fb_slot);
+    let handle = sys_spawn(app_id, fb_slot);
     if handle == SYS_ERR {
         sys_write(b"shell: spawn failed\n");
         sys_exit(2);
     }
-    // Join: the app draws, then transfers the framebuffer capability back over
-    // this channel before exiting. Getting a capability back (cap_slot != NO_CAP)
-    // is the authority returning -- the shell -> app -> shell handoff completing.
+    // Join. There are TWO ways the screen comes back, and the shell must survive
+    // both -- this is C6, and it is the reason the reclamation milestone exists.
+    //
+    //   IPC_OK         the app drew, transferred the capability back over this
+    //                  channel, and exited cleanly. The cooperative path.
+    //   IPC_PEER_DIED  the app FAULTED while still holding the screen. Nobody
+    //                  handed anything back; the kernel reclaimed the capability
+    //                  on teardown and, since ABI v2.9, reports the slot it landed
+    //                  in on this very wake.
+    //
+    // What matters is that the shell does the SAME thing afterwards either way:
+    // remap at the reported slot and redraw. Before reclamation the second case
+    // was unrecoverable -- no syscall mints a framebuffer, so nothing in userspace
+    // could draw again for the rest of the boot, and a shell that launched a
+    // crashing app would have taken the display down with it.
     let (status, _msg, cap_slot) = sys_recv_cap(handle);
-    if status != IPC_OK || cap_slot == NO_CAP {
-        sys_write(b"shell: app did not return the screen\n");
+    match status {
+        IPC_OK => {
+            sys_write(b"shell: app returned the screen\n");
+        }
+        IPC_PEER_DIED => {
+            sys_write(b"shell: app died holding the screen\n");
+        }
+        _ => {
+            sys_write(b"shell: unexpected wake from the app\n");
+            sys_exit(3);
+        }
+    }
+    if cap_slot == NO_CAP {
+        // Said plainly rather than exiting quietly. On the death path this is the
+        // K-023 shape: the capability may well be sitting in this table unfound,
+        // but nothing can enumerate a capability table, so the honest claim is
+        // only that the wake carried no slot.
+        sys_write(b"shell: no landing slot -- the screen did not come back\n");
         sys_exit(3);
     }
     // The framebuffer came back at cap_slot, not FB_SLOT; track it so the next
@@ -393,8 +455,8 @@ fn open_icon(
     kbd: &mut ring::EventStream,
     keymap: &mut Keymap,
 ) -> (Framebuffer, u64) {
-    if sel == APP_ICON {
-        return launch_app(fb, fb_slot, sel, cur);
+    if let Some(app_id) = ICON_APPS[sel] {
+        return launch_app(fb, fb_slot, app_id, sel, cur);
     }
     // A shell-drawn view; any key but the kernel-scripted Backspace would also
     // work -- the demo scripts Backspace.

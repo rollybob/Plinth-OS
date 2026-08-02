@@ -1052,8 +1052,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // tour is exactly why smoke missed them. It is a regression guard for
             // the framebuffer round-tripping cleanly, not for table exhaustion:
             // that takes ~9 launches and is caprelease-user's job instead.
+            //
+            // The four 0xAA bytes before 'q' are a DELAY, not filler. 0xAA is a
+            // left-shift RELEASE: the keymap decodes it to nothing, so the shell
+            // skips it and no behaviour depends on it. They exist because the two
+            // synthetic queues advance together and 'q' ends the demo -- without
+            // them the quit fires while the pointer sequence still has its second
+            // click (CRASH) pending, and the whole of slice 2 never runs. Any
+            // scancode that decodes to nothing would do; a release is the least
+            // surprising.
             #[cfg(not(feature = "interactive"))]
-            input::arm_synthetic(&[0xE0, 0x4D, 0x1C, 0x0E, 0xE0, 0x50, 0x1C, 0x1C, 0x10]);
+            input::arm_synthetic(&[
+                0xE0, 0x4D, 0x1C, 0x0E, 0xE0, 0x50, 0x1C, 0x1C, 0xAA, 0xAA, 0xAA, 0xAA, 0x10,
+            ]);
             // The pointer journey, in packets the shell turns into motion. It
             // starts on the centre of icon 0 (the shell parks it there), so every
             // delta here is a FIXED icon-to-icon step -- ICON_W + ICON_GAP = 248
@@ -1084,6 +1095,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // existed and the click is purely additive. A zero packet moves
             // nothing, changes no hit-test answer and presses no button, so it
             // emits nothing.
+            //
+            // The SECOND click is slice 2 and the point of the milestone: it
+            // lands on CRASH, which spawns a process that maps the screen, draws
+            // to prove it holds it, and then faults while still holding it. The
+            // shell has to get the screen back from a process that handed nothing
+            // back, and redraw. Before reclamation that was unrecoverable -- no
+            // syscall mints a framebuffer, so a shell that launched a crashing app
+            // took the display down with it for the rest of boot.
+            //
+            // CRASH is one column left of APP, so -(ICON_W + ICON_GAP) in x and
+            // no change in y, again split across two packets.
             #[cfg(not(feature = "interactive"))]
             input::arm_synthetic_mouse(&[
                 (0, 0, 0x00),
@@ -1092,6 +1114,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 (121, 0, 0x00),
                 (0, -127, 0x00),
                 (0, -41, 0x00),
+                (0, 0, 0x01),
+                (0, 0, 0x00),
+                (-127, 0, 0x00),
+                (-121, 0, 0x00),
                 (0, 0, 0x01),
                 (0, 0, 0x00),
             ]);
