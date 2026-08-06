@@ -64,6 +64,19 @@ capability *back* -- and retires `frame_free` (nr 5) into it.
   table (with a silent `quietworker-user` child) -- a leaking build cannot finish
   it -- and the scripted shell tour now launches its app twice, since both bugs
   found on 2026-06-27 only appear on a relaunch.
+- **`spawn_and_wait_cap`: recover a capability lent to a child that dies.** The
+  plain `spawn_and_wait` collapses the wait's three-value return to two and drops
+  the reclaimed-capability slot -- awkward for the one helper whose `transfer_slot`
+  argument makes it *the* lend-and-wait primitive. `spawn_and_wait_cap` returns
+  `(status, result, cap_slot)`: if the child dies still holding a capability the
+  parent handed it, the parent gets `IPC_PEER_DIED` and the slot where the
+  reclaimed capability landed, exactly as `recv_cap` does on an endpoint. A pure
+  library helper over the existing v2.9 mechanism (`spawn` + `recv_cap` +
+  `cap_release`), so no ABI change; `spawn_and_wait` stays as the two-value form
+  for the common case that lends nothing. `call` deliberately still does not carry
+  the slot -- it lends no capability of its own, so it is the wrong channel to
+  return one; a lender that wants a capability back by name waits with `recv_cap`
+  or `spawn_and_wait_cap`.
 
 ### Fixed
 - **A reclaimed capability is reported to its lender whether or not the lender
@@ -81,8 +94,9 @@ capability *back* -- and retires `frame_free` (nr 5) into it.
   correctly-written caller can have depended on the old value. Not an ABI bump:
   this delivers meaning the contract already had, rather than adding new meaning
   to a return value. The narrower limits are unchanged and still documented in
-  [ABI.md](ABI.md) -- `call` and `spawn_and_wait` still cannot receive the slot,
-  and only one landing is reported per lender.
+  [ABI.md](ABI.md) -- `call` does not carry the slot (by design) and the plain
+  `spawn_and_wait` drops it (use `spawn_and_wait_cap`, added above), and only one
+  landing is reported per lender.
 - **A framebuffer mapping now dies with the capability that justified it.**
   Previously, giving up a `Framebuffer` capability -- by `cap_release` or by
   transferring it to another process -- surrendered the *authority* but left the

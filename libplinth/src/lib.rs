@@ -574,9 +574,12 @@ pub fn sys_recv(ep_slot: u64) -> (u64, u64) {
 /// that capability and reports where it landed here. "Your peer died, and here
 /// is the thing you lent it."
 ///
-/// This is the only wait that receives that slot. `sys_call` has no register
-/// free for it and `spawn_and_wait` discards it, so a process that lends a
-/// capability and wants it back by name must wait with this function.
+/// This is the endpoint-side wait that receives that slot; `spawn_and_wait_cap`
+/// is its join-side twin. `sys_call` deliberately does not carry it: a `call`
+/// lends no capability of its own, so it is the wrong channel to surface one
+/// dying elsewhere, and its reply convention keeps `RDX` out of userspace on
+/// purpose (see K-012). A process that lends a capability and wants it back by
+/// name must wait with `recv_cap` or `spawn_and_wait_cap`.
 #[inline]
 pub fn sys_recv_cap(ep_slot: u64) -> (u64, u64, u64) {
     let status: u64;
@@ -666,6 +669,34 @@ pub fn spawn_and_wait(child_id: u64, transfer_slot: u64) -> (u64, u64) {
         return (IPC_ERR, 0);
     }
     let out = sys_recv(handle);
+    sys_cap_release(handle);
+    out
+}
+
+/// Like `spawn_and_wait`, but returns the reclaimed-capability landing slot as a
+/// third value -- the lend-and-join case of ABI v2.9. Returns
+/// `(status, result, cap_slot)`:
+/// - `(IPC_OK, value, NO_CAP)` -- the child sent `value` and did not leave a
+///   transferred capability behind (the ordinary success path);
+/// - `(IPC_PEER_DIED, _, slot)` -- the child died before sending; if it died
+///   still holding a capability this process handed it via `transfer_slot`, the
+///   kernel reclaimed that capability and `slot` names where it landed in this
+///   table (else `NO_CAP`);
+/// - `(IPC_ERR, _, NO_CAP)` -- the spawn itself failed.
+///
+/// This exists because the plain `spawn_and_wait` collapses the wait's
+/// three-value return to two and drops the slot -- which is exactly wrong for its
+/// own signature, since `transfer_slot` makes it *the* lend-and-wait helper. Use
+/// this when you hand a child a capability you want back by name if it dies; use
+/// `spawn_and_wait` when you lend nothing or do not care to recover it. It is the
+/// `spawn`-side twin of `sys_recv` / `sys_recv_cap`.
+#[inline]
+pub fn spawn_and_wait_cap(child_id: u64, transfer_slot: u64) -> (u64, u64, u64) {
+    let handle = sys_spawn(child_id, transfer_slot);
+    if handle == SYS_ERR {
+        return (IPC_ERR, 0, NO_CAP);
+    }
+    let out = sys_recv_cap(handle);
     sys_cap_release(handle);
     out
 }

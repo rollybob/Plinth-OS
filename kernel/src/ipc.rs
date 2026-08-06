@@ -376,8 +376,21 @@ pub(crate) fn reap_dying(caps: &CapTable) {
         match cap.object {
             CapObject::Reply { caller } => {
                 if scheduler::is_blocked(caller) {
-                    let landing = scheduler::take_reclaim_landing(caller);
-                    scheduler::wake_with(caller, IPC_PEER_DIED, 0, landing);
+                    // A caller reached through a Reply cap is by construction
+                    // blocked in `call` -- only `sys_call` mints one. `call`'s
+                    // return convention keeps RDX out of userspace, so a real
+                    // landing slot here would be written into a register the
+                    // wrapper discards, and `call` lends no capability of its
+                    // own -- it is the wrong channel to carry a reclaimed one
+                    // (K-012, ruled 2026-08-05: recv_cap / spawn_and_wait_cap
+                    // are the delivery paths). We still take-and-clear the
+                    // pending landing -- the read-and-clear is load-bearing, so
+                    // a later death reusing this lender slot cannot report a
+                    // stale landing -- but deliver NO_CAP. The capability is
+                    // still minted into the caller's table; it just cannot be
+                    // named through `call`. Residual soft-leak tracked as K-024.
+                    let _ = scheduler::take_reclaim_landing(caller);
+                    scheduler::wake_with(caller, IPC_PEER_DIED, 0, NO_CAP);
                 }
             }
             CapObject::Endpoint { id } if id < MAX_ENDPOINTS => {

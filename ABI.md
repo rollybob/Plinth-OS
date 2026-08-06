@@ -174,17 +174,27 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   different answers depending on scheduling. That was a defect, not a contract,
   and it is fixed without an ABI change.
 
+  It is also delivered to a caller of the **`spawn_and_wait_cap`** helper, the
+  join-side twin of `recv_cap` -- the natural home for this notification, since
+  that helper's own `transfer_slot` is what performed the lend.
+
   It is still NOT delivered to:
-  - a lender blocked in **`call`**, because that op's return convention has no
-    free register for it (`RSI` carries the reply word and `RDX` is discarded);
-  - a caller of the **`spawn_and_wait`** helper, which collapses the three-value
-    return to two and drops the slot on the floor;
+  - a lender blocked in **`call`**, by design rather than by register pressure.
+    A `call` lends no capability of its own, so it is the wrong channel to
+    surface one that died on some other relationship, and its reply convention
+    keeps `RDX` out of userspace on purpose (`RSI` carries the reply word).
+    Routing lifecycle events from unrelated objects onto the reply path is a
+    coupling the ABI declines;
+  - a caller of the plain **`spawn_and_wait`** helper, which collapses the
+    three-value return to two and drops the slot -- call `spawn_and_wait_cap`
+    instead when you want it;
   - a lender that never waits on the channel at all -- there is no return value
     to carry it, so the capability arrives silently.
 
   In every one of those cases the capability *is* in the lender's table -- it
   just has no way to learn where, and nothing enumerates a capability table.
-  A lender that wants the notification must wait with `recv_cap`.
+  A lender that wants the notification must wait with `recv_cap` or
+  `spawn_and_wait_cap`.
 - **The other limit.** If the lender's own 16-slot table is full there is nowhere
   to put the capability, so it is destroyed as it would have been anyway -- a
   hazard the lender controls, since v2.8's `cap_release` is how it makes room.
