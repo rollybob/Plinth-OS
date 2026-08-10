@@ -60,10 +60,14 @@ capability *back* -- and retires `frame_free` (nr 5) into it.
   names a caller blocked awaiting it, and releasing it would strand that caller.
   `spawn_and_wait` now releases the handle it joined on, so the common
   spawn-in-a-loop shape is leak-free without callers thinking about it. New
-  `caprelease-user` runs 20 spawn/join/release round-trips through the 16-slot
-  table (with a silent `quietworker-user` child) -- a leaking build cannot finish
-  it -- and the scripted shell tour now launches its app twice, since both bugs
-  found on 2026-06-27 only appear on a relaunch.
+  `caprelease-user` runs 20 spawn/join/release round-trips (with a silent
+  `quietworker-user` child) -- a leaking build cannot finish it, dying at round 8
+  -- and the scripted shell tour now launches its app twice, since both bugs
+  found on 2026-06-27 only appear on a relaunch. Note round 8 and not the round
+  ~15 this entry claimed until 2026-08-10: a leaked handle keeps its result
+  endpoint referenced, so it exhausts the eight-endpoint pool well before the
+  16-slot table it also occupies. The demo catches the leak either way; only the
+  stated mechanism was wrong.
 - **`spawn_and_wait_cap`: recover a capability lent to a child that dies.** The
   plain `spawn_and_wait` collapses the wait's three-value return to two and drops
   the reclaimed-capability slot -- awkward for the one helper whose `transfer_slot`
@@ -77,6 +81,25 @@ capability *back* -- and retires `frame_free` (nr 5) into it.
   the slot -- it lends no capability of its own, so it is the wrong channel to
   return one; a lender that wants a capability back by name waits with `recv_cap`
   or `spawn_and_wait_cap`.
+
+  It now has an end-to-end demo of its own, `spawnwaitcap-user`, which lends the
+  screen to a child that faults and collects it through the helper. It reuses
+  `fbreclaim-user`'s child rather than adding a near-copy, and `fbreclaim-user`
+  deliberately stays on the raw syscalls so that a failure remains attributable to
+  the kernel or to the library rather than to both. Note the demo must lend a
+  **framebuffer**: reclamation is scoped to `Framebuffer`, so an ordinary frame
+  lent to a dying child is simply freed with it and the wake carries `NO_CAP`.
+  Until that scope widens, that is the only shape in which this helper is useful.
+
+  The demo has a second part that watches the helper's *other* promise: that it
+  releases the wait handle it joined on. The endpoint bracket around the demo
+  looks like it would catch a leak there and does not -- it samples before and
+  after the whole process, by which time teardown has released everything, so a
+  leak inside a process's life is invisible to it. Part 2 therefore borrows
+  `caprelease-user`'s shape: 20 handle-only round-trips, transferring nothing and
+  spawning the silent worker, so the loop costs one line of boot log instead of
+  the sixty a chatty faulting child would. Deleting the helper's `cap_release`
+  now turns the transcript red at round 7.
 
 ### Fixed
 - **A reclaimed capability is reported to its lender whether or not the lender

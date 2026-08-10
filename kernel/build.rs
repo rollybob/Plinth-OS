@@ -19,7 +19,7 @@ const USER_BINARIES: &[&str] = &[
     "share", "rpc", "faultchild", "blk", "asyncblk", "blkwrite", "fsdemo", "evt", "evtstream",
     "unified", "kbd", "mouse", "rwfs", "stealer", "stealwork", "gfx", "gfxtext",
     "gfxsplit", "gfxbound", "gfxrevoke", "fbreclaim", "fbreclaimchild", "shell", "shellapp",
-    "caprelease", "quietworker",
+    "caprelease", "quietworker", "spawnwaitcap",
 ];
 
 // Embedded only by the `bench` build (`cargo xtask bench`), matching the

@@ -8,10 +8,25 @@
 //! app launch and its ninth-or-so launch failed with the table full.
 //!
 //! The loop below runs the same spawn -> join -> release cycle
-//! `ROUNDS` times, which is comfortably more than the table can hold at once.
-//! Without the release it cannot get past the table size; with it, every round
-//! reuses the slot the previous round gave back. Nothing here is graphical and
+//! `ROUNDS` times, which is comfortably more than the system can have in flight
+//! at once. Without the release it cannot get through; with it, every round
+//! reuses what the previous round gave back. Nothing here is graphical and
 //! the child is silent, so the whole demo costs two lines of boot log.
+//!
+//! **What actually binds is the endpoint pool, not the capability table**, and
+//! this comment said otherwise until 2026-08-10. Measured, by deleting the
+//! release below and reading the round it dies on: **round 8**, with fifteen cap
+//! slots still free. `MAX_ENDPOINTS` is 8 (`kernel/src/ipc.rs`) and every spawn
+//! creates one for its result channel, so a leaked handle -- which is what keeps
+//! that endpoint referenced -- exhausts the pool long before the 16-slot table it
+//! also occupies. The demo is unaffected and still catches the leak; only the
+//! explanation was wrong. See assumption A-13 in Design/known_bugs.md.
+//!
+//! Worth being precise about, because the 06-27 crash this guards against WAS a
+//! table-full failure. This demo cannot actually reach a full table -- the pool
+//! runs out first -- so it catches the regression by a different limit than the
+//! one that originally broke. `ROUNDS` is past both, so the protection holds
+//! either way.
 //!
 //! Note what is NOT being proved: the frame path was always releasable (the
 //! retired `frame_free` did that). What is new is releasing a non-frame
@@ -28,9 +43,10 @@ use libplinth::{
 /// quietworker's index in the kernel's SPAWNABLE table (see kernel main.rs).
 const QUIETWORKER_ID: u64 = 4;
 
-/// Round-trips to run. MAX_CAPS is 16 and this process starts holding its CPU
-/// budget at slot 0, so a leaking build runs out somewhere around round 15.
-/// Twenty leaves no doubt while keeping the demo quick.
+/// Round-trips to run. A leaking build dies at round 8 (measured -- the eight
+/// endpoints, see the module docs), and would die by round 15 on the capability
+/// table even if the pool were bottomless. Twenty clears both and keeps the demo
+/// quick.
 const ROUNDS: u64 = 20;
 
 #[no_mangle]

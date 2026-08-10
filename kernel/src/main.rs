@@ -200,7 +200,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // fbreclaimchild (the child that FAULTS holding a transferred
         // framebuffer, so the reclamation demo can prove the capability comes
         // home -- Design/cap_reclaim.md D6; fbreclaim-user mirrors this id as
-        // FBRECLAIMCHILD_ID).
+        // FBRECLAIMCHILD_ID, and spawnwaitcap-user reuses the same child rather
+        // than shipping a near-copy of it).
         //
         // Ids are positional, so appending is safe but INSERTING is not: every
         // id after the insertion point shifts and the mirrored constants in the
@@ -992,6 +993,62 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 );
                 let after_reclaim = free_frames();
                 let _ = writeln!(serial, "plinth: {after_reclaim} frames free after fbreclaim");
+            }
+
+            // The same reclamation, driven through `spawn_and_wait_cap` instead
+            // of by hand (ABI v2.9, K-012). The helper shipped on 08-05 with
+            // nothing exercising it: its delivery path was inherited-proven from
+            // fbreclaim above, but the packaging -- returning the landing slot as
+            // a third value, and releasing the spawn handle -- was not. Both
+            // demos are kept deliberately. fbreclaim stays on the raw syscalls so
+            // that a failure stays attributable; if both went through the helper,
+            // a kernel regression and a library regression would look identical.
+            //
+            // It reuses fbreclaimchild (SPAWNABLE id 5) rather than adding a
+            // near-copy of it, and it lends a Framebuffer because that is the
+            // only thing it CAN lend: `release_action` scopes reclamation to
+            // Framebuffer (cap_reclaim.md D2, narrowed at ruling time), so an
+            // ordinary Frame lent to a dying child is freed with the child and
+            // the wake carries NO_CAP. That was measured -- the Frame version was
+            // built first and reported no landing slot.
+            //
+            // The endpoint bracket here does NOT prove the helper released the
+            // spawn handle, though it reads as though it would. Deleting the
+            // helper's `sys_cap_release` leaves smoke entirely green: the bracket
+            // samples before and after the whole demo, and by "after" the process
+            // has exited and teardown has released everything it held. A bracket
+            // around a process's whole life cannot see a leak inside that life.
+            // It is kept for what it does prove -- the spawn endpoint does not
+            // outlive the demo -- and catching a leaked handle would need
+            // caprelease-user's shape, a loop past the 16-slot table.
+            if let Some(fbobj) = framebuffer::framebuffer_cap() {
+                const SPAWNWAITCAP_BIN: &[u8] =
+                    include_bytes!(concat!(env!("OUT_DIR"), "/spawnwaitcap-user"));
+                let before_swc = free_frames();
+                let _ = writeln!(serial, "plinth: {before_swc} frames free before spawnwaitcap");
+                let _ = writeln!(
+                    serial,
+                    "plinth: {} endpoints free before spawnwaitcap",
+                    free_endpoints()
+                );
+                let fbcap = Capability {
+                    object: fbobj,
+                    rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+                    origin: None,
+                };
+                scheduler::run(
+                    "spawnwaitcap demo",
+                    &[SPAWNWAITCAP_BIN],
+                    phys_offset,
+                    &[Some(fbcap)],
+                );
+                let after_swc = free_frames();
+                let _ = writeln!(serial, "plinth: {after_swc} frames free after spawnwaitcap");
+                let _ = writeln!(
+                    serial,
+                    "plinth: {} endpoints free after spawnwaitcap",
+                    free_endpoints()
+                );
             }
         }
 

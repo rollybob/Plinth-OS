@@ -60,6 +60,7 @@ const USER_CRATES: &[&str] = &[
     "gfxsplit", "gfxbound", "gfxrevoke",
     "fbreclaim",
     "fbreclaimchild", "shell", "shellapp", "caprelease", "quietworker",
+    "spawnwaitcap",
     "template", "bench",
 ];
 
@@ -974,10 +975,20 @@ fn check_ipc_order(actual: &str, rounds: u64) {
 }
 
 /// Pull the integer out of the first line containing `marker`.
+/// Anchored at the END of the line, not `contains`. Every bracket line this
+/// reads is written as `plinth: <n> <kind> free <before|after> <name>`, so the
+/// demo name is the last thing on it -- which means a `contains` match lets one
+/// demo's marker match a LONGER demo's line. That is not hypothetical: `blk` is
+/// a prefix of `blkwrite` and `evt` of `evtstream`, and both pairs have been in
+/// this tree for weeks reading the right numbers purely because the shorter demo
+/// happens to boot first and `find` stops at the first hit. Reordering the boot
+/// sequence would have silently pointed a baseline at another demo's counts --
+/// still green, still "passing", checking the wrong thing. Anchoring costs
+/// nothing and removes the whole class.
 fn find_frame_count(actual: &str, marker: &str) -> Option<u64> {
     actual
         .lines()
-        .find(|l| l.contains(marker))
+        .find(|l| l.trim_end().ends_with(marker))
         .and_then(|l| l.split_whitespace().find_map(|t| t.parse::<u64>().ok()))
 }
 
@@ -1085,13 +1096,21 @@ fn check_reap(actual: &str) {
 
 /// Verify the cap_release regression (Design/cap_release.md): a released
 /// capability slot is reusable, so a process can spawn and join more times than
-/// its 16-slot capability table could ever hold handles at once.
+/// the system could ever have wait handles outstanding at once.
 ///
 /// The demo exits non-zero partway through if any round fails, so the summary
 /// line existing at all is most of the assertion; the round count is checked
-/// too, so a demo silently shortened below the table size cannot pass while
-/// proving nothing. This is the one check that would have caught the 2026-06-27
-/// crash -- the shell tour's single launch never came close to the limit.
+/// too, so a demo silently shortened below the limit cannot pass while proving
+/// nothing. This is the one check that would have caught the 2026-06-27 crash --
+/// the shell tour's single launch never came close.
+///
+/// **The limit reached first is the eight-endpoint pool, not the 16-slot table**,
+/// and both this function and the demo said otherwise until 2026-08-10. Measured
+/// by deleting the demo's release: it dies at round 8 with fifteen cap slots
+/// still free, because a leaked handle keeps its result endpoint referenced and
+/// `MAX_ENDPOINTS` is 8. The regression is caught either way -- `ROUNDS` clears
+/// both -- but this check should not be cited as evidence about table capacity.
+/// See A-13 in Design/known_bugs.md.
 fn check_caprelease(actual: &str, rounds: u64) {
     let marker = "caprelease: ";
     let got = actual
@@ -1102,7 +1121,7 @@ fn check_caprelease(actual: &str, rounds: u64) {
         .and_then(|n| n.parse::<u64>().ok());
     match got {
         Some(v) if v == rounds => {
-            println!("smoke: cap_release ok ({v} spawn round-trips through a 16-slot table)");
+            println!("smoke: cap_release ok ({v} spawn round-trips, handles reused)");
         }
         Some(v) => {
             eprintln!("smoke: FAIL cap_release: {v} round-trips, expected {rounds}");
@@ -1111,7 +1130,7 @@ fn check_caprelease(actual: &str, rounds: u64) {
         None => {
             eprintln!(
                 "smoke: FAIL cap_release: no summary line -- a round failed \
-                 (a leaked wait handle fills the table around round 15)"
+                 (a leaked wait handle exhausts the 8 endpoints at round 8)"
             );
             std::process::exit(1);
         }
@@ -1269,6 +1288,20 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     // reclamation worked. The two differing hashes in the boot log are what say
     // that; this only says nothing was leaked while doing it.
     check_frames_baseline(&actual, "fbreclaim");
+    // The same reclamation driven through `spawn_and_wait_cap` (K-012). The frame
+    // baseline carries the D7 hazard exactly as fbreclaim's does. The endpoint
+    // baseline proves only that the spawn endpoint does not outlive the demo --
+    // NOT that the helper released its handle, which was checked by deleting that
+    // release and watching every one of these stay green. Teardown frees the
+    // process's whole table at exit, so a leak inside its life is invisible here.
+    //
+    // What does catch it is the demo's own part 2, added 2026-08-10: a loop of
+    // handle-only round-trips whose asserted summary line in expected_boot_log.txt
+    // disappears when the release does (it dies at round 7 instead). That is a
+    // transcript assertion rather than a check here, so there is deliberately no
+    // extra function for it.
+    check_frames_baseline(&actual, "spawnwaitcap");
+    check_endpoints_baseline(&actual, "spawnwaitcap");
     check_frames_baseline(&actual, "shell");
 }
 

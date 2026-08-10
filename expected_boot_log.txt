@@ -203,10 +203,14 @@ plinth: terminating user process
 plinth: spawn demo: all done
 
 # cap_release regression (Design/cap_release.md, ABI v2.8): a released capability
-# slot is genuinely reusable. 20 spawn -> join -> release round-trips through a
-# 16-slot capability table; a build that leaks the spent wait handle cannot get
-# past round ~15. The child (quietworker, SPAWNABLE id 4) is silent, so the whole
-# regression costs two asserted lines. The summary line ("caprelease: 20 spawn
+# slot is genuinely reusable. 20 spawn -> join -> release round-trips; a build
+# that leaks the spent wait handle cannot get past round 8 -- measured 2026-08-10
+# by deleting the release. Note round 8, not the round ~15 this comment claimed:
+# what runs out is the EIGHT-endpoint pool (a leaked handle keeps its result
+# endpoint referenced), not the 16-slot capability table, which still had fifteen
+# slots free. The regression is caught either way. See A-13 in
+# Design/known_bugs.md. The child (quietworker, SPAWNABLE id 4) is silent, so the
+# whole regression costs two asserted lines. The summary line ("caprelease: 20 spawn
 # round-trips, slots reused") is checked by xtask's check_caprelease rather than
 # asserted here -- same treatment as the spawn demo's parent output, since a
 # spawning parent's line can land either side of a child's scheduling. Frame AND
@@ -464,6 +468,66 @@ plinth: terminating user process
 fbreclaim: child died, screen came back
 fbreclaim: reclaimed hash 0xd12799246c3d6e04
 plinth: fbreclaim demo: all done
+
+# The SAME reclamation, driven through the `spawn_and_wait_cap` helper instead of
+# by hand (ABI v2.9, K-012). The helper shipped 2026-08-05 with nothing exercising
+# it: fbreclaim above proves the kernel path, but it calls sys_spawn and
+# sys_recv_cap itself, so the library wrapper that packages them had no watch.
+# Both demos are kept on purpose -- fbreclaim stays on the raw syscalls so a
+# failure stays attributable. If both went through the helper, a kernel regression
+# and a library regression would produce identical output.
+#
+# It reuses fbreclaimchild (SPAWNABLE id 5) rather than adding a near-copy, which
+# is why that child's line appears here a second time.
+#
+# It lends a Framebuffer because that is the only thing it CAN lend. The 08-05
+# handoff proposed lending a Ring or an ordinary Frame; `release_action` scopes
+# reclamation to Framebuffer (cap_reclaim.md D2, narrowed at ruling time), so a
+# lent Frame is freed with the dying child and the wake carries NO_CAP. Measured,
+# not assumed -- the Frame version was built first and reported no landing slot,
+# with a flat frame bracket because the frame went to the allocator rather than to
+# the lender. Rings are built from Frame capabilities, so they are out too.
+#
+# The two hashes carry the same proof they carry above, and differ for the same
+# reason. What this adds is a watched failure for the HELPER: swap its call for
+# the two-value `spawn_and_wait` and the demo takes its "no landing slot" exit and
+# turns this file red. That collapse is K-012 itself, so the regression this
+# guards against is the one that was just fixed.
+#
+# The endpoint bracket xtask puts around this demo does NOT prove the helper
+# released its spawn handle, though it reads that way. Deleting that release
+# leaves the bracket completely green: it samples before and after the whole
+# demo, and by then the process has exited and teardown has released its entire
+# table. It is kept for what it does prove -- the spawn endpoint does not outlive
+# the demo. A leaked handle needs caprelease-user's shape to catch: a loop run
+# past what the system can have in flight. That loop is the last line below.
+#
+# The loop transfers NOTHING and spawns quietworker rather than fbreclaimchild.
+# A handle is minted by every spawn whether or not a capability rides along, so
+# the framebuffer is irrelevant to this claim -- and dropping it is what keeps
+# twenty rounds of a chatty, faulting child (sixty lines: its own, the fault, the
+# termination) out of this file to say something none of them are about. It runs
+# in the same process, still holding the reclaimed framebuffer, so the budget it
+# contends for is the honest one. Watched failing: delete the helper's
+# `sys_cap_release` and the loop dies with "spawn failed at round 7".
+#
+# What runs out at round 7 is the EIGHT-endpoint pool, not the 16-slot capability
+# table -- there were still about six slots free. Every spawn creates an endpoint
+# for its result channel and the handle is what keeps it referenced, so leaking
+# the handle pins the endpoint. Seven rather than eight because the framebuffer
+# round above leaks one too under that control. caprelease-user, which has no
+# such round ahead of it, dies at exactly 8. Both demos described this as a table
+# overrun until 2026-08-10; see A-13 in Design/known_bugs.md. The round number is
+# the diagnostic -- round 0 would be the helper never working at all.
+plinth: spawnwaitcap demo: 1 processes
+spawnwaitcap: lent hash 0x69d3ede9a07b7784
+fbreclaimchild: holding the screen, now faulting
+plinth: [user fault] #PF
+plinth: terminating user process
+spawnwaitcap: child died, screen came back
+spawnwaitcap: reclaimed hash 0x10bdf158afe53b64
+spawnwaitcap: 20 handle round-trips, slots reused
+plinth: spawnwaitcap demo: all done
 
 # Visual userspace skin (D8, Design/display_skin.md) -- the finale: a shell with a
 # splash, a home screen of app icons, arrow-key navigation and a MOUSE POINTER,
