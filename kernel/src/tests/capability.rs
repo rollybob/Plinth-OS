@@ -2,8 +2,8 @@
 
 use super::TestCtx;
 use crate::capability::{
-    reclaim_target, release_action, CapError, CapObject, CapTable, Capability, ReleaseAction,
-    MAX_CAPS,
+    reclaim_target, release_action, CapError, CapObject, CapTable, Capability, Origin,
+    ReleaseAction, MAX_CAPS,
     RIGHT_CONSUME, RIGHT_MAP, RIGHT_READ, RIGHT_WRITE,
 };
 use crate::test_assert;
@@ -14,7 +14,7 @@ fn kernel_cap(object: CapObject) -> Capability {
 }
 
 /// A framebuffer-shaped capability, the kind reclamation exists for.
-fn fb_cap(origin: Option<usize>) -> Capability {
+fn fb_cap(origin: Option<Origin>) -> Capability {
     Capability {
         object: CapObject::Framebuffer {
             phys_base: 0x8000_0000,
@@ -33,13 +33,13 @@ fn fb_cap(origin: Option<usize>) -> Capability {
 /// `mint` would silently drop it (Design/cap_reclaim.md D3).
 pub fn origin_recorded_on_transfer(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     // Process 1 hands a kernel-minted capability to process 2.
-    let lent = fb_cap(None).lent_to(1, 2);
-    test_assert!(lent.origin == Some(1), "a transfer must record the giver as the lender");
+    let lent = fb_cap(None).lent_to(Origin::new(1, 3), 2);
+    test_assert!(lent.origin == Some(Origin::new(1, 3)), "a transfer must record the giver as the lender");
 
     let mut table = CapTable::new();
     let slot = table.install(lent).map_err(|_| "install failed")?;
     let back = table.lookup(slot, RIGHT_MAP).map_err(|_| "lookup failed")?;
-    test_assert!(back.origin == Some(1), "install must preserve the origin");
+    test_assert!(back.origin == Some(Origin::new(1, 3)), "install must preserve the origin");
 
     // The contrast that makes `install` necessary at all.
     let mut minted = CapTable::new();
@@ -55,22 +55,22 @@ pub fn origin_recorded_on_transfer(_ctx: &mut TestCtx) -> Result<(), &'static st
 /// `shell-user`'s framebuffer never returns to the slot it left from.
 pub fn origin_clears_on_homecoming(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     // Shell (1) lends the screen to the app (2), which hands it back.
-    let lent = fb_cap(None).lent_to(1, 2);
-    test_assert!(lent.origin == Some(1), "the shell must be recorded as the lender");
-    let home = lent.lent_to(2, 1);
+    let lent = fb_cap(None).lent_to(Origin::new(1, 3), 2);
+    test_assert!(lent.origin == Some(Origin::new(1, 3)), "the shell must be recorded as the lender");
+    let home = lent.lent_to(Origin::new(2, 3), 1);
     test_assert!(home.origin.is_none(), "a capability returned to its lender must clear its origin");
 
     // A second round trip must behave identically -- the shell relaunches, and a
     // stale origin here would be the lie the next death acts on.
-    let again = home.lent_to(1, 2);
-    test_assert!(again.origin == Some(1), "a relaunch must record the lender again");
-    test_assert!(again.lent_to(2, 1).origin.is_none(), "the second hand-back must clear too");
+    let again = home.lent_to(Origin::new(1, 3), 2);
+    test_assert!(again.origin == Some(Origin::new(1, 3)), "a relaunch must record the lender again");
+    test_assert!(again.lent_to(Origin::new(2, 3), 1).origin.is_none(), "the second hand-back must clear too");
 
     // Passing it on to a THIRD process is not a homecoming, and does not move the
     // claim either: one level is tracked and that level is the ROOT lender, so the
     // origin still names the shell (D8, amending which level D4 left unspecified).
-    let onward = lent.lent_to(2, 3);
-    test_assert!(onward.origin == Some(1), "a hand-on must not move the claim off the root lender");
+    let onward = lent.lent_to(Origin::new(2, 3), 3);
+    test_assert!(onward.origin == Some(Origin::new(1, 3)), "a hand-on must not move the claim off the root lender");
     Ok(())
 }
 
@@ -86,21 +86,21 @@ pub fn origin_clears_on_homecoming(_ctx: &mut TestCtx) -> Result<(), &'static st
 /// homecoming -- origin cleared, B owned outright a screen it had borrowed, and
 /// A's death swept nothing.
 pub fn relending_preserves_the_root_lenders_claim(_ctx: &mut TestCtx) -> Result<(), &'static str> {
-    let a_to_b = fb_cap(None).lent_to(1, 2);
-    test_assert!(a_to_b.origin == Some(1), "the first loan records A");
+    let a_to_b = fb_cap(None).lent_to(Origin::new(1, 3), 2);
+    test_assert!(a_to_b.origin == Some(Origin::new(1, 3)), "the first loan records A");
 
-    let b_to_c = a_to_b.lent_to(2, 3);
-    test_assert!(b_to_c.origin == Some(1), "handing on must leave A's claim intact");
+    let b_to_c = a_to_b.lent_to(Origin::new(2, 3), 3);
+    test_assert!(b_to_c.origin == Some(Origin::new(1, 3)), "handing on must leave A's claim intact");
 
-    let c_to_b = b_to_c.lent_to(3, 2);
+    let c_to_b = b_to_c.lent_to(Origin::new(3, 3), 2);
     test_assert!(
-        c_to_b.origin == Some(1),
+        c_to_b.origin == Some(Origin::new(1, 3)),
         "returning to the middleman is NOT a homecoming -- B still owes A"
     );
 
     // Only the real owner clears it.
     test_assert!(
-        c_to_b.lent_to(2, 1).origin.is_none(),
+        c_to_b.lent_to(Origin::new(2, 3), 1).origin.is_none(),
         "the hand-back to A must clear the origin"
     );
     Ok(())
@@ -112,8 +112,8 @@ pub fn relending_preserves_the_root_lenders_claim(_ctx: &mut TestCtx) -> Result<
 /// eventually mint the screen into an unrelated process.
 pub fn origin_cleared_when_lender_exits(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     let mut table = CapTable::new();
-    let from_one = table.install(fb_cap(Some(1))).map_err(|_| "install failed")?;
-    let from_two = table.install(fb_cap(Some(2))).map_err(|_| "install failed")?;
+    let from_one = table.install(fb_cap(Some(Origin::new(1, 3)))).map_err(|_| "install failed")?;
+    let from_two = table.install(fb_cap(Some(Origin::new(2, 3)))).map_err(|_| "install failed")?;
     let kernel = table.mint(CapObject::Frame { addr: 0x1000 }, RIGHT_READ).map_err(|_| "mint")?;
 
     test_assert!(table.clear_origin(1) == 1, "exactly the one capability lent by 1 must clear");
@@ -122,7 +122,7 @@ pub fn origin_cleared_when_lender_exits(_ctx: &mut TestCtx) -> Result<(), &'stat
         "a dead lender's origin must not survive its slot"
     );
     test_assert!(
-        table.lookup(from_two, RIGHT_MAP).map_err(|_| "lookup")?.origin == Some(2),
+        table.lookup(from_two, RIGHT_MAP).map_err(|_| "lookup")?.origin == Some(Origin::new(2, 3)),
         "an unrelated lender must be left alone"
     );
     test_assert!(
@@ -370,7 +370,7 @@ pub fn release_action_reclaims_only_lent_framebuffer(
 ) -> Result<(), &'static str> {
     // A LENT framebuffer goes home, naming its lender.
     test_assert!(
-        release_action(&fb_cap(Some(2))) == ReleaseAction::ReclaimTo { lender: 2 },
+        release_action(&fb_cap(Some(Origin::new(2, 3)))) == ReleaseAction::ReclaimTo { origin: Origin::new(2, 3) },
         "a lent framebuffer must be reclaimed to the process that lent it"
     );
     // An OWNED one is unchanged -- this is the pre-reclamation behaviour and the
@@ -389,7 +389,7 @@ pub fn release_action_reclaims_only_lent_framebuffer(
         CapObject::BlockRange { dev: 0, start: 8, count: 4 },
     ] {
         test_assert!(
-            release_action(&Capability { object: obj, rights: RIGHT_READ, origin: Some(2) })
+            release_action(&Capability { object: obj, rights: RIGHT_READ, origin: Some(Origin::new(2, 3)) })
                 == ReleaseAction::DropSlot,
             "only a Framebuffer is in reclamation's scope -- D2 was narrowed deliberately"
         );
@@ -400,7 +400,7 @@ pub fn release_action_reclaims_only_lent_framebuffer(
         release_action(&Capability {
             object: CapObject::Frame { addr: 0x4000 },
             rights: RIGHT_READ,
-            origin: Some(2),
+            origin: Some(Origin::new(2, 3)),
         }) == ReleaseAction::FreeFrame { addr: 0x4000 },
         "a lent Frame must still be freed, not reclaimed -- every frame baseline depends on it"
     );
@@ -413,8 +413,8 @@ pub fn release_action_reclaims_only_lent_framebuffer(
 pub fn reclaim_target_sends_lent_screen_home(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     // Process 3 dies holding a framebuffer that process 1 lent it.
     let (lender, home) =
-        reclaim_target(&fb_cap(Some(1)), 3).ok_or("a lent framebuffer must be reclaimable")?;
-    test_assert!(lender == 1, "it must go home to the process that lent it");
+        reclaim_target(&fb_cap(Some(Origin::new(1, 3))), 3).ok_or("a lent framebuffer must be reclaimable")?;
+    test_assert!(lender.lender() == 1, "it must go home to the process that lent it");
     test_assert!(
         home.origin.is_none(),
         "the reclaimed capability has come home, so its origin must clear -- \
@@ -434,7 +434,7 @@ pub fn reclaim_target_sends_lent_screen_home(_ctx: &mut TestCtx) -> Result<(), &
             &Capability {
                 object: CapObject::EventSource { id: 0 },
                 rights: RIGHT_READ,
-                origin: Some(1)
+                origin: Some(Origin::new(1, 3))
             },
             3
         )
@@ -453,7 +453,7 @@ pub fn reclaim_declines_when_lender_table_full(_ctx: &mut TestCtx) -> Result<(),
     for _ in 0..MAX_CAPS {
         lender.mint(CapObject::Frame { addr: 0x1000 }, RIGHT_READ).map_err(|_| "fill failed")?;
     }
-    let (_, home) = reclaim_target(&fb_cap(Some(1)), 3).ok_or("should be reclaimable")?;
+    let (_, home) = reclaim_target(&fb_cap(Some(Origin::new(1, 3))), 3).ok_or("should be reclaimable")?;
     test_assert!(
         lender.reclaim(home).is_none(),
         "a full table must decline the reclaim rather than displace something"

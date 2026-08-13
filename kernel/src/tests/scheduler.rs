@@ -8,7 +8,7 @@
 //! Design/timer_scheduler.md section 2).
 
 use super::TestCtx;
-use crate::capability::{CapObject, Capability, RIGHT_MAP, RIGHT_WRITE};
+use crate::capability::{CapObject, Capability, Origin, RIGHT_MAP, RIGHT_WRITE};
 use crate::process::{self, Process};
 use crate::scheduler::{
     self, clear_origins_naming, lender_cap_count, pick_next, swap_current_slot, State,
@@ -30,7 +30,7 @@ fn borrower_of(lender: Option<usize>) -> Process {
                 format: 1,
             },
             rights: RIGHT_MAP | RIGHT_WRITE,
-            origin: lender,
+            origin: lender.map(|l| Origin::new(l, 3)),
         })
         .expect("fresh table");
     p

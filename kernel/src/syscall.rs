@@ -61,8 +61,8 @@ use x86_64::VirtAddr;
 use crate::bkl;
 use crate::capability;
 use crate::capability::{
-    CapError, CapObject, Capability, RIGHT_CONSUME, RIGHT_MAP, RIGHT_READ, RIGHT_RECV, RIGHT_SEND,
-    RIGHT_WRITE,
+    CapError, CapObject, Capability, Origin, RIGHT_CONSUME, RIGHT_MAP, RIGHT_READ, RIGHT_RECV,
+    RIGHT_SEND, RIGHT_WRITE,
 };
 use crate::fault;
 use crate::frame_alloc::{FRAME_ALLOC, FRAME_SIZE};
@@ -745,7 +745,9 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
     let transferred = if transfer_slot != ERR {
         let mut cur = process::current().lock();
         match cur.as_mut() {
-            Some(p) => process::revoke_and_unmap(p, transfer_slot as usize),
+            // Reserve the slot the capability is leaving, so it has somewhere
+            // guaranteed to come home to (`lender_owed.md` D2(D)).
+            Some(p) => process::revoke_and_unmap_for_lend(p, transfer_slot as usize),
             None => None,
         }
     } else {
@@ -778,7 +780,19 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
     // capability names a free slot. That sweep has to reach running processes on
     // other cores for this to hold -- see `scheduler::clear_origins_naming`,
     // where walking `TABLE` alone was a real bug.
-    let lent = transferred.map(|cap| Capability { origin: Some(scheduler::current_slot()), ..cap });
+    // K-025: preserve an existing origin instead of overwriting it. D8 ruled
+    // that `origin` names the ROOT lender, and `lent_to`'s middle branch exists
+    // so a claim survives a hop -- but this site never went through `lent_to`
+    // and unconditionally recorded the caller, laundering the real owner's claim
+    // whenever a borrower passed a capability on to a child. The homecoming
+    // branch genuinely cannot apply here (the child's slot is fresh), which is
+    // what the comment above reasoned about and why the gap was not obvious.
+    let lent = transferred.map(|cap| Capability {
+        origin: cap
+            .origin
+            .or_else(|| Some(Origin::new(scheduler::current_slot(), transfer_slot as usize))),
+        ..cap
+    });
     if scheduler::spawn(binary, phys, &[Some(send_cap), lent]).is_none() {
         // Could not create the child: it never minted send_cap, so the result
         // endpoint is unreferenced -- reclaim the slot. Then undo the capability
@@ -787,7 +801,16 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
         if let Some(cap) = transferred {
             let mut cur = process::current().lock();
             if let Some(p) = cur.as_mut() {
-                let _ = p.caps.install(cap);
+                // The loan never happened, so its reservation must not outlive
+                // it. Restore into the capability's OWN slot: `install` would
+                // skip that slot precisely because it is reserved, and the
+                // caller would silently find its capability moved by a failure
+                // that is supposed to be invisible.
+                let slot = transfer_slot as usize;
+                if p.caps.reclaim_to(slot, cap).is_none() {
+                    p.caps.clear_reservation(slot);
+                    let _ = p.caps.install(cap);
+                }
             }
             ipc::note_cap_added(&cap);
         }

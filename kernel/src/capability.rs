@@ -138,7 +138,49 @@ pub struct Capability {
     /// (Design/cap_reclaim_build.md section 0). Without that sweep this field is
     /// a hazard, not a record.
     ///
-    pub origin: Option<usize>,
+    pub origin: Option<Origin>,
+}
+
+/// Where a lent capability goes home to: the lender, and the slot it left from.
+///
+/// Widened from a bare process slot on 2026-08-10 (`Design/lender_owed.md` D2,
+/// ruled (D) -- homecoming reservation). The lender's slot answers *who* is owed
+/// it, which is all reclamation needed while the kernel chose the landing slot
+/// itself; `cap_slot` answers *where it goes*, which is what lets the lender know
+/// the answer before the borrower has even died.
+///
+/// `u8` each, against `MAX_PROCESSES = 4` and `MAX_CAPS = 16`. Both are
+/// placeholders and both may grow (`lender_owed.md` D9); `u8` leaves room for
+/// 256 of each, and the day either passes that, this struct is the one place to
+/// widen. Deliberately not `usize`: `caps: CapTable` is the first field of
+/// `Process`, so every byte here is multiplied by `MAX_CAPS` and then by
+/// `MAX_PROCESSES` (A-5 -- growing `Capability` grew `Process` by 16x once
+/// already, and that moved a frame baseline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Origin {
+    /// The lender's process-table slot.
+    pub proc_slot: u8,
+    /// The capability slot in the lender's table that this was lent from, and
+    /// that it returns to. Reserved at lend time from slice 2 onward; recorded
+    /// but not yet acted on in slice 1.
+    pub cap_slot: u8,
+}
+
+impl Origin {
+    pub const fn new(proc_slot: usize, cap_slot: usize) -> Origin {
+        Origin { proc_slot: proc_slot as u8, cap_slot: cap_slot as u8 }
+    }
+
+    /// The lender's process slot, widened back for comparison with the `usize`
+    /// slots every other module speaks in.
+    pub const fn lender(&self) -> usize {
+        self.proc_slot as usize
+    }
+
+    /// The slot this capability comes home to.
+    pub const fn home(&self) -> usize {
+        self.cap_slot as usize
+    }
 }
 
 impl Capability {
@@ -177,17 +219,28 @@ impl Capability {
     /// capability it had only borrowed, with A's claim silently gone and A's
     /// death sweeping nothing (K-013). Note what the fix did not need -- the
     /// tree. Only the decision not to overwrite. This is still exactly one
-    /// `Option<usize>` and still one level; the level is now the root.
-    pub fn lent_to(self, source: usize, dest: usize) -> Capability {
-        let origin = if self.origin == Some(dest) {
-            // Home: the owner holds it outright again.
-            None
-        } else if self.origin.is_some() {
+    /// `Option<Origin>` and still one level; the level is now the root.
+    ///
+    /// **The slot-identity trap got sharper on 2026-08-10, not safer.** The rule
+    /// above -- compare process slots, never "did it come back to the slot it
+    /// left from" -- was written when those two tests gave visibly different
+    /// answers, because a hand-back landed wherever `install` chose. Under
+    /// homecoming reservation (`lender_owed.md` D2(D)) a returning capability
+    /// *does* come back to the slot it left, so **the two tests now agree in
+    /// every case a demo exercises** and a slot-identity test would pass the
+    /// whole suite. It is still wrong: the re-lending case (A -> B -> C, C hands
+    /// back to B) turns on *whose* claim is outstanding, and no comparison of
+    /// slot numbers can answer that. Compare `proc_slot`. Never derive homecoming
+    /// from `cap_slot`, and never from `Origin`'s derived `PartialEq`, which
+    /// compares both fields.
+    pub fn lent_to(self, source: Origin, dest: usize) -> Capability {
+        let origin = match self.origin {
+            // Home: the owner holds it outright again. Process slots, per above.
+            Some(o) if o.lender() == dest => None,
             // Already on loan. Passing it on moves the capability, not the claim.
-            self.origin
-        } else {
+            Some(o) => Some(o),
             // A first loan, from an outright owner.
-            Some(source)
+            None => Some(source),
         };
         Capability { origin, ..self }
     }
@@ -237,7 +290,7 @@ pub enum ReleaseAction {
     /// into the frame allocator would have it serve them later as ordinary
     /// memory (Design/fb_mapping.md D7). The frame baselines are what would
     /// catch that, and they must not move.
-    ReclaimTo { lender: usize },
+    ReclaimTo { origin: Origin },
     /// Nothing pooled: emptying the slot is the whole of the release.
     DropSlot,
     /// Not releasable on request. Only `Reply`: it names a caller that is
@@ -259,9 +312,17 @@ pub enum ReleaseAction {
 /// lender owns it outright again, and an origin still naming the dead borrower
 /// would be a lie the *next* death would act on. Reusing `lent_to` rather than
 /// writing `origin: None` here is deliberate: there is one homecoming rule.
-pub fn reclaim_target(cap: &Capability, dying_slot: usize) -> Option<(usize, Capability)> {
+pub fn reclaim_target(cap: &Capability, dying_slot: usize) -> Option<(Origin, Capability)> {
     match release_action(cap) {
-        ReleaseAction::ReclaimTo { lender } => Some((lender, cap.lent_to(dying_slot, lender))),
+        ReleaseAction::ReclaimTo { origin } => {
+            // `dying_slot` is the source PROCESS; the source capability slot is
+            // irrelevant here because this call always takes `lent_to`'s
+            // homecoming branch (the origin names `dest` by construction), and
+            // that branch reads neither field of `source`. Passing the origin's
+            // own home keeps the argument well-formed without inventing a slot.
+            let source = Origin::new(dying_slot, origin.home());
+            Some((origin, cap.lent_to(source, origin.lender())))
+        }
         _ => None,
     }
 }
@@ -288,6 +349,44 @@ pub fn reclaim_target(cap: &Capability, dying_slot: usize) -> Option<(usize, Cap
 /// also send a borrowed framebuffer home is a real question the ruling did not
 /// decide; it would change `cap_release`'s observable behaviour, so it is not
 /// being smuggled in here.
+/// Can a capability of this kind come home to its lender when a borrower dies?
+///
+/// The reclaimable SET, named in exactly one place. Two decisions read it and
+/// they must not drift (I7): `release_action` asks it at death time, and the
+/// lending path asks it at lend time to decide whether to reserve a homecoming
+/// slot. A slot reserved for something that can never return would be burnt for
+/// the rest of the process's life, so "would this come back?" has to give the
+/// same answer at both ends.
+///
+/// The set is `Framebuffer` today (`cap_reclaim.md` D2). `lender_owed.md` D6
+/// rules it widens to `BlockRange` and `EventSource` -- the kinds no syscall can
+/// re-mint, which is also exactly the set that carries no refcount and names no
+/// pool. That widening is slice 4 and is **not** applied here: this function is
+/// the one line it will change.
+pub const fn is_reclaimable_kind(object: &CapObject) -> bool {
+    matches!(object, CapObject::Framebuffer { .. })
+}
+
+/// Does handing this capability away create a NEW loan, one that should reserve
+/// a homecoming slot? **The single rule for when a lend reserves.**
+///
+/// Two conditions, and the second is the one that is easy to miss. The kind must
+/// be able to come home at all (`is_reclaimable_kind`) -- reserving a slot for
+/// something that will never return burns it for the process's lifetime. And the
+/// giver must be the **outright owner**: a capability that already carries an
+/// origin is on loan from someone else, and passing it on moves the capability
+/// without moving the claim (D8, the root-lender rule). An intermediary that
+/// reserved a slot would be holding one open for a capability that is going home
+/// to a different process entirely.
+///
+/// That second condition is K-025's shape on the reservation side, and it is
+/// stated here rather than at each call site for the same reason K-025 happened:
+/// there is more than one lend path, and the one that did not go through the
+/// shared rule is the one that got it wrong.
+pub fn lend_reserves_home(cap: &Capability) -> bool {
+    cap.origin.is_none() && is_reclaimable_kind(&cap.object)
+}
+
 pub fn release_action(cap: &Capability) -> ReleaseAction {
     // Scope is `Framebuffer` only (Design/cap_reclaim.md D2, narrowed at ruling
     // time). `EventSource` was in the draft and was cut: the kernel hands every
@@ -295,9 +394,9 @@ pub fn release_action(cap: &Capability) -> ReleaseAction {
     // so a lender would have to give up the screen to lend a keyboard, and no
     // user crate lends one -- an arm with no caller and no test to distinguish it
     // from dead code. It becomes a one-line change here once a lender exists.
-    if let CapObject::Framebuffer { .. } = cap.object {
-        if let Some(lender) = cap.origin {
-            return ReleaseAction::ReclaimTo { lender };
+    if is_reclaimable_kind(&cap.object) {
+        if let Some(origin) = cap.origin {
+            return ReleaseAction::ReclaimTo { origin };
         }
     }
     match cap.object {
@@ -339,11 +438,112 @@ pub enum CapError {
 
 pub struct CapTable {
     slots: [Option<Capability>; MAX_CAPS],
+    /// Slots held open for a capability that is out on loan and will come back
+    /// here (`Design/lender_owed.md` D2, ruled (D) -- homecoming reservation).
+    ///
+    /// A reserved slot is empty but **not free**: `install` skips it, so nothing
+    /// else can take the place a lent capability is coming home to. That is the
+    /// whole mechanism. Because the destination is fixed when the loan starts,
+    /// the lender knows it before the borrower has even died, which is what makes
+    /// the notification an optimisation rather than the only route to the fact.
+    ///
+    /// A bare `[bool; MAX_CAPS]` rather than a bitmask: `MAX_CAPS` is a
+    /// placeholder that may grow (D9), and an array grows with it while a `u16`
+    /// would silently stop covering the table. It costs `MAX_CAPS` bytes against
+    /// the 256 this milestone's slice 1 gave back.
+    ///
+    /// Nothing needs to record *who* a slot is reserved for. The returning
+    /// capability carries its own destination in `origin.cap_slot`; this array
+    /// only answers "is this slot spoken for".
+    reserved: [bool; MAX_CAPS],
 }
 
 impl CapTable {
     pub const fn new() -> CapTable {
-        CapTable { slots: [None; MAX_CAPS] }
+        CapTable { slots: [None; MAX_CAPS], reserved: [false; MAX_CAPS] }
+    }
+
+    /// Read the capability at `slot` without a rights check.
+    ///
+    /// For kernel-internal decisions about a capability's *kind*, where no right
+    /// is being exercised -- the lending path asks this to decide whether the
+    /// slot is worth reserving. Not a substitute for `lookup`, which is what a
+    /// syscall must use.
+    pub fn peek(&self, slot: usize) -> Option<Capability> {
+        *self.slots.get(slot)?
+    }
+
+    /// Hold `slot` open for a capability that is going out on loan from it.
+    ///
+    /// Separate from the revoke so the caller can unmap first: the lending path
+    /// runs `process::revoke_and_unmap_for_lend`, which must take the mapping
+    /// down with the authority (`fb_mapping.md` D1) before the slot is spoken
+    /// for.
+    pub fn reserve(&mut self, slot: usize) {
+        if let Some(r) = self.reserved.get_mut(slot) {
+            *r = true;
+        }
+    }
+
+    /// Place `cap` in this table, honouring a homecoming reservation if there is
+    /// one -- **the single rule for where an arriving capability goes**.
+    ///
+    /// `prior` is the capability's origin *before* the transfer, and it has to be
+    /// passed in because `lent_to` has already cleared it by the time a
+    /// capability arrives home: the homecoming rule fires exactly when the
+    /// destination is the origin, which is exactly the case this needs to
+    /// recognise. Reading `cap.origin` here would always see `None` and always
+    /// fall through to `install`.
+    ///
+    /// **Every path that puts a capability into a table should call this rather
+    /// than `install`.** Slice 2 of `lender_owed.md` taught `install` to skip
+    /// reserved slots but taught only the death path to target them, so the
+    /// cooperative hand-back landed past its own reservation and stranded a slot
+    /// per launch -- green the whole time. That is a rule living in more places
+    /// than one (I7); this function is the fix for the class, not the instance.
+    pub fn install_home(
+        &mut self,
+        cap: Capability,
+        prior: Option<Origin>,
+        dest_proc: usize,
+    ) -> Option<usize> {
+        if let Some(o) = prior {
+            if o.lender() == dest_proc {
+                if let Some(slot) = self.reclaim_to(o.home(), cap) {
+                    return Some(slot);
+                }
+            }
+        }
+        self.install(cap).ok()
+    }
+
+    /// Is `slot` held open for a returning capability?
+    pub fn is_reserved(&self, slot: usize) -> bool {
+        self.reserved.get(slot).copied().unwrap_or(false)
+    }
+
+    /// Give up a reservation without anything coming home.
+    ///
+    /// The spawn-failure rollback path uses this: the loan never happened, so the
+    /// slot must go back to being ordinarily free.
+    pub fn clear_reservation(&mut self, slot: usize) {
+        if let Some(r) = self.reserved.get_mut(slot) {
+            *r = false;
+        }
+    }
+
+    /// Put a returning capability back in the slot reserved for it.
+    ///
+    /// `Some(slot)` on success. `None` if the slot is not reserved or is somehow
+    /// occupied -- callers fall back to `reclaim`, which is what every lend did
+    /// before reservation existed.
+    pub fn reclaim_to(&mut self, slot: usize, cap: Capability) -> Option<usize> {
+        if !self.is_reserved(slot) || self.slots.get(slot)?.is_some() {
+            return None;
+        }
+        self.slots[slot] = Some(cap);
+        self.reserved[slot] = false;
+        Some(slot)
     }
 
     /// Install a kernel-minted capability in the first free slot; returns the
@@ -371,7 +571,9 @@ impl CapTable {
     ///   gets back precisely what it had).
     pub fn install(&mut self, cap: Capability) -> Result<usize, CapError> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
-            if slot.is_none() {
+            // `reserved` is the reason this is not simply "first empty": a slot
+            // held open for a returning capability is empty and unavailable.
+            if slot.is_none() && !self.reserved[i] {
                 *slot = Some(cap);
                 return Ok(i);
             }
@@ -408,7 +610,9 @@ impl CapTable {
         let mut cleared = 0;
         for entry in self.slots.iter_mut() {
             if let Some(cap) = entry.as_mut() {
-                if cap.origin == Some(slot) {
+                // `proc_slot` only -- this asks whose claim is departing, and
+                // `Origin`'s derived `PartialEq` would also compare `cap_slot`.
+                if cap.origin.map(|o| o.lender()) == Some(slot) {
                     cap.origin = None;
                     cleared += 1;
                 }
@@ -479,3 +683,5 @@ impl CapTable {
         }
     }
 }
+
+

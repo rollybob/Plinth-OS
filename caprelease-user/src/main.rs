@@ -28,6 +28,15 @@
 //! one that originally broke. `ROUNDS` is past both, so the protection holds
 //! either way.
 //!
+//! **Which pool binds is a consequence of two constants, and both are
+//! placeholders.** `MAX_ENDPOINTS` (8) and `MAX_CAPS` (16) are kernel-side and
+//! neither is exported here, so the `ROUNDS` below is a literal chosen against
+//! numbers this crate cannot see. If the endpoint pool ever grows past `ROUNDS`,
+//! this demo passes while testing nothing -- green, asserting nothing, the exact
+//! failure class A-13 was filed for. `lender_owed.md` D9 rules that these round
+//! counts be derived from the kernel constants rather than copied; until that
+//! lands, treat this number as owed a re-measurement whenever either limit moves.
+//!
 //! Note what is NOT being proved: the frame path was always releasable (the
 //! retired `frame_free` did that). What is new is releasing a non-frame
 //! capability -- an `Endpoint` -- and spawn handles are the only way a user

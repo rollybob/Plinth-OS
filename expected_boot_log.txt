@@ -524,7 +524,7 @@ spawnwaitcap: lent hash 0x69d3ede9a07b7784
 fbreclaimchild: holding the screen, now faulting
 plinth: [user fault] #PF
 plinth: terminating user process
-spawnwaitcap: child died, screen came back
+spawnwaitcap: child died, screen came back at slot 1
 spawnwaitcap: reclaimed hash 0x10bdf158afe53b64
 spawnwaitcap: 20 handle round-trips, slots reused
 plinth: spawnwaitcap demo: all done

@@ -34,7 +34,7 @@ use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::{PrivilegeLevel, VirtAddr};
 
 use crate::bkl;
-use crate::capability::{CapObject, CapTable, Capability, RIGHT_RECV, RIGHT_SEND};
+use crate::capability::{CapObject, CapTable, Capability, Origin, RIGHT_RECV, RIGHT_SEND};
 use crate::process;
 use crate::scheduler::{self, TrapFrame, GP_RAX, GP_RDI, GP_RDX, GP_RSI};
 
@@ -683,7 +683,7 @@ fn transfer_current_to_blocked(receiver: usize, cap_slot: u64) -> u64 {
     let cap = {
         let mut guard = process::current().lock();
         match guard.as_mut() {
-            Some(p) => process::revoke_and_unmap(p, cap_slot as usize),
+            Some(p) => process::revoke_and_unmap_for_lend(p, cap_slot as usize),
             None => None,
         }
     };
@@ -696,8 +696,10 @@ fn transfer_current_to_blocked(receiver: usize, cap_slot: u64) -> u64 {
     // The lender is recorded on the way in (Design/cap_reclaim.md D3), and the
     // homecoming rule inside `lent_to` clears it when the capability is going
     // back to whoever lent it.
-    let lent = cap.lent_to(scheduler::current_slot(), receiver);
-    match scheduler::install_into_blocked(receiver, lent) {
+    let prior = cap.origin;
+    let lent =
+        cap.lent_to(Origin::new(scheduler::current_slot(), cap_slot as usize), receiver);
+    match scheduler::install_into_blocked_home(receiver, lent, prior) {
         Some(landing) => {
             note_cap_added(&cap);
             landing as u64
@@ -727,10 +729,12 @@ fn transfer_blocked_to_current(sender: usize, cap_slot: u64) -> u64 {
     note_cap_removed(&cap, false);
     // Same as the other direction: the blocked sender is the lender, and
     // `lent_to` clears the origin if this is the capability coming home.
-    let lent = cap.lent_to(sender, scheduler::current_slot());
+    let prior = cap.origin;
+    let dest = scheduler::current_slot();
+    let lent = cap.lent_to(Origin::new(sender, cap_slot as usize), dest);
     let landing = {
         let mut guard = process::current().lock();
-        guard.as_mut().and_then(|p| p.caps.install(lent).ok())
+        guard.as_mut().and_then(|p| p.caps.install_home(lent, prior, dest))
     };
     match landing {
         Some(l) => {

@@ -1410,6 +1410,21 @@ pub fn wake_with(slot: usize, status: u64, payload: u64, landing: u64) {
 /// Mint `cap` into the table of the Blocked process at `slot`; returns its
 /// landing slot, or None if that process's capability table is full. Used by
 /// the IPC layer to deliver a transferred capability into a blocked receiver.
+/// `install_into_blocked`, honouring a homecoming reservation in the receiver's
+/// table. `prior` is the capability's origin before `lent_to` cleared it; see
+/// `CapTable::install_home`, which is where the rule lives.
+pub fn install_into_blocked_home(
+    slot: usize,
+    cap: Capability,
+    prior: Option<capability::Origin>,
+) -> Option<usize> {
+    // SAFETY: as `install_into_blocked`.
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        table[slot].process.as_mut()?.caps.install_home(cap, prior, slot)
+    }
+}
+
 pub fn install_into_blocked(slot: usize, cap: Capability) -> Option<usize> {
     // SAFETY: single CPU, IF=0; the slot holds a Blocked process.
     unsafe {
@@ -1442,13 +1457,24 @@ pub fn install_into_blocked(slot: usize, cap: Capability) -> Option<usize> {
 /// on a *different* process's table. Two different jobs.
 fn reclaim_lent_caps(dying: &CapTable, dying_slot: usize) {
     for cap in dying.iter() {
-        let Some((lender, home)) = capability::reclaim_target(&cap, dying_slot) else {
+        let Some((origin, home)) = capability::reclaim_target(&cap, dying_slot) else {
             continue;
         };
+        let lender = origin.lender();
+        let home_slot = origin.home();
         // Through `with_lender_caps`, not `TABLE` directly: a RUNNING lender has
         // had its `Process` moved out of its slot into the per-core `CURRENT`, so
         // a `TABLE`-only lookup finds nothing.
-        match with_lender_caps(lender, |caps| caps.reclaim(home)) {
+        // Home to the slot the capability left from, if that slot is still
+        // reserved for it (`lender_owed.md` D2(D)). The fallback to `reclaim`
+        // -- first free -- is what every lend did before reservation existed,
+        // and is still reached by lends that do not reserve: IPC `send_cap`
+        // records an origin but does not reserve until slice 3. Without the
+        // fallback those returns would target a slot nobody held open, and
+        // `reclaim_to` would refuse.
+        match with_lender_caps(lender, |caps| {
+            caps.reclaim_to(home_slot, home).or_else(|| caps.reclaim(home))
+        }) {
             Some(Some(landing)) => {
                 // Account it as the MOVE it is: the dying holder loses the
                 // capability and the lender gains it, so both halves are needed

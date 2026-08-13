@@ -559,13 +559,25 @@ pub extern "C" fn _start(_idx: u64) -> ! {
     // So we must remember where it landed and transfer THAT slot next time, or a
     // second launch would hand the app the stale wait-handle instead.
     //
-    // The observed values are 1 -> 7 on the first launch and 7 -> 7 on every one
-    // after, and that stability is MISLEADING. It invites the conclusion that only
-    // the first launch migrates anything, so the second launch adds no coverage
-    // and the D7 relaunch guard is weaker than it claims. That conclusion is
-    // wrong, and it was reached and retracted on 2026-08-01 -- recorded here
-    // because the numbers will look just as suspicious to the next person who
-    // prints them.
+    // **The migration described above stopped happening on 2026-08-10**
+    // (Design/lender_owed.md D2(D), homecoming reservation). The slot a
+    // capability is lent from is now RESERVED for its return, so the screen comes
+    // back to the slot it left -- measured across the whole tour as
+    // 0x1, 0x1, 0x1, 0x1, 0x1, where it previously walked 0x1, 0x8, 0x9, 0xa, 0xa.
+    // `fb_slot` is therefore constant in practice, and the assertion after each
+    // launch below is what says so out loud rather than leaving it to be noticed.
+    //
+    // The variable is KEPT, and this is deliberate: it still reads the slot the
+    // kernel reports rather than assuming one, so if the guarantee ever regresses
+    // the assertion fires instead of the shell silently transferring a stale
+    // slot. A constant here would trade a loud failure for a quiet one.
+    //
+    // Kept for the historical record, because the numbers will look suspicious to
+    // anyone reading an older log: the values used to be 1 -> 7 on the first
+    // launch and 7 -> 7 after, and that stability was MISLEADING. It invited the
+    // conclusion that only the first launch migrated anything, so the second
+    // added no coverage and the D7 relaunch guard was weaker than it claimed.
+    // That conclusion is wrong, and it was reached and retracted on 2026-08-01.
     //
     // The guard is not about the migration RECURRING. It is about whether this
     // shell USES the migrated value on the next transfer, and that is observable
@@ -601,10 +613,20 @@ pub extern "C" fn _start(_idx: u64) -> ! {
                         move_selection(&fb, &mut cur, prev, sel);
                     }
                     Key::Enter => {
+                        let prev_slot = fb_slot;
                         let (nfb, nslot) =
                             open_icon(fb, fb_slot, sel, &mut cur, &mut kbd, &mut keymap);
                         fb = nfb;
                         fb_slot = nslot;
+                        // The homecoming guarantee, guarded where it is relied
+                        // on (lender_owed.md D2(D)): the screen returns to the
+                        // slot it was lent from, launch after launch, whether
+                        // the app exited politely or died holding it.
+                        if nslot != prev_slot {
+                            sys_write(b"shell: screen did not come home
+");
+                            sys_exit(7);
+                        }
                     }
                     Key::Char(b'q') | Key::Char(b'Q') => {
                         // No farewell frame: the kernel terminates QEMU shortly
@@ -665,10 +687,20 @@ pub extern "C" fn _start(_idx: u64) -> ! {
                         let prev = sel;
                         sel = idx;
                         move_selection(&fb, &mut cur, prev, sel);
+                        let prev_slot = fb_slot;
                         let (nfb, nslot) =
                             open_icon(fb, fb_slot, sel, &mut cur, &mut kbd, &mut keymap);
                         fb = nfb;
                         fb_slot = nslot;
+                        // The homecoming guarantee, guarded where it is relied
+                        // on (lender_owed.md D2(D)): the screen returns to the
+                        // slot it was lent from, launch after launch, whether
+                        // the app exited politely or died holding it.
+                        if nslot != prev_slot {
+                            sys_write(b"shell: screen did not come home
+");
+                            sys_exit(7);
+                        }
                     }
                 }
             }

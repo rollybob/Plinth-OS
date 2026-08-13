@@ -179,7 +179,19 @@ pub extern "C" fn _start(_id: u64) -> ! {
         // reopened -- or the kernel stopped recording the landing slot.
         fail(b"spawnwaitcap: no landing slot -- the helper reported nothing\n", 3);
     }
-    sys_write(b"spawnwaitcap: child died, screen came back\n");
+    // The homecoming guarantee, asserted directly rather than inferred from a
+    // green run (`lender_owed.md` D2(D)): a lent capability returns to the slot
+    // it left from, because that slot was reserved the moment the loan started.
+    //
+    // Watched failing before it was believed. With the reservation disabled in
+    // `process::revoke_and_unmap_for_lend`, this same demo reports **slot 2** --
+    // the first free slot, which is what the kernel chose for every loan before
+    // this milestone. With it, slot 1, which is FB_SLOT. That is the whole
+    // difference the ruling buys, and it is one number.
+    if cap_slot != FB_SLOT {
+        fail(b"spawnwaitcap: the screen did not come home to the slot it left\n", 8);
+    }
+    emit_line(b"spawnwaitcap: child died, screen came back at slot ", cap_slot, b"\n");
 
     // 3) The screen is ours again. Map it at the slot the helper reported and
     //    paint a different colour, so the second hash cannot coincide with the

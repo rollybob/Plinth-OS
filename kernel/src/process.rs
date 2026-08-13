@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::structures::paging::PageTableFlags;
 
-use crate::capability::{Capability, CapObject, CapTable, RIGHT_CONSUME};
+use crate::capability::{self, Capability, CapObject, CapTable, RIGHT_CONSUME};
 use crate::elf;
 use crate::frame_alloc::{FRAME_ALLOC, FRAME_SIZE};
 use crate::memory;
@@ -450,6 +450,27 @@ pub fn run(binary: &[u8], phys_offset: u64) -> Result<Outcome, &'static str> {
 /// receiver to mint. The frame itself is not freed; ownership moves. This is
 /// half of an IPC capability transfer (the mint into the receiver is the
 /// other half); it is also the building block a transfer-over-spawn would use.
+/// `revoke_and_unmap`, but holding the slot open for the capability's return
+/// (`Design/lender_owed.md` D2(D)).
+///
+/// Reserves only for kinds that can actually come home, asking
+/// `capability::is_reclaimable_kind` -- the same predicate `release_action` uses
+/// at death time, so the two ends cannot drift. Lending anything else behaves
+/// exactly as before: the slot is freed. Reserving for a capability that will
+/// never return would burn the slot for the process's lifetime.
+pub fn revoke_and_unmap_for_lend(proc: &mut Process, slot: usize) -> Option<Capability> {
+    let reserves = proc
+        .caps
+        .peek(slot)
+        .map(|c| capability::lend_reserves_home(&c))
+        .unwrap_or(false);
+    let cap = revoke_and_unmap(proc, slot)?;
+    if reserves {
+        proc.caps.reserve(slot);
+    }
+    Some(cap)
+}
+
 pub fn revoke_and_unmap(proc: &mut Process, slot: usize) -> Option<Capability> {
     let cap = proc.caps.revoke(slot).ok()?;
     if matches!(cap.object, CapObject::Frame { .. }) {
