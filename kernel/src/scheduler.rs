@@ -1467,11 +1467,19 @@ fn reclaim_lent_caps(dying: &CapTable, dying_slot: usize) {
         // a `TABLE`-only lookup finds nothing.
         // Home to the slot the capability left from, if that slot is still
         // reserved for it (`lender_owed.md` D2(D)). The fallback to `reclaim`
-        // -- first free -- is what every lend did before reservation existed,
-        // and is still reached by lends that do not reserve: IPC `send_cap`
-        // records an origin but does not reserve until slice 3. Without the
-        // fallback those returns would target a slot nobody held open, and
-        // `reclaim_to` would refuse.
+        // -- first free -- is what every lend did before reservation existed.
+        //
+        // As of 2026-08-13 every lend path reserves, so a reclaimable
+        // capability should always find its slot held open and the fallback
+        // should be unreachable for one. It is deliberately kept rather than
+        // turned into an assertion: `reclaim_to` also refuses a slot that is
+        // somehow occupied, and losing the screen is a worse failure than
+        // returning it somewhere the lender must be told about. Note this
+        // comment claimed IPC `send_cap` "does not reserve until slice 3" for
+        // three days after slice 3 landed -- it was half true the whole time,
+        // because only one of the two send directions had been converted (see
+        // `revoke_from_blocked`). A fallback described as routine is how a live
+        // gap stays invisible.
         match with_lender_caps(lender, |caps| {
             caps.reclaim_to(home_slot, home).or_else(|| caps.reclaim(home))
         }) {
@@ -1635,11 +1643,23 @@ fn with_lender_caps<R>(lender: usize, f: impl FnOnce(&mut CapTable) -> R) -> Opt
 /// Revoke (and, if a mapped frame, unmap) the capability at `cap_slot` from
 /// the Blocked process at `slot`. Used when a receiver completes a rendezvous
 /// with a blocked sender that is transferring a capability.
+///
+/// Reserves a homecoming slot on the same rule as every other lend, via
+/// `revoke_and_unmap_for_lend`. This is the give half of a transfer exactly as
+/// `transfer_current_to_blocked`'s revoke is, and the only difference between
+/// them is which side arrived first -- which is a scheduling accident and must
+/// not decide whether a loan is reservable. It called plain `revoke_and_unmap`
+/// until 2026-08-13, so a fresh lend by an outright owner that happened to
+/// block before its receiver arrived reserved nothing, and the capability came
+/// home to first-free with only `set_reclaim_landing` to name it: K-024's
+/// residue, on one path. Not reachable by any in-tree crate today (every
+/// outright-owner framebuffer lend goes through `spawn`), which is why it
+/// survived slice 3's sweep of the class.
 pub fn revoke_from_blocked(slot: usize, cap_slot: usize) -> Option<Capability> {
     // SAFETY: single CPU, IF=0; the slot holds a Blocked process.
     unsafe {
         let table = &mut *addr_of_mut!(TABLE);
-        process::revoke_and_unmap(table[slot].process.as_mut()?, cap_slot)
+        process::revoke_and_unmap_for_lend(table[slot].process.as_mut()?, cap_slot)
     }
 }
 
