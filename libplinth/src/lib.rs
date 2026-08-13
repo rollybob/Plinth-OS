@@ -53,6 +53,42 @@ pub const MAP_END: u64 = 0x2000_0000;
 
 pub const PAGE_SIZE: u64 = 4096;
 
+/// Guaranteed minimum table sizes -- the floor the kernel promises, not a
+/// statement of what it currently has.
+///
+/// A program may rely on at least this many entries existing. The kernel is
+/// free to have more, so growth is always ABI-compatible and only shrinking
+/// breaks the contract; that is why these are published as minimums rather
+/// than as exact sizes. `ABI.md`'s "Table sizes" section is the contract, and
+/// these constants exist so that a program needing the number stops copying a
+/// literal out of the kernel source.
+///
+/// The kernel pins its own `MAX_CAPS`, `MAX_ENDPOINTS` and `MAX_FB_MAPS` to
+/// these numbers with one compile-time assertion apiece. Raising a kernel
+/// limit therefore fails the kernel build until the value here and `ABI.md`
+/// are raised with it. That coupling is the point rather than a nuisance: an
+/// in-tree demo that loops "more times than the system can have in flight" is
+/// only meaningful against the real limit, and one that quietly stops
+/// exceeding it goes green while asserting nothing.
+pub const MIN_CAP_SLOTS: u64 = 16;
+pub const MIN_ENDPOINTS: u64 = 8;
+pub const MIN_FB_MAPS: u64 = 4;
+
+/// Rounds a reuse demo must run for its result to mean anything: strictly more
+/// than the tightest per-process limit the cycle consumes, plus a margin so
+/// the assertion does not sit exactly on the boundary.
+///
+/// What actually binds a spawn-and-join cycle is the endpoint pool rather than
+/// the capability table -- every spawn creates a result endpoint, and a leaked
+/// wait handle is what keeps it referenced -- but a run that clears the larger
+/// of the two clears both. Taking the maximum keeps this correct if the two
+/// limits ever swap places, which is exactly the sort of drift a hand-picked
+/// literal does not survive.
+pub const REUSE_ROUNDS: u64 = {
+    let tightest = if MIN_CAP_SLOTS > MIN_ENDPOINTS { MIN_CAP_SLOTS } else { MIN_ENDPOINTS };
+    tightest + 4
+};
+
 /// The kernel mints each process a CPU-time capability at spawn, and it
 /// always lands in this slot -- a well-known initial capability, the way
 /// fd 0 is on Unix. Pass it to sys_cpu_charge.

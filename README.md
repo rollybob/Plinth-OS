@@ -381,7 +381,7 @@ user programs (ring 3, each its own crate):
   gfxbound-user/ write past a band's grant -> kernel page-faults it (the boundary)
   shell-user/    the skin: splash + a home screen of app icons + arrow-key nav
   shellapp-user/ an app the shell spawns + hands the screen to, then gets back
-  caprelease-user/  20 spawn/join/release round-trips through a 16-slot table
+  caprelease-user/  spawn/join/release round-trips past the endpoint pool
   quietworker-user/ a silent worker for the loop above (grantee without output)
   faultchild-user/  a child that faults, for liveness testing
   template-user/    minimal skeleton to copy for a new program (see GUIDE.md)

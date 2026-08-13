@@ -81,6 +81,18 @@ const NO_CAP: u64 = u64::MAX;
 /// Bounded endpoint table -- no heap, like the rest of Plinth.
 const MAX_ENDPOINTS: usize = 8;
 
+/// This is the limit a spawn-and-join cycle actually reaches first -- every
+/// spawn creates a result endpoint, and a leaked wait handle keeps it
+/// referenced -- so it binds the reuse demos before the capability table does.
+/// `ABI.md` publishes it as a guaranteed minimum and `libplinth::MIN_ENDPOINTS`
+/// carries the same number. Raise all three in one edit; `REUSE_ROUNDS` is
+/// derived from the published value, and a demo that stops exceeding this pool
+/// passes while testing nothing.
+const _: () = assert!(
+    MAX_ENDPOINTS == 8,
+    "MAX_ENDPOINTS changed: update libplinth::MIN_ENDPOINTS and ABI.md's table-sizes section to match",
+);
+
 /// An intrusive FIFO of blocked waiters on one endpoint, plus the rendezvous
 /// side it currently holds. The queue only ever holds waiters from ONE side at
 /// a time (`are_senders` says which); the instant a peer arrives on the other

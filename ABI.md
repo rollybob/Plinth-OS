@@ -570,6 +570,40 @@ A few slots are well-known, the way file descriptor 0 is on Unix:
 
 All other slots start empty.
 
+## Table sizes
+
+Plinth has no heap behind its per-process tables, so they are fixed arrays and
+a program can run out of them. The sizes are published as **guaranteed
+minimums** rather than as exact numbers:
+
+| Table                | Guaranteed minimum | `libplinth`        |
+|----------------------|--------------------|--------------------|
+| Capability slots     | 16 per process     | `MIN_CAP_SLOTS`    |
+| IPC endpoints        | 8 system-wide      | `MIN_ENDPOINTS`    |
+| Framebuffer mappings | 4 per process      | `MIN_FB_MAPS`      |
+
+A program may rely on at least this many entries existing. A kernel may
+provide more, so **growing a limit is always compatible and only shrinking one
+is a breaking change** -- a program written against these numbers keeps
+working on a kernel with larger tables, which is the whole reason for
+publishing floors instead of exact sizes. Do not infer the actual size by
+probing until allocation fails and treating the result as a constant; it is
+not part of this contract.
+
+Endpoints are the limit reached first by anything that spawns repeatedly.
+Every `spawn` creates a result endpoint, and the wait handle it returns is
+what keeps that endpoint referenced, so a process that joins children without
+`cap_release`-ing their handles exhausts the eight endpoints well before it
+exhausts its sixteen capability slots.
+
+Code that must not silently stop exercising a limit should derive its bound
+from these constants rather than copy the number. `libplinth::REUSE_ROUNDS`
+does this for the in-tree demos that prove a resource is recycled: it is the
+tightest of the limits above plus a margin, so it still exceeds the real table
+if either grows. The kernel pins its own constants to the values in this
+table with a compile-time assertion apiece, so raising a limit fails the build
+until this section and `libplinth` are raised with it.
+
 ## Virtual-address windows
 
 | Window      | Range                       | Purpose                          |

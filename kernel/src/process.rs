@@ -57,6 +57,14 @@ pub const MAX_USER_MAPS: usize = 16;
 /// digits, which is not worth being clever about.
 pub const MAX_FB_MAPS: usize = 4;
 
+/// `ABI.md` publishes this as a guaranteed minimum and `libplinth::MIN_FB_MAPS`
+/// carries the same number. Headroom chosen here is still a published promise
+/// once userspace can read it, so raise both together.
+const _: () = assert!(
+    MAX_FB_MAPS == 4,
+    "MAX_FB_MAPS changed: update libplinth::MIN_FB_MAPS and ABI.md's table-sizes section to match",
+);
+
 /// One `fb_map` result: `pages` pages mapped contiguously from `va_base`
 /// through the capability at `slot`.
 ///

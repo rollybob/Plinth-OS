@@ -28,14 +28,15 @@
 //! one that originally broke. `ROUNDS` is past both, so the protection holds
 //! either way.
 //!
-//! **Which pool binds is a consequence of two constants, and both are
-//! placeholders.** `MAX_ENDPOINTS` (8) and `MAX_CAPS` (16) are kernel-side and
-//! neither is exported here, so the `ROUNDS` below is a literal chosen against
-//! numbers this crate cannot see. If the endpoint pool ever grows past `ROUNDS`,
-//! this demo passes while testing nothing -- green, asserting nothing, the exact
-//! failure class A-13 was filed for. `lender_owed.md` D9 rules that these round
-//! counts be derived from the kernel constants rather than copied; until that
-//! lands, treat this number as owed a re-measurement whenever either limit moves.
+//! **Which pool binds is a consequence of two constants, and this crate no
+//! longer copies either of them.** `MAX_ENDPOINTS` and `MAX_CAPS` are
+//! kernel-side, but `ABI.md` now publishes both as guaranteed minimums and
+//! `libplinth` carries them, so `ROUNDS` below is derived rather than chosen
+//! against numbers this crate cannot see (`lender_owed.md` D9). The hazard that
+//! closes is concrete: a literal that stopped exceeding a grown endpoint pool
+//! would leave this demo green while asserting nothing -- the exact failure
+//! class A-13 was filed for. Growing a kernel limit now fails the kernel build
+//! until the published value moves with it, and `ROUNDS` follows automatically.
 //!
 //! Note what is NOT being proved: the frame path was always releasable (the
 //! retired `frame_free` did that). What is new is releasing a non-frame
@@ -54,9 +55,11 @@ const QUIETWORKER_ID: u64 = 4;
 
 /// Round-trips to run. A leaking build dies at round 8 (measured -- the eight
 /// endpoints, see the module docs), and would die by round 15 on the capability
-/// table even if the pool were bottomless. Twenty clears both and keeps the demo
-/// quick.
-const ROUNDS: u64 = 20;
+/// table even if the pool were bottomless. The derived value clears both and
+/// keeps the demo quick; it tracks the published limits rather than restating
+/// the measurement, so neither number above can go stale without the build
+/// saying so.
+const ROUNDS: u64 = libplinth::REUSE_ROUNDS;
 
 #[no_mangle]
 pub extern "C" fn _start(_id: u64) -> ! {

@@ -76,7 +76,9 @@
 //!
 //! This does not weaken the test -- the leak is caught either way, and `ROUNDS`
 //! clears both limits. It does mean the loop never actually reaches a full table,
-//! so do not cite it as evidence about table behaviour.
+//! so do not cite it as evidence about table behaviour. `ROUNDS` is derived from
+//! the minimums `ABI.md` publishes rather than copied from the kernel, so it
+//! still clears both if either limit grows (`lender_owed.md` D9).
 //!
 //! **Part 2 deliberately transfers nothing and spawns the silent worker.** The
 //! handle is minted by every spawn regardless of whether a capability rides
@@ -112,9 +114,11 @@ const QUIETWORKER_ID: u64 = 4;
 /// endpoints, one of them already spent by part 1; see the module docs), and
 /// would die in the low teens on the capability table even if the pool were
 /// bottomless, since this process enters the loop holding its CPU budget and the
-/// reclaimed framebuffer. Twenty clears both -- the same number as
-/// `caprelease-user`, for the same reason.
-const ROUNDS: u64 = 20;
+/// reclaimed framebuffer. The derived value clears both -- the same number as
+/// `caprelease-user`, now for the structural reason rather than by both crates
+/// happening to pick it: `ABI.md` publishes the limits as guaranteed minimums
+/// and `libplinth` derives the count from them (`lender_owed.md` D9).
+const ROUNDS: u64 = libplinth::REUSE_ROUNDS;
 
 /// Side of the hashed square. 128 to match every other framebuffer demo, so the
 /// numbers stay comparable by eye in the boot log.

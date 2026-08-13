@@ -841,8 +841,18 @@ const SPAWN_RESULT: u64 = 42;
 const STEAL_WORKERS: u64 = 3;
 
 /// Spawn round-trips the cap_release demo runs; must match caprelease-user's
-/// ROUNDS. It has to exceed the 16-slot capability table for the test to mean
+/// ROUNDS. It has to exceed the eight-endpoint pool for the test to mean
 /// anything -- a build that leaks the spent wait handle dies partway through.
+/// (It clears the 16-slot capability table too, but the pool is what binds;
+/// this comment said otherwise until 2026-08-10, see A-13.)
+///
+/// The demo now derives its own count from `libplinth::REUSE_ROUNDS` rather
+/// than a literal, and this crate is host-side so it cannot read that. It stays
+/// a mirror on purpose: raising a kernel limit fails the kernel build first
+/// (the const assert beside `MAX_ENDPOINTS`), and following that instruction
+/// changes the demo's derived count, which turns this check red until the
+/// number here is raised too. Red in a known place beats a literal that drifts
+/// quietly.
 const CAPRELEASE_ROUNDS: u64 = 20;
 
 /// Assert each scheduled process printed its own lines in program order.

@@ -27,6 +27,17 @@ pub const RIGHT_RECV: u8 = 1 << 5;
 
 pub const MAX_CAPS: usize = 16;
 
+/// `ABI.md` publishes this as a guaranteed minimum and `libplinth::MIN_CAP_SLOTS`
+/// carries the same number, so the two cannot be changed independently without
+/// this failing the build. Raising the limit is ABI-compatible, but it is not
+/// free: `libplinth::REUSE_ROUNDS` is derived from the published value, and a
+/// reuse demo that stops exceeding the real table goes green while asserting
+/// nothing. Raise all three -- here, `libplinth`, `ABI.md` -- in one edit.
+const _: () = assert!(
+    MAX_CAPS == 16,
+    "MAX_CAPS changed: update libplinth::MIN_CAP_SLOTS and ABI.md's table-sizes section to match",
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapObject {
     /// Ownership of one physical frame (frame-aligned address).
