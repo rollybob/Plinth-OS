@@ -44,7 +44,7 @@ pub const SYS_ERR: u64 = u64::MAX;
 /// version on screen cannot drift from the contract the binary was built
 /// against. It drifted exactly once, when the shell splash kept saying 2.7
 /// through the v2.8 bump.
-pub const ABI_VERSION: &[u8] = b"2.9";
+pub const ABI_VERSION: &[u8] = b"2.10";
 
 /// frame_map only accepts virtual addresses in [MAP_BASE, MAP_END),
 /// page-aligned. Mirrors the kernel's user mapping window.

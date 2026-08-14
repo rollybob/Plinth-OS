@@ -3,7 +3,7 @@
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
 follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
-current contract is **v2.8**. v2 added IPC and revised `spawn`, breaking v1 --
+current contract is **v2.10**. v2 added IPC and revised `spawn`, breaking v1 --
 the one incompatible ABI change so far; v2.1 added `spawn_from_buffer` (the
 load-from-disk path), v2.2 added console input (`event_recv` + `EventSource`),
 both additive over v2; v2.3 moved `block_read` to the `int 0x80` gate so it can
@@ -16,11 +16,51 @@ ring, one `ring_wait`, now multiplexes block reads and input; v2.6 adds the
 write half of the block ring ABI (`RING_OP_WRITE`), purely additive; v2.7 adds
 the framebuffer as a capability (`Framebuffer` + the `fb_map` syscall, nr 14),
 purely additive; v2.8 adds `cap_release` (nr 15) -- the first way to give a
-capability *back* -- and retires `frame_free` (nr 5) into it.
+capability *back* -- and retires `frame_free` (nr 5) into it; v2.9 returns a lent
+`Framebuffer` to whoever lent it when the borrower dies, and lets a death-wake
+carry the landing slot; v2.10 makes that landing slot **predictable in advance**
+by reserving the slot a capability was lent from, so it comes home to where it
+left. This paragraph said "v2.8" through both of those bumps -- the same drift
+the splash hit at v2.7, caught here on 2026-08-13.
 
 ## [Unreleased]
 
 ### Added
+- **A lent capability comes home to the slot it left from (ABI v2.10).** v2.9
+  made a lent framebuffer come back when its borrower died; it did not make the
+  lender able to find it. The kernel picked a slot and then tried to say which
+  one on whatever wait the lender happened to be in, and some waits cannot carry
+  that -- a lender blocked in `call`, or not waiting on the dying process at all,
+  received the capability at a slot it had no way to learn. The capability was
+  safe, accounted, and unusable.
+
+  The fix is not a better announcement. Because the kernel chooses destination
+  slots, every non-trivial program keeps a private model of its own capability
+  table, and an install the program cannot observe leaves that model wrong with
+  nothing able to detect or repair it. So the destination is now decided *before*
+  the loan: lending reserves the slot the capability left from, and it returns
+  there -- whether handed back cooperatively or reclaimed on death. There is
+  nothing to announce because the answer was known in advance. The v2.9
+  notification still works and is unchanged; it is simply no longer the only way
+  to find out.
+
+  A reserved slot is empty but not allocatable, so a program with a loan
+  outstanding sees one fewer free slot. Which slot a mint lands in has never been
+  part of this contract, so nothing correct can have depended on it, but the
+  effect is observable -- hence a version bump rather than a silent improvement.
+  Only an **outright owner** lending a **reclaimable** kind reserves: passing on
+  something you are yourself borrowing reserves nothing, because it goes home to
+  whoever lent it originally, however many hops away.
+
+  Two capability-model defects were found and fixed while building it, both by
+  reading the write sites rather than by a failing test, and **neither is watched
+  failing** -- nothing can distinguish either from correct behaviour until
+  re-lending a reclaimable capability is buildable. The spawn transfer path set
+  the lender unconditionally, so passing a borrowed capability to a child
+  rewrote the owner's claim to name the intermediary. And only one of the two IPC
+  transfer directions reserved, so whether a loan was reservable depended on
+  which side of the rendezvous arrived first -- a scheduling accident deciding a
+  capability-model question.
 - **A lent framebuffer survives the borrower's death (ABI v2.9).** Transferring
   the screen to a process that then crashed destroyed the only `Framebuffer`
   capability in existence, and nothing in userspace could draw again for the rest

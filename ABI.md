@@ -1,4 +1,4 @@
-# Plinth ABI v2.9
+# Plinth ABI v2.10
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -138,6 +138,46 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   multiplexes the raw region and never touches a pixel -- fonts, layout, and
   compositing are library-OS policy (`libgfx`), exactly as keymaps and on-disk
   formats are. Purely additive: no existing call changed.
+
+### v2.10 (a lent capability comes home to the slot it left from)
+
+- **The landing slot is now predictable before the loan begins.** Lending a
+  capability reserves the slot it left from, and when it comes back -- whether
+  returned cooperatively or reclaimed because the borrower died -- it is placed
+  in that same slot. v2.9 made the capability come back; v2.10 makes *where*
+  knowable in advance.
+- **Why this rather than better notification.** v2.9 returned the capability and
+  then tried to tell the lender where it landed, and some waits cannot carry
+  that: a lender blocked in `call`, or not waiting on the dying process at all,
+  got the capability at a slot it had no way to learn. Because the kernel picks
+  destination slots, any non-trivial program keeps its own model of its
+  capability table, and an install it cannot observe leaves that model silently
+  wrong with no way to detect or repair it. Making the destination predictable
+  removes the thing that needed announcing, rather than widening the
+  announcement.
+- **A reserved slot is empty but not allocatable.** While a loan is outstanding
+  the lender's table holds a slot that contains nothing and will not be chosen
+  for a new capability, so a program that counts its free slots sees one fewer
+  per outstanding loan. Which slot a mint lands in has never been specified by
+  this contract, so nothing correctly written can have depended on it -- but the
+  effect is observable, which is why this is a version bump rather than a silent
+  improvement.
+- **Which lends reserve.** Only a kind that can come home at all (today,
+  `Framebuffer` -- see v2.9) and only when lent by its **outright owner**.
+  Passing on a capability you are yourself borrowing reserves nothing: it does
+  not go home to you, it goes home to whoever lent it originally. The claim
+  follows the capability across any number of hops and always names the root
+  lender.
+- **The notification still exists and is unchanged.** `recv`/`recv_cap` still
+  report the landing slot alongside `IPC_PEER_DIED` exactly as in v2.9. It is
+  simply no longer the only way to find out, so its narrowness stops being
+  load-bearing.
+- **What this does not change.** Reclamation scope is still `Framebuffer` only.
+  Nothing is reclaimed from a live holder, there is still no revocation protocol,
+  and a voluntary `cap_release` of a borrowed capability still destroys it. If a
+  lender's table is genuinely full when a capability tries to come home it is
+  dropped, as before -- but a reservation makes that far less likely, since the
+  slot it needs is the one being held for it.
 
 ### v2.9 (getting a lent capability back when the borrower dies)
 
