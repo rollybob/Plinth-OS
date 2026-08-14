@@ -46,8 +46,8 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use libplinth::{
-    sys_frame_alloc, sys_frame_map, sys_ring_register, sys_ring_submit, sys_ring_wait, MAP_END,
-    PAGE_SIZE, SYS_ERR,
+    sys_frame_alloc, sys_frame_map, sys_ring_register, sys_ring_submit, sys_ring_wait, sys_write,
+    write_dec, MAP_END, PAGE_SIZE, SYS_ERR,
 };
 
 /// Ring depth: a power of two that fits one frame and exceeds any realistic
@@ -83,10 +83,19 @@ const RING_OP_WRITE: u32 = 3;
 
 /// Drop-flag bit in an event completion's `status` (event_rings.md s5): the
 /// kernel sets it on the first event posted after one or more were dropped on a
-/// full CQ. The stream masks it off the returned event word; a reader that needs
-/// it can compare consecutive events. (No demo overruns the CQ, so it never
-/// fires here, but the adapter must not pass the flag bit through as event data
-/// -- it overlays the packed event's `value` field.)
+/// full CQ. Two things happen with it here, at different points. `reap` COUNTS it
+/// -- every completion draining out of the CQ is inspected, so a drop is tallied
+/// into `Reactor::drops` even when the flagged completion is a mouse event no
+/// future ever consumes (the view-loop case: the shell awaits only the keyboard
+/// while mouse packets accumulate). The event futures then MASK it off the word
+/// they return, since it overlays the packed event's `value` field and is not
+/// event data. Counting at reap rather than at consume is why a slow reader that
+/// never drains a given stream still sees `events_dropped()` climb.
+///
+/// Safe to test at reap without knowing whether a completion is a block read or
+/// an event: only the kernel event path ever sets bit 31, and block status codes
+/// are small (`BLK_OK`=0 .. `BLK_E_DEV`=4), so a set bit 31 is unambiguously a
+/// dropped-event marker.
 const EVENT_DROPPED: u32 = 1 << 31;
 
 #[inline]
@@ -116,6 +125,18 @@ struct Reactor {
     /// Reaped completions awaiting a matching `poll`: (user_data, status).
     done: [(u64, u64); CAP],
     done_len: usize,
+    /// Count of event completions reaped carrying the kernel's `EVENT_DROPPED`
+    /// flag -- one per burst of CQ-full drops the kernel surfaced (each flagged
+    /// completion marks at least one lost event since the previous one on that
+    /// stream, event_rings.md s5). A lower bound on total loss, not the exact
+    /// count; the exact per-subscription tally lives in the kernel. Read via
+    /// `events_dropped()` -- the reason input loss is a reported number rather
+    /// than a silent stall.
+    drops: u32,
+    /// The value of `drops` last announced on serial by `report_drops`. Lets the
+    /// executor emit one line per new drop burst rather than repeating the total
+    /// on every wake.
+    reported: u32,
 }
 
 static mut REACTOR: Reactor = Reactor {
@@ -124,6 +145,8 @@ static mut REACTOR: Reactor = Reactor {
     next_ud: 1,
     done: [(0, 0); CAP],
     done_len: 0,
+    drops: 0,
+    reported: 0,
 };
 
 /// Access the per-process reactor. SAFETY: a user process is single-threaded
@@ -177,12 +200,45 @@ impl Reactor {
                 let e = CQ_VA + HDR_SIZE + (head & mask) as u64 * CQ_ENTRY;
                 let ud = r64(e);
                 let status = r32(e + 8) as u64;
+                // Tally the kernel's drop flag as each completion passes through,
+                // before it is (or is not) matched to a future. This is the one
+                // point that sees every event, so loss is counted even on a stream
+                // the caller is not currently draining. Only event completions set
+                // bit 31, so this never miscounts a block read (see EVENT_DROPPED).
+                if status as u32 & EVENT_DROPPED != 0 {
+                    self.drops = self.drops.saturating_add(1);
+                }
                 if self.done_len < CAP {
                     self.done[self.done_len] = (ud, status);
                     self.done_len += 1;
                 }
                 w32(CQ_VA + HDR_HEAD, head.wrapping_add(1));
             }
+        }
+    }
+
+    /// Announce on serial any drop bursts counted since the last announcement,
+    /// and mark them announced. Called from `block_on` after each reap, so input
+    /// loss surfaces the instant the kernel reports it -- crucially even while a
+    /// consumer is parked awaiting one stream and the drops are landing on
+    /// another. That is the view-loop hang the K-027 investigation hit: the shell
+    /// blocks in `block_on(kbd.next())`, a mouse flood overruns the shared CQ and
+    /// swallows the keystroke, and every wake reaps mouse events carrying the drop
+    /// flag while `kbd.next()` stays Pending and never returns to the caller. A
+    /// caller-side poll cannot see that; this can, because it runs inside the
+    /// blocking loop. Silent when nothing was dropped, so a reader that keeps up
+    /// -- every deterministic demo and the scripted tour -- prints nothing and the
+    /// smoke transcript is unchanged.
+    ///
+    /// This is reference-executor policy, not mechanism: a real library OS may
+    /// route the signal to a log, a counter, or a UI instead of serial. What the
+    /// kernel guarantees is the count; where it is voiced is the tenant's choice.
+    fn report_drops(&mut self) {
+        if self.drops != self.reported {
+            self.reported = self.drops;
+            sys_write(b"libos: input dropped on a full queue, bursts ");
+            write_dec(self.drops as u64);
+            sys_write(b"\n");
         }
     }
 }
@@ -209,6 +265,18 @@ pub fn init() -> bool {
     r.handle = handle;
     r.ready = true;
     true
+}
+
+/// How many event completions this reactor has reaped carrying the kernel's
+/// `EVENT_DROPPED` flag since the process started -- a monotonically rising
+/// count of the bursts in which the CQ overran and the kernel dropped input
+/// (event_rings.md s5). Zero on a reader that keeps up. `block_on` already voices
+/// each new burst on serial; this is the same number as a value, for a tenant
+/// that wants to poll it (a status line, a metric) rather than read the log. It
+/// is a lower bound on events lost (one tick per drop burst, not per event); the
+/// exact per-subscription tally would need a kernel query.
+pub fn events_dropped() -> u32 {
+    reactor().drops
 }
 
 /// Push one block I/O submission entry into the SQ at its tail (the kernel
@@ -650,6 +718,13 @@ pub fn block_on<F: Future + Unpin>(mut fut: F) -> F::Output {
         let handle = reactor().handle;
         let _ = sys_ring_submit(handle);
         let _ = sys_ring_wait(handle);
-        reactor().reap();
+        let r = reactor();
+        r.reap();
+        // Voice any input the kernel dropped on a full CQ before re-polling. Runs
+        // inside the blocking loop deliberately: a stream the caller is not
+        // draining (a mouse flood behind a keyboard wait) surfaces here or not at
+        // all. No-op unless a drop was counted, so the deterministic tour is
+        // unaffected.
+        r.report_drops();
     }
 }
