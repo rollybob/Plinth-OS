@@ -57,7 +57,9 @@ const ENTRIES: u64 = 16;
 
 /// Capacity of the reaped-completion table: at most `ENTRIES` can be in flight,
 /// so this never overflows while the consumer keeps up (it polls after each
-/// reap).
+/// reap). When it does -- a burst larger than `CAP` reaped before the consumer
+/// polls -- the excess completions are counted as `Reactor::undelivered` and
+/// voiced on serial, rather than silently dropped.
 const CAP: usize = ENTRIES as usize;
 
 /// SQ/CQ frames, just below libplinth's shim frames (MAP_END-1/-2 pages) so a
@@ -133,10 +135,19 @@ struct Reactor {
     /// `events_dropped()` -- the reason input loss is a reported number rather
     /// than a silent stall.
     drops: u32,
-    /// The value of `drops` last announced on serial by `report_drops`. Lets the
+    /// Completions reaped from the CQ but discarded because the `done` table was
+    /// full -- a *second*, distinct loss from `drops`. `drops` is the kernel
+    /// dropping input before the libOS ever saw it (the CQ overran); this is the
+    /// libOS reaping a completion and then having nowhere to stage it (the reactor
+    /// table overran). It is the loss the refuted K-027 `done`-table hypothesis
+    /// was about, and it is silent no longer. Read via `undelivered()`.
+    undelivered: u32,
+    /// The value of `drops` last announced on serial by `report_losses`. Lets the
     /// executor emit one line per new drop burst rather than repeating the total
     /// on every wake.
-    reported: u32,
+    reported_drops: u32,
+    /// The same, for `undelivered` -- one line per new reactor-table overrun.
+    reported_undelivered: u32,
 }
 
 static mut REACTOR: Reactor = Reactor {
@@ -146,7 +157,9 @@ static mut REACTOR: Reactor = Reactor {
     done: [(0, 0); CAP],
     done_len: 0,
     drops: 0,
-    reported: 0,
+    undelivered: 0,
+    reported_drops: 0,
+    reported_undelivered: 0,
 };
 
 /// Access the per-process reactor. SAFETY: a user process is single-threaded
@@ -211,33 +224,54 @@ impl Reactor {
                 if self.done_len < CAP {
                     self.done[self.done_len] = (ud, status);
                     self.done_len += 1;
+                } else {
+                    // The staging table is full, so this completion -- already
+                    // reaped from the CQ, whose head advances below regardless --
+                    // has nowhere to go and is lost here, in the libOS, not the
+                    // kernel. Count it as a distinct loss from `drops`. This is the
+                    // refuted K-027 trigger; counting it, not fixing it (delivery
+                    // is unchanged), makes the second silent-loss site a number.
+                    self.undelivered = self.undelivered.saturating_add(1);
                 }
                 w32(CQ_VA + HDR_HEAD, head.wrapping_add(1));
             }
         }
     }
 
-    /// Announce on serial any drop bursts counted since the last announcement,
-    /// and mark them announced. Called from `block_on` after each reap, so input
-    /// loss surfaces the instant the kernel reports it -- crucially even while a
-    /// consumer is parked awaiting one stream and the drops are landing on
-    /// another. That is the view-loop hang the K-027 investigation hit: the shell
-    /// blocks in `block_on(kbd.next())`, a mouse flood overruns the shared CQ and
-    /// swallows the keystroke, and every wake reaps mouse events carrying the drop
-    /// flag while `kbd.next()` stays Pending and never returns to the caller. A
-    /// caller-side poll cannot see that; this can, because it runs inside the
-    /// blocking loop. Silent when nothing was dropped, so a reader that keeps up
-    /// -- every deterministic demo and the scripted tour -- prints nothing and the
-    /// smoke transcript is unchanged.
+    /// Announce on serial any loss counted since the last announcement, and mark
+    /// it announced. Called from `block_on` after each reap, so loss surfaces the
+    /// instant it happens -- crucially even while a consumer is parked awaiting one
+    /// stream and the loss is landing on another. That is the view-loop hang the
+    /// K-027 investigation hit: the shell blocks in `block_on(kbd.next())`, a mouse
+    /// flood overruns the shared CQ and swallows the keystroke, and every wake
+    /// reaps mouse events while `kbd.next()` stays Pending and never returns to the
+    /// caller. A caller-side poll cannot see that; this can, because it runs inside
+    /// the blocking loop.
     ///
-    /// This is reference-executor policy, not mechanism: a real library OS may
-    /// route the signal to a log, a counter, or a UI instead of serial. What the
-    /// kernel guarantees is the count; where it is voiced is the tenant's choice.
-    fn report_drops(&mut self) {
-        if self.drops != self.reported {
-            self.reported = self.drops;
+    /// Two distinct losses, each with its own line and its own shadow counter so a
+    /// new occurrence of either is announced exactly once:
+    ///   - `drops`: the kernel dropped input on a full CQ before the libOS saw it
+    ///     (`EVENT_DROPPED`).
+    ///   - `undelivered`: the libOS reaped a completion but its staging table was
+    ///     full, so it discarded it. The refuted-as-trigger K-027 site.
+    ///
+    /// Silent when nothing was lost, so a reader that keeps up -- every
+    /// deterministic demo and the scripted tour -- prints nothing and the smoke
+    /// transcript is unchanged. This is reference-executor policy, not mechanism: a
+    /// real library OS may route these to a log, a counter, or a UI instead of
+    /// serial. What the kernel guarantees is the counts; where they are voiced is
+    /// the tenant's choice.
+    fn report_losses(&mut self) {
+        if self.drops != self.reported_drops {
+            self.reported_drops = self.drops;
             sys_write(b"libos: input dropped on a full queue, bursts ");
             write_dec(self.drops as u64);
+            sys_write(b"\n");
+        }
+        if self.undelivered != self.reported_undelivered {
+            self.reported_undelivered = self.undelivered;
+            sys_write(b"libos: completion discarded, reactor table full, total ");
+            write_dec(self.undelivered as u64);
             sys_write(b"\n");
         }
     }
@@ -277,6 +311,16 @@ pub fn init() -> bool {
 /// exact per-subscription tally would need a kernel query.
 pub fn events_dropped() -> u32 {
     reactor().drops
+}
+
+/// How many completions this reactor has reaped from the CQ but discarded because
+/// its staging table (`done`, CAP entries) was full -- loss inside the libOS, as
+/// distinct from `events_dropped()` (loss inside the kernel). Nonzero only when a
+/// burst larger than the table arrives before the consumer polls, which is the
+/// refuted-as-trigger K-027 site; zero for a reader that keeps up. `block_on`
+/// already voices each new overrun on serial; this is the same number as a value.
+pub fn undelivered() -> u32 {
+    reactor().undelivered
 }
 
 /// Push one block I/O submission entry into the SQ at its tail (the kernel
@@ -739,11 +783,11 @@ pub fn block_on<F: Future + Unpin>(mut fut: F) -> F::Output {
         let _ = sys_ring_wait(handle);
         let r = reactor();
         r.reap();
-        // Voice any input the kernel dropped on a full CQ before re-polling. Runs
-        // inside the blocking loop deliberately: a stream the caller is not
-        // draining (a mouse flood behind a keyboard wait) surfaces here or not at
-        // all. No-op unless a drop was counted, so the deterministic tour is
-        // unaffected.
-        r.report_drops();
+        // Voice any loss counted during the reap before re-polling -- both the
+        // kernel's CQ drops and the reactor's own table overruns. Runs inside the
+        // blocking loop deliberately: a stream the caller is not draining (a mouse
+        // flood behind a keyboard wait) surfaces here or not at all. No-op unless
+        // something was lost, so the deterministic tour is unaffected.
+        r.report_losses();
     }
 }
