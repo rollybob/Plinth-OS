@@ -305,7 +305,7 @@ plinth: evt demo: all done
 # subscription. Frame counts around the demo must match (check_frames_baseline).
 plinth: evtstream demo: 1 processes
 evtstream: start
-evtstream: ok (4 events in order)
+evtstream: ok (4 events in order, 0 dropped)
 plinth: evtstream demo: all done
 
 # Phase 2 console input (Stage 3): a line read through a library OS. kbd-user
@@ -581,7 +581,7 @@ shell: start
 # through the whole v2.8 bump with all tests green. Pinning it here is what makes
 # that drift impossible rather than merely unlikely. Update on every ABI bump;
 # if this line and libplinth::ABI_VERSION ever disagree, one of them is a lie.
-shell: VERSION 2.10
+shell: VERSION 2.11
 shell: splash hash 0x549089847b362325
 shell: home hash 0x4b82ddae83e366a5
 # The pointer is parked on the centre of the selected icon at startup, so it

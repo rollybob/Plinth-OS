@@ -663,6 +663,29 @@ pub fn any_event_sub() -> bool {
     subs.any()
 }
 
+/// Query the sticky dropped-event count for the subscription named by
+/// (`ring_slot`, `user_data`) -- the exact per-subscription tally the kernel keeps
+/// behind the `EVENT_DROPPED` flag (S5). The flag rides the next admitted
+/// completion and says only "you missed something"; this reads the magnitude
+/// directly, and works even while the CQ is jammed full and no completion is
+/// riding out to carry the flag (the persistent-overflow case the flag alone
+/// cannot surface). Owner-scoped through `ring_id_for`, so a handle another
+/// process does not own is refused. Returns the count, or `ERR` when the ring
+/// does not resolve or carries no such live subscription -- which distinguishes
+/// "no drops" (0) from "no such subscription" (ERR). Read-only: it neither clears
+/// the count nor touches the flag, so polling it never perturbs delivery.
+pub fn dropped_for(ring_slot: u64, user_data: u64) -> u64 {
+    let Some(id) = ring_id_for(ring_slot) else {
+        return ERR;
+    };
+    // SAFETY: single CPU, IF=0 under the BKL; SUBSCRIPTIONS as elsewhere.
+    let subs = unsafe { &*addr_of_mut!(SUBSCRIPTIONS) };
+    match subs.dropped(id, user_data) {
+        Some(n) => n as u64,
+        None => ERR,
+    }
+}
+
 /// Subscription pool size (S8): a few subscriptions per ring -- one ring may
 /// subscribe several sources at once (keyboard, later a mouse, ...). A small
 /// fixed pool, scaled to `MAX_RINGS`, matching the endpoint/ring pool style.
@@ -773,9 +796,9 @@ impl Subscriptions {
     }
 
     /// The sticky dropped-event count for `(ring, user_data)`, if live -- the
-    /// backpressure signal behind `EVENT_DROPPED`. Drives the routing tests now;
-    /// a `dropped`-query path may surface it to the libOS later.
-    #[allow(dead_code)]
+    /// backpressure signal behind `EVENT_DROPPED`. Read by the routing tests and,
+    /// since ABI v2.11, by the `ring_dropped` syscall (`dropped_for`) that surfaces
+    /// the exact count to the libOS.
     pub(crate) fn dropped(&self, ring: usize, user_data: u64) -> Option<u32> {
         self.find(ring, user_data).map(|i| self.subs[i].unwrap().dropped)
     }

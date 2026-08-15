@@ -3,7 +3,7 @@
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
 follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
-current contract is **v2.10**. v2 added IPC and revised `spawn`, breaking v1 --
+current contract is **v2.11**. v2 added IPC and revised `spawn`, breaking v1 --
 the one incompatible ABI change so far; v2.1 added `spawn_from_buffer` (the
 load-from-disk path), v2.2 added console input (`event_recv` + `EventSource`),
 both additive over v2; v2.3 moved `block_read` to the `int 0x80` gate so it can
@@ -20,12 +20,34 @@ capability *back* -- and retires `frame_free` (nr 5) into it; v2.9 returns a len
 `Framebuffer` to whoever lent it when the borrower dies, and lets a death-wake
 carry the landing slot; v2.10 makes that landing slot **predictable in advance**
 by reserving the slot a capability was lent from, so it comes home to where it
-left. This paragraph said "v2.8" through both of those bumps -- the same drift
-the splash hit at v2.7, caught here on 2026-08-13.
+left; v2.11 makes the per-subscription dropped-event count readable with the
+`ring_dropped` syscall (nr 16), so input lost to a full completion queue is a
+number a consumer can read rather than a silent gap. This paragraph said "v2.8"
+through the v2.9 and v2.10 bumps -- the same drift the splash hit at v2.7, caught
+here on 2026-08-13.
 
 ## [Unreleased]
 
 ### Added
+- **The dropped-event count is readable (ABI v2.11).** The kernel has kept a
+  sticky per-subscription count of input dropped on a full completion queue since
+  the event-ring milestone (v2.5), and surfaced a drop *flag* on the next admitted
+  completion -- but no consumer could read either. The reference executor masked
+  the flag off and threw it away, so a keystroke lost to a full CQ was
+  indistinguishable from a dead key, which is the shape a mouse-flood hang
+  investigation spent an evening on.
+
+  Two additions make the loss a number. The `libos` reactor now tallies the flag
+  as it reaps and voices each new drop burst on serial from inside its blocking
+  loop, so loss surfaces the instant it happens even while a consumer is parked on
+  a different stream. And a new read-only `ring_dropped` syscall (nr 16) returns
+  the exact per-subscription count on demand -- the magnitude, not just the fact,
+  and readable even while the CQ is jammed full and no completion is riding out to
+  carry the flag. Both are silent when nothing is dropped, so the deterministic
+  boot is byte-identical but for the version line; `evtstream-user` now asserts
+  its own count is zero, exercising the query end to end. Purely additive: the
+  flag is unchanged and reading the count neither clears it nor perturbs delivery.
+
 - **A lent capability comes home to the slot it left from (ABI v2.10).** v2.9
   made a lent framebuffer come back when its borrower died; it did not make the
   lender able to find it. The kernel picked a slot and then tried to say which

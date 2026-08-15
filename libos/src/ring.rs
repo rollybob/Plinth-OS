@@ -46,8 +46,8 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use libplinth::{
-    sys_frame_alloc, sys_frame_map, sys_ring_register, sys_ring_submit, sys_ring_wait, sys_write,
-    write_dec, MAP_END, PAGE_SIZE, SYS_ERR,
+    sys_frame_alloc, sys_frame_map, sys_ring_dropped, sys_ring_register, sys_ring_submit,
+    sys_ring_wait, sys_write, write_dec, MAP_END, PAGE_SIZE, SYS_ERR,
 };
 
 /// Ring depth: a power of two that fits one frame and exceeds any realistic
@@ -468,6 +468,25 @@ impl EventStream {
             let handle = reactor().handle;
             let _ = sys_ring_submit(handle);
             self.armed = false;
+        }
+    }
+
+    /// The kernel's exact count of events dropped on THIS subscription's full CQ
+    /// since it was armed (ABI v2.11, `sys_ring_dropped`) -- read straight from
+    /// the kernel rather than inferred from the drop flag. Unlike the reactor-wide
+    /// `events_dropped()`, which counts flag bursts seen across every stream, this
+    /// is the precise number for this stream's cookie, and it is readable even
+    /// while the CQ is jammed and no completion is riding out to carry the flag.
+    /// Zero on a stream that has never overrun; also zero for a stream not yet
+    /// armed or already cancelled (the kernel has no subscription to count, which
+    /// it reports as `SYS_ERR` and this folds to 0 -- "nothing dropped" either
+    /// way).
+    pub fn dropped(&self) -> u32 {
+        let n = sys_ring_dropped(reactor().handle, self.ud);
+        if n == SYS_ERR {
+            0
+        } else {
+            n as u32
         }
     }
 }

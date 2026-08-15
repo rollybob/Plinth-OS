@@ -22,6 +22,7 @@
 //! | 13 | ring_submit | ring         | count posted, or SYS_ERR |
 //! | 14 | fb_map      | slot, va, info_ptr | 0, or SYS_ERR       |
 //! | 15 | cap_release | slot         | 0, or SYS_ERR            |
+//! | 16 | ring_dropped| ring, user_data | drop count, or SYS_ERR |
 //!
 //! Block I/O is the async-ring ABI (nr 12/13 + `ring_wait` on the `int 0x80`
 //! gate, op 6); `sys_block_read` is a single-in-flight shim over it. The old
@@ -44,7 +45,7 @@ pub const SYS_ERR: u64 = u64::MAX;
 /// version on screen cannot drift from the contract the binary was built
 /// against. It drifted exactly once, when the shell splash kept saying 2.7
 /// through the v2.8 bump.
-pub const ABI_VERSION: &[u8] = b"2.10";
+pub const ABI_VERSION: &[u8] = b"2.11";
 
 /// frame_map only accepts virtual addresses in [MAP_BASE, MAP_END),
 /// page-aligned. Mirrors the kernel's user mapping window.
@@ -388,6 +389,17 @@ pub fn sys_ring_wait(ring: u64) -> u64 {
         );
     }
     ret
+}
+
+/// ring_dropped(ring, user_data): the exact count of events the kernel has
+/// dropped on this subscription's full CQ since it was armed (ABI v2.11) -- the
+/// per-subscription tally behind the `EVENT_DROPPED` flag. Non-blocking and
+/// read-only: it neither clears the count nor perturbs delivery, so a caller may
+/// poll it. Returns the count, or SYS_ERR when the ring handle does not resolve
+/// or names no live subscription under `user_data`.
+#[inline]
+pub fn sys_ring_dropped(ring: u64, user_data: u64) -> u64 {
+    syscall3(16, ring, user_data, 0)
 }
 
 // --- Block storage: the single-in-flight ring shim --------------------------
@@ -768,7 +780,11 @@ const RING_OP_CANCEL: u32 = 2;
 
 /// Drop-flag bit in an event completion's status (event_rings.md s5): set when
 /// the kernel dropped events on a full CQ. The shim reaps one event at a time so
-/// it never overflows, but it masks the flag off defensively before returning.
+/// its own CQ rarely overflows, but the kernel can still drop when a burst
+/// arrives between two `sys_event_recv` calls. Rather than mask the flag off and
+/// forget it (which is what left input loss silent here), the shim now tallies it
+/// into `EVT_DROPS` -- read via `event_drops()` -- before masking it off the
+/// event word it returns.
 const EVT_DROPPED: u32 = 1 << 31;
 
 /// The event ring is tiny -- one subscription, one event reaped at a time -- so
@@ -791,6 +807,13 @@ const EVT_COOKIE: u64 = 1;
 /// are touched without races.
 static mut EVT_RING: u64 = SYS_ERR;
 static mut EVT_SUB_SOURCE: u64 = SYS_ERR;
+
+/// Running count of events the kernel reported dropped on this shim's event ring
+/// (the `EVT_DROPPED` flag, summed across `sys_event_recv` calls). Read via
+/// `event_drops()`. The shim's own single-subscription depth-4 ring rarely
+/// overruns, but when the kernel does drop, the flag used to be masked off and
+/// lost; this keeps it.
+static mut EVT_DROPS: u32 = 0;
 
 /// Set up the event ring once: allocate + map an SQ and a CQ frame, register
 /// them, and cache the handle. Returns the handle, or SYS_ERR on any failure.
@@ -891,6 +914,12 @@ pub fn sys_event_recv(source_slot: u64) -> (u64, u64) {
                     EVT_SUB_SOURCE = SYS_ERR;
                     return (EVENT_ERR, 0);
                 }
+                // Tally the kernel's drop flag before masking it off, so input
+                // lost to a full CQ is a number (event_drops()) rather than the
+                // silently-discarded bit it used to be.
+                if status & EVT_DROPPED != 0 {
+                    EVT_DROPS = EVT_DROPS.saturating_add(1);
+                }
                 return (EVENT_OK, (status & !EVT_DROPPED) as u64);
             }
             if sys_ring_wait(handle) == SYS_ERR {
@@ -898,6 +927,18 @@ pub fn sys_event_recv(source_slot: u64) -> (u64, u64) {
             }
         }
     }
+}
+
+/// How many events the kernel has reported dropped on the blocking-shim event
+/// ring since the process started (event_rings.md s5) -- the `EVENT_DROPPED` flag
+/// this shim used to mask off and forget, kept as a count. Zero on a reader that
+/// keeps up. For the shim path (`sys_event_recv`, libinput); the ring reactor has
+/// its own `libos::ring::events_dropped`, and the exact per-subscription count is
+/// `sys_ring_dropped`.
+#[inline]
+pub fn event_drops() -> u32 {
+    // SAFETY: single-threaded user process; the static has one writer/reader.
+    unsafe { EVT_DROPS }
 }
 
 /// Unpack a packed event's kind. For a key event this is `EVENT_KEY`.

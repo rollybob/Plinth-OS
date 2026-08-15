@@ -1,4 +1,4 @@
-# Plinth ABI v2.10
+# Plinth ABI v2.11
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -138,6 +138,28 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   multiplexes the raw region and never touches a pixel -- fonts, layout, and
   compositing are library-OS policy (`libgfx`), exactly as keymaps and on-disk
   formats are. Purely additive: no existing call changed.
+
+### v2.11 (the dropped-event count becomes readable)
+
+- **New: `ring_dropped` syscall (nr 16).** `ring_dropped(ring, user_data)` returns
+  the exact number of events the kernel has dropped on that subscription's full CQ
+  since it was armed -- the sticky per-subscription counter that has existed behind
+  the `EVENT_DROPPED` flag since v2.5 and that nothing could read. Non-blocking,
+  read-only, on the `syscall` fast path; owner-scoped like every ring op, so a
+  handle another process does not own is refused. Returns `SYS_ERR` when the ring
+  does not resolve or names no live subscription under `user_data`, which
+  distinguishes "no drops" (0) from "no such subscription".
+- **Why the flag was not enough.** The flag is set on the *next admitted*
+  completion after a drop, so it says "you missed something" and rides out in-band
+  -- but only if a completion rides out at all. While a CQ stays jammed full the
+  flag never surfaces, and a consumer parked on one stream cannot see drops landing
+  on another it is not draining. A direct query answers both cases: it reports the
+  magnitude, not just the fact, and it works when nothing is moving. This is the
+  signal that turns a silently dead key into a number.
+- **Purely additive.** No existing call changes. The flag still behaves exactly as
+  in v2.5; reading the count neither clears it nor perturbs delivery, so a poll is
+  side-effect-free. The bump is because the syscall table grew, not because any
+  behaviour moved -- the mildest possible version step.
 
 ### v2.10 (a lent capability comes home to the slot it left from)
 
@@ -319,6 +341,7 @@ The non-blocking calls use the `syscall`/`sysretq` instructions:
 | 13 | ring_submit  | ring                  | entries consumed, or `SYS_ERR`   |
 | 14 | fb_map       | slot, va, info_ptr    | 0, or `SYS_ERR`                  |
 | 15 | cap_release  | slot                  | 0, or `SYS_ERR`                  |
+| 16 | ring_dropped | ring, user_data       | drop count, or `SYS_ERR`         |
 
 (Nr 10, `block_read`, was retired in v2.3 -- moved to the `int 0x80` gate --
 and that gate op was itself retired in v2.4: block I/O is the ring ABI. The

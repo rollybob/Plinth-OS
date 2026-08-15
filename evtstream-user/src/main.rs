@@ -53,6 +53,16 @@ pub extern "C" fn _start(_id: u64) -> ! {
         }
     }
 
+    // Query the kernel's exact per-subscription dropped count (ABI v2.11) while
+    // the subscription is still live -- the signal that used to exist only inside
+    // the kernel. A clean scripted run overruns nothing, so it must read 0; this
+    // asserts that AND exercises the ring_dropped query path end to end (a
+    // resolved live subscription returning a real count, not SYS_ERR).
+    let dropped = stream.dropped();
+    if dropped != 0 {
+        ok = false;
+    }
+
     // Cancel the live subscription: posts RING_OP_CANCEL, exercising the cancel
     // dispatch end to end. Process teardown would drop the subscription anyway,
     // but a long-lived reader that is done with a source cancels it explicitly.
@@ -61,7 +71,9 @@ pub extern "C" fn _start(_id: u64) -> ! {
     if ok {
         sys_write(b"evtstream: ok (");
         write_dec(SEQUENCE.len() as u64);
-        sys_write(b" events in order)\n");
+        sys_write(b" events in order, ");
+        write_dec(dropped as u64);
+        sys_write(b" dropped)\n");
         sys_exit(0);
     } else {
         sys_write(b"evtstream: FAIL\n");

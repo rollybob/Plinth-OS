@@ -15,6 +15,7 @@
 //! | 13 | ring_submit | ring                | count posted, or ERR     |
 //! | 14 | fb_map      | slot, va, info_ptr  | 0, or ERR                |
 //! | 15 | cap_release | slot                | 0, or ERR                |
+//! | 16 | ring_dropped| ring, user_data     | drop count, or ERR       |
 //!
 //! Nr 5 (frame_free) was retired in ABI v2.8: `cap_release` generalises it to
 //! every capability kind, and a frame release is exactly what it used to do.
@@ -201,6 +202,11 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         13 => crate::rings::ring_submit(a1),
         14 => sys_fb_map(a1, a2, a3),
         15 => sys_cap_release(a1),
+        // Read the sticky per-subscription dropped-event count (ABI v2.11). A
+        // non-blocking, read-only query, so it rides the fast syscall path like
+        // register/submit; owner-scoping and the subscription lookup live in
+        // rings::dropped_for.
+        16 => crate::rings::dropped_for(a1, a2),
         _ => ERR,
     };
     unsafe { bkl::release() };
