@@ -201,7 +201,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // framebuffer, so the reclamation demo can prove the capability comes
         // home -- Design/cap_reclaim.md D6; fbreclaim-user mirrors this id as
         // FBRECLAIMCHILD_ID, and spawnwaitcap-user reuses the same child rather
-        // than shipping a near-copy of it).
+        // than shipping a near-copy of it), id 6 = fbreleasechild (the child that
+        // VOLUNTARILY RELEASES a transferred framebuffer with cap_release rather
+        // than faulting, so the cap_release-on-reserved demo can prove a polite
+        // return comes home to the lender's reserved slot -- fbrelease-user
+        // mirrors this id as FBRELEASECHILD_ID).
         //
         // Ids are positional, so appending is safe but INSERTING is not: every
         // id after the insertion point shifts and the mirrored constants in the
@@ -213,6 +217,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             include_bytes!(concat!(env!("OUT_DIR"), "/shellapp-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/quietworker-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/fbreclaimchild-user")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/fbreleasechild-user")),
         ];
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
@@ -1047,6 +1052,44 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let _ = writeln!(
                     serial,
                     "plinth: {} endpoints free after spawnwaitcap",
+                    free_endpoints()
+                );
+            }
+
+            // Framebuffer VOLUNTARY RELEASE (cap_release-on-reserved, ruled
+            // 2026-08-15) -- the polite counterpart to fbreclaim above. Where
+            // fbreclaim proves a lent screen survives the borrower's DEATH, this
+            // proves it comes home when the borrower politely RELEASES it.
+            // fbrelease-user is granted the whole screen, draws and hashes a frame,
+            // TRANSFERS the capability to a child that releases it with cap_release
+            // (not a fault, not an IPC transfer-back), and then draws and hashes a
+            // second frame through the capability that came home to the reserved
+            // slot it lent from. On the pre-ruling kernel the release unmapped and
+            // dropped the capability, so the reserved slot was stranded and the
+            // second map was unreachable -- which makes this, like fbreclaim, a
+            // regression test rather than a demonstration. Frame and endpoint
+            // brackets for the same D7/leak reasons as spawnwaitcap.
+            if let Some(fbobj) = framebuffer::framebuffer_cap() {
+                const FBRELEASE_BIN: &[u8] =
+                    include_bytes!(concat!(env!("OUT_DIR"), "/fbrelease-user"));
+                let before_rel = free_frames();
+                let _ = writeln!(serial, "plinth: {before_rel} frames free before fbrelease");
+                let _ = writeln!(
+                    serial,
+                    "plinth: {} endpoints free before fbrelease",
+                    free_endpoints()
+                );
+                let fbcap = Capability {
+                    object: fbobj,
+                    rights: capability::RIGHT_MAP | capability::RIGHT_WRITE,
+                    origin: None,
+                };
+                scheduler::run("fbrelease demo", &[FBRELEASE_BIN], phys_offset, &[Some(fbcap)]);
+                let after_rel = free_frames();
+                let _ = writeln!(serial, "plinth: {after_rel} frames free after fbrelease");
+                let _ = writeln!(
+                    serial,
+                    "plinth: {} endpoints free after fbrelease",
                     free_endpoints()
                 );
             }

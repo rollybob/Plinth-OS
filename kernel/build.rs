@@ -18,7 +18,8 @@ const USER_BINARIES: &[&str] = &[
     "hello", "bump", "list", "crash", "greedy", "lazy", "spawner", "grantee", "spin", "pingpong",
     "share", "rpc", "faultchild", "blk", "asyncblk", "blkwrite", "fsdemo", "evt", "evtstream",
     "unified", "kbd", "mouse", "rwfs", "stealer", "stealwork", "gfx", "gfxtext",
-    "gfxsplit", "gfxbound", "gfxrevoke", "fbreclaim", "fbreclaimchild", "shell", "shellapp",
+    "gfxsplit", "gfxbound", "gfxrevoke", "fbreclaim", "fbreclaimchild", "fbrelease",
+    "fbreleasechild", "shell", "shellapp",
     "caprelease", "quietworker", "spawnwaitcap",
 ];
 

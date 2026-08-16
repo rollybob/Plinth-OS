@@ -59,7 +59,8 @@ const USER_CRATES: &[&str] = &[
     "evtstream", "unified", "kbd", "mouse", "rwfs", "stealer", "stealwork", "gfx", "gfxtext",
     "gfxsplit", "gfxbound", "gfxrevoke",
     "fbreclaim",
-    "fbreclaimchild", "shell", "shellapp", "caprelease", "quietworker",
+    "fbreclaimchild", "fbrelease", "fbreleasechild", "shell", "shellapp", "caprelease",
+    "quietworker",
     "spawnwaitcap",
     "template", "bench",
 ];
@@ -1312,6 +1313,14 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     // extra function for it.
     check_frames_baseline(&actual, "spawnwaitcap");
     check_endpoints_baseline(&actual, "spawnwaitcap");
+    // The voluntary-release counterpart to fbreclaim (cap_release-on-reserved). Same
+    // D7 hazard on the frame baseline; the endpoint baseline brackets the spawn the
+    // lender does to hand the screen to the releasing child. The proof that the
+    // screen actually came home on release is the two differing hashes in the boot
+    // log (unreachable on the pre-ruling kernel, which dropped the released cap and
+    // stranded the reserved slot) -- these only say nothing leaked doing it.
+    check_frames_baseline(&actual, "fbrelease");
+    check_endpoints_baseline(&actual, "fbrelease");
     check_frames_baseline(&actual, "shell");
 }
 

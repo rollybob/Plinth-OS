@@ -555,19 +555,38 @@ fn sys_cap_release(slot: u64) -> u64 {
         capability::ReleaseAction::UnmapFramebuffer => {
             process::unmap_fb_for_slot(proc, slot as usize);
         }
-        // A *voluntary* release of a borrowed framebuffer is treated exactly
-        // like releasing an owned one: unmap, and the capability is gone.
+        // A *voluntary* release of a BORROWED framebuffer sends it home to its
+        // lender's reserved slot -- the same reclamation a death runs
+        // (`scheduler::reclaim_cap_home`) -- rather than unmapping and dropping
+        // it. Ruled 2026-08-15 (cap_release-on-reserved). The old behaviour treated
+        // this arm as plain `UnmapFramebuffer`, which stranded the lender's
+        // reserved slot and bricked the borrowed screen precisely when a borrower
+        // was well-behaved: a crash returned the screen (via death reclamation), a
+        // polite release did not. That asymmetry was backwards, and the stranded
+        // reservation is the same "green but leaking" class the slice-2 fix closed
+        // on the IPC path -- here reached through the `release` verb.
         //
-        // This is deliberate, not an oversight, and it is the same asymmetry
-        // `Refuse` already has -- teardown reads that as "just drop" while this
-        // syscall reads it as an error. Reclamation was ruled for a holder that
-        // *dies* (Design/cap_reclaim.md), and sending a borrowed screen home on
-        // a voluntary release would change this syscall's observable behaviour,
-        // which the ruling did not sanction. Worth revisiting: an app that
-        // politely releases the screen instead of transferring it back still
-        // bricks the display, which is arguably the same bug D1 set out to fix.
-        capability::ReleaseAction::ReclaimTo { .. } => {
+        // The borrower's own mapping still comes down first: the authority is
+        // leaving it. Then the capability goes home with its origin cleared.
+        capability::ReleaseAction::ReclaimTo { origin } => {
             process::unmap_fb_for_slot(proc, slot as usize);
+            // `home` is `cap` with its origin cleared -- the lender owns it
+            // outright again. `reclaim_target` builds it through the single
+            // homecoming rule (`lent_to`); `current_slot()` is the releaser's own
+            // table slot, which that rule takes but does not read (the origin
+            // already names the destination). It always returns `Some` here --
+            // `release_action` just said `ReclaimTo` -- so the fallback is inert.
+            let home = match capability::reclaim_target(&cap, scheduler::current_slot()) {
+                Some((_, home)) => home,
+                None => cap,
+            };
+            // Safe while holding the current-process guard: the lender is a
+            // different process (a cap's origin names who lent it, never its
+            // holder), so `with_lender_caps` reaches TABLE or another core's
+            // CURRENT, never this core's. LenderFull / NoLender leave the
+            // now-revoked, now-unmapped capability to cease to exist -- the same
+            // D4 fallback a death takes, identical to the old drop for those cases.
+            let _ = scheduler::reclaim_cap_home(&cap, origin, home);
         }
         // Nothing pooled.
         capability::ReleaseAction::DropSlot => {}

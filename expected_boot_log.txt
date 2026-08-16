@@ -529,6 +529,32 @@ spawnwaitcap: reclaimed hash 0x10bdf158afe53b64
 spawnwaitcap: 20 handle round-trips, slots reused
 plinth: spawnwaitcap demo: all done
 
+# Framebuffer VOLUNTARY RELEASE (cap_release-on-reserved, ruled 2026-08-15) -- the
+# polite counterpart to fbreclaim above. fbreclaim proves a lent screen survives the
+# borrower's DEATH; this proves it comes home when the borrower politely RELEASES it
+# with cap_release. fbrelease-user draws and hashes a frame, TRANSFERS the screen to
+# a child that releases it (not a fault, not an IPC transfer-back), and then re-maps
+# the very slot it lent from -- which the reservation held open -- and hashes a second
+# frame. The child's "released the screen" line comes after a real draw through its
+# mapping, so it demonstrably had the screen. The two hashes match fbreclaim's byte
+# for byte (identical paint), and DIFFER from each other, so a stale mapping cannot
+# masquerade as the returned one.
+#
+# On the pre-ruling kernel the second hash is unreachable, not merely different: a
+# voluntary release unmapped and DROPPED the borrowed capability, so the lender's
+# reserved slot was stranded empty and the re-map failed -- a crashing borrower
+# returned the screen while a well-behaved one did not. That is the regression this
+# guards, the same "green but leaking reserved slot" class the slice-2 fix closed,
+# reached through the release verb. Frames and endpoints are bracketed (no leak):
+# reclamation must never route a framebuffer through the Frame arm (D7).
+plinth: fbrelease demo: 1 processes
+fbrelease: lent hash 0xf10a511b535ec044
+fbreleasechild: holding the screen, now releasing
+fbreleasechild: released the screen, exiting
+fbrelease: child released the screen
+fbrelease: returned hash 0xd12799246c3d6e04
+plinth: fbrelease demo: all done
+
 # Visual userspace skin (D8, Design/display_skin.md) -- the finale: a shell with a
 # splash, a home screen of app icons, arrow-key navigation and a MOUSE POINTER,
 # all library-OS policy over the whole-screen Framebuffer (slot 1), the keyboard

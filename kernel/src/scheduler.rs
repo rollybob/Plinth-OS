@@ -1433,6 +1433,72 @@ pub fn install_into_blocked(slot: usize, cap: Capability) -> Option<usize> {
     }
 }
 
+/// Where a reclaimed capability ended up. The caller decides what a full or
+/// absent lender means, because that differs between a death (the death-wake
+/// must carry the landing slot) and a voluntary `cap_release` (nobody is
+/// waiting): keeping the interpretation out of `reclaim_cap_home` is what lets
+/// both callers share it.
+pub enum ReclaimHome {
+    /// Landed in the lender's table at this slot.
+    Landed(usize),
+    /// The lender's 16 slots are all full, so the capability dies as it would
+    /// have anyway. A hazard the lender controls (v2.8 `cap_release` is how it
+    /// makes room), not a trap -- D4's second fallback.
+    LenderFull,
+    /// No live process at the lender's slot. Supposed to be unreachable: a dead
+    /// lender's exit sweeps the origin to `None` (`clear_origins_naming`), so
+    /// `release_action` would never have said `ReclaimTo`. Kept DISTINCT from
+    /// LenderFull because the two were briefly indistinguishable and that is
+    /// exactly how the SMP-reach bug hid -- a lookup that missed a running lender
+    /// destroyed the capability and looked like a full table.
+    NoLender,
+}
+
+/// Send one borrowed reclaimable capability home to its lender, honouring the
+/// homecoming reservation and accounting the move. **The single place the
+/// where-does-a-returning-capability-land rule lives (I7)** -- shared by
+/// death-time reclamation (`reclaim_lent_caps`) and voluntary `cap_release`
+/// (`syscall::sys_cap_release`), so a fix or a fallback cannot be taught to one
+/// path and not the other, which is the class of bug this whole milestone kept
+/// hitting (K-025, the cooperative-hand-back strand).
+///
+/// Home to the slot the capability left from if that slot is still reserved for
+/// it (`lender_owed.md` D2(D)); the fallback to `reclaim` (first free) is what
+/// every lend did before reservation existed. As of 2026-08-13 every lend path
+/// reserves, so a reclaimable capability should always find its slot held open
+/// and the fallback should be unreachable for one -- it is kept rather than
+/// asserted because `reclaim_to` also refuses a slot that is somehow occupied,
+/// and losing the screen is a worse failure than returning it somewhere the
+/// lender must be told about.
+///
+/// Reached through `with_lender_caps`, not `TABLE` directly: a RUNNING lender
+/// has had its `Process` moved out of its slot into the per-core `CURRENT`, so a
+/// `TABLE`-only lookup finds nothing (the SMP-reach bug).
+pub fn reclaim_cap_home(cap: &Capability, origin: capability::Origin, home: Capability) -> ReclaimHome {
+    let lender = origin.lender();
+    let home_slot = origin.home();
+    match with_lender_caps(lender, |caps| {
+        caps.reclaim_to(home_slot, home).or_else(|| caps.reclaim(home))
+    }) {
+        Some(Some(landing)) => {
+            // Account it as the MOVE it is: the holder loses the capability and
+            // the lender gains it, so both halves are needed and net to zero.
+            // `false` (do not free-at-zero) is right because the count dips
+            // transiently between the two calls and the endpoint must not be
+            // freed out from under an in-flight move. Both halves are no-ops for
+            // a `Framebuffer` (D2's whole scope today); the removal is what will
+            // matter if scope ever widens to a refcounted kind, because a
+            // reclaimed capability lands in a caller's `ReclaimTo` arm, which
+            // does not account the departure.
+            ipc::note_cap_removed(cap, false);
+            ipc::note_cap_added(&home);
+            ReclaimHome::Landed(landing)
+        }
+        Some(None) => ReclaimHome::LenderFull,
+        None => ReclaimHome::NoLender,
+    }
+}
+
 /// Return every capability the dying process at `dying_slot` borrowed to the
 /// process that lent it (Design/cap_reclaim.md D1).
 ///
@@ -1461,77 +1527,25 @@ fn reclaim_lent_caps(dying: &CapTable, dying_slot: usize) {
             continue;
         };
         let lender = origin.lender();
-        let home_slot = origin.home();
-        // Through `with_lender_caps`, not `TABLE` directly: a RUNNING lender has
-        // had its `Process` moved out of its slot into the per-core `CURRENT`, so
-        // a `TABLE`-only lookup finds nothing.
-        // Home to the slot the capability left from, if that slot is still
-        // reserved for it (`lender_owed.md` D2(D)). The fallback to `reclaim`
-        // -- first free -- is what every lend did before reservation existed.
-        //
-        // As of 2026-08-13 every lend path reserves, so a reclaimable
-        // capability should always find its slot held open and the fallback
-        // should be unreachable for one. It is deliberately kept rather than
-        // turned into an assertion: `reclaim_to` also refuses a slot that is
-        // somehow occupied, and losing the screen is a worse failure than
-        // returning it somewhere the lender must be told about. Note this
-        // comment claimed IPC `send_cap` "does not reserve until slice 3" for
-        // three days after slice 3 landed -- it was half true the whole time,
-        // because only one of the two send directions had been converted (see
-        // `revoke_from_blocked`). A fallback described as routine is how a live
-        // gap stays invisible.
-        match with_lender_caps(lender, |caps| {
-            caps.reclaim_to(home_slot, home).or_else(|| caps.reclaim(home))
-        }) {
-            Some(Some(landing)) => {
-                // Account it as the MOVE it is: the dying holder loses the
-                // capability and the lender gains it, so both halves are needed
-                // and they net to zero. This mirrors `transfer_current_to_blocked`
-                // exactly, and `false` is right for the same reason there -- the
-                // count dips transiently between the two calls and the endpoint
-                // must not be freed out from under an in-flight move.
-                //
-                // Both halves are no-ops for a `Framebuffer`, which is the whole
-                // of D2's scope today, so this changes nothing now. It matters if
-                // that scope ever widens to a refcounted kind, and it is the
-                // removal that matters: `teardown` will NOT account this
-                // capability's departure, because a reclaimed capability lands in
-                // the `ReclaimTo` arm, which does nothing. With only the addition
-                // the refcount would be permanently one too high and the endpoint
-                // would never be freed.
-                ipc::note_cap_removed(&cap, false);
-                ipc::note_cap_added(&home);
-                // Record where it landed on the lender's own slot, so the fact
-                // outlives this call and both delivery paths read it from one
-                // place (Design/cap_reclaim.md D7). First write wins.
-                set_reclaim_landing(lender, landing as u64);
-            }
-            // D4's second fallback, and a legitimate outcome: all 16 of the
-            // lender's slots are occupied, so there is nowhere to put this and it
-            // dies as it would have anyway. A hazard the lender controls, since
-            // v2.8's `cap_release` is how it makes room.
-            Some(None) => {}
-            // No live process at the lender's slot. This is supposed to be
-            // unreachable: a dead lender's exit swept this origin to `None`
-            // (`clear_origins_naming`), so `release_action` would never have said
-            // `ReclaimTo` in the first place. That is how D4's first fallback is
-            // satisfied without a liveness check to get wrong.
-            //
-            // Kept as a DISTINCT arm rather than folded in with table-full,
-            // because the two were briefly indistinguishable and that is exactly
-            // how the SMP reach bug hid: a lookup that missed a running lender
-            // destroyed the capability and looked like a full table. Silence is
-            // the wrong response to "my invariant is broken", so this is loud in
-            // the builds that can afford to be -- `debug_assert` fires under
-            // `xtask test`/`smoke` (debug kernel) and costs the production kernel
-            // nothing.
-            None => {
-                debug_assert!(
-                    false,
-                    "reclaim: no live process at lender slot -- the exit-time \
-                     origin sweep should have cleared this origin"
-                );
-            }
+        // The landing rule and the move-accounting live in `reclaim_cap_home`,
+        // shared with voluntary `cap_release`. The death path adds one thing on
+        // top: the death-wake must carry the landing slot, because `reap_dying`
+        // (which issues that wake) runs right after this and a lender woken
+        // empty-handed cannot find what came back -- nothing enumerates a table.
+        match reclaim_cap_home(&cap, origin, home) {
+            // Record where it landed on the lender's own slot, so the fact
+            // outlives this call and both delivery paths read it from one place
+            // (Design/cap_reclaim.md D7, ABI v2.9). First write wins.
+            ReclaimHome::Landed(landing) => set_reclaim_landing(lender, landing as u64),
+            // Table full: dies as it would have anyway (D4's second fallback).
+            ReclaimHome::LenderFull => {}
+            // Invariant violation -- loud in the debug kernel (xtask test/smoke),
+            // free in production. See `ReclaimHome::NoLender`.
+            ReclaimHome::NoLender => debug_assert!(
+                false,
+                "reclaim: no live process at lender slot -- the exit-time \
+                 origin sweep should have cleared this origin"
+            ),
         }
     }
 }
