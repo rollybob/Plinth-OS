@@ -208,13 +208,6 @@ pub fn resume() -> ! {
 /// The #PF dispatcher. Reached only from `page_fault_entry`.
 #[no_mangle]
 extern "C" fn page_fault_dispatch(raw: *const RawTrap) -> ! {
-    // BKL (D4): acquired here (this is its own kernel-entry dispatch surface,
-    // separate from interrupts::handle_fault's naked-stub-free exceptions).
-    // Every path below diverges -- into deliver_fault_handler (released right
-    // before that call), into process::exit_current (released at ITS
-    // chokepoint), or into `panic!` (halts, no release needed).
-    bkl::acquire();
-
     // SAFETY: the stub passes a pointer to the RawTrap it built on the
     // kernel stack; it is valid for the duration of this call.
     let raw = unsafe { &*raw };
@@ -222,6 +215,17 @@ extern "C" fn page_fault_dispatch(raw: *const RawTrap) -> ! {
     let from_user = raw.cs & 3 == 3;
 
     if from_user {
+        // BKL (D4): a CPL-3 fault means the lock was released before the return
+        // to ring 3, so it is free now. Acquire it for the handler-delivery /
+        // terminate logic below (this is a kernel-entry dispatch surface). Every
+        // path out of this block diverges and releases the lock:
+        // deliver_fault_handler (released right before the call) or
+        // process::exit_current (released at ITS chokepoint). Do NOT hoist this
+        // to the top of the function: a kernel-mode #PF is taken with the BKL
+        // already held by this core, so acquiring here would deadlock re-locking
+        // it and the panic below would never print (K-028).
+        bkl::acquire();
+
         let not_present = raw.error_code & PageFaultErrorCode::PROTECTION_VIOLATION.bits() == 0;
 
         // Decide whether to upcall, under the lock, then release it before
@@ -271,6 +275,10 @@ extern "C" fn page_fault_dispatch(raw: *const RawTrap) -> ! {
 
     // Kernel-mode #PF is a bug -- including the documented CPL-0 user-pointer
     // gap, which the syscall layer is written to keep userspace away from.
+    // BKL (D4): this arm never acquired it (the acquire lives in the from_user
+    // block above), precisely because a kernel #PF is taken with the BKL already
+    // held; the console is lock-free, so the diagnostic goes out with no lock and
+    // the machine goes down (K-028).
     let mut serial = serial::init();
     let _ = writeln!(
         serial,

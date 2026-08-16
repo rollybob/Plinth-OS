@@ -96,17 +96,21 @@ pub fn set_irq_handler(vector: u8, handler: extern "x86-interrupt" fn(InterruptS
 /// Shared fault path. Diverges (via kernel_resume) for ring-3 faults;
 /// panics for kernel faults.
 fn handle_fault(name: &str, frame: &InterruptStackFrame, err: Option<u64>, addr: Option<u64>) {
-    // BKL (D4): this function always diverges -- either into
-    // process::exit_current (which releases the lock at its own chokepoint,
-    // scheduler::resume_process / switch_to_next / process::exit_current's
-    // kernel_resume arm) or into `panic!` (which halts, needing no release).
-    // No explicit release here covers either path correctly.
-    bkl::acquire();
-
     // The low two bits of the saved CS are the CPL at the time of the
-    // fault; 3 means the fault came from user code.
+    // fault; 3 means the fault came from user code. Read it before touching
+    // the BKL, because whether the lock may be taken depends on it (K-028).
     let from_user = frame.code_segment & 3 == 3;
 
+    // BKL (D4): do NOT blocking-acquire at the top. A kernel-mode fault is
+    // taken while this core already holds the BKL (every kernel-entry dispatch
+    // body runs under it), so a `bkl::acquire()` here would re-lock a lock this
+    // core owns and spin forever -- the panic below never prints and a
+    // diagnosable crash becomes a silent hang (K-028). The console is lock-free
+    // (each writer takes a fresh serial handle), so the report goes out without
+    // the lock. Only the user-fault arm needs the BKL -- it re-enters the
+    // scheduler via exit_current -- and that arm is exactly where the lock is
+    // provably free (CPL 3 means it was released before the return to ring 3).
+    // double_fault_handler takes the same lock-free path for the same reason.
     let mut serial = serial::init();
     let _ = write!(
         serial,
@@ -125,10 +129,14 @@ fn handle_fault(name: &str, frame: &InterruptStackFrame, err: Option<u64>, addr:
 
     if from_user {
         let _ = writeln!(serial, "plinth: terminating user process");
-        // from_user means the CPU was at CPL 3, so no kernel lock is held and
-        // the saved context is live. exit_current never returns.
+        // CPL 3 fault: the BKL was released before the iretq/sysretq to ring 3,
+        // so it is free now. Acquire it for the scheduler re-entry; exit_current
+        // releases it at its own chokepoint and never returns.
+        bkl::acquire();
         process::exit_current(usermode::EXIT_FAULTED)
     }
+    // Kernel-mode fault: no BKL was taken (see the top of this function), so the
+    // machine goes straight down with its diagnostic already printed.
     panic!("unrecoverable kernel fault: {name}");
 }
 
