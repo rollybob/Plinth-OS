@@ -351,15 +351,16 @@ pub fn reclaim_target(cap: &Capability, dying_slot: usize) -> Option<(Origin, Ca
 /// written exactly once, because two places make the decision and must not drift;
 /// a second function would have re-created the drift on day one.
 ///
-/// **Callers interpret `ReclaimTo` differently, and that asymmetry is the point.**
-/// It is the same shape as `Refuse`, which teardown already maps to "just drop".
-/// Reclamation was ruled for capabilities whose holder *dies*
-/// (Design/cap_reclaim.md is titled for exactly that), so `sys_cap_release` --
-/// a live process voluntarily giving a capability up -- deliberately treats
-/// `ReclaimTo` as plain `UnmapFramebuffer`. Whether a *voluntary* release should
-/// also send a borrowed framebuffer home is a real question the ruling did not
-/// decide; it would change `cap_release`'s observable behaviour, so it is not
-/// being smuggled in here.
+/// **Both callers now act on `ReclaimTo` the same way -- send the capability
+/// home -- and that symmetry was a ruling.** Reclamation was first ruled only for
+/// a holder that *dies* (Design/cap_reclaim.md), and `sys_cap_release` used to
+/// treat `ReclaimTo` as plain `UnmapFramebuffer` for a live process giving a
+/// capability up. That stranded the lender's reserved slot when a borrower
+/// politely released instead of crashing -- a crash returned the screen, a
+/// release did not. Ruled 2026-08-15 (cap_release-on-reserved): a voluntary
+/// release routes a borrowed capability home too, via `scheduler::reclaim_cap_home`,
+/// the same helper the death path uses. `teardown` still maps this arm (and
+/// `Refuse`) to "just drop", because by teardown the reclamation has already run.
 /// Can a capability of this kind come home to its lender when a borrower dies?
 ///
 /// The reclaimable SET, named in exactly one place. Two decisions read it and
