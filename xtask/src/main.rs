@@ -64,6 +64,7 @@ const USER_CRATES: &[&str] = &[
     "spawnwaitcap",
     "blkreclaim", "blkreclaimchild",
     "blkrelend", "blkrelendmid",
+    "blkipclend", "blkrecvchild",
     "template", "bench",
 ];
 
@@ -1314,6 +1315,13 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     // asserted `range came home to root at slot ...` line, which goes to NO_CAP if
     // the origin is laundered.
     check_frames_baseline(&actual, "blkrelend");
+    // The IPC blocked-sender reclamation (lender_owed.md slice 4 / K-026). The
+    // sender lends a BlockRange over `send_cap` while blocked; the frame baseline
+    // proves its and the receiver's I/O frames are reclaimed, and the endpoint
+    // baseline proves the shared endpoint plus the spawn result channel are freed.
+    // The K-026 proof is the asserted "range came home to sender at slot 1" line.
+    check_frames_baseline(&actual, "blkipclend");
+    check_endpoints_baseline(&actual, "blkipclend");
     // The same reclamation driven through `spawn_and_wait_cap` (K-012). The frame
     // baseline carries the D7 hazard exactly as fbreclaim's does. The endpoint
     // baseline proves only that the spawn endpoint does not outlive the demo --

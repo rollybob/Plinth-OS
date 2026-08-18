@@ -215,6 +215,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // it receives a BlockRange on loan from blkrelend-user, re-lends it to
         // blkreclaimchild, and proves the range goes home to the ROOT rather than
         // back to itself -- the K-025 watch, Design/lender_owed.md slice 4 step 2).
+        // id 9 = blkrecvchild (the RECEIVER in the K-026 IPC blocked-sender watch:
+        // blkipclend-user send_caps it a BlockRange while blocked, it receives over
+        // IPC and faults holding it, so reclamation must route the range home to
+        // the blocked sender's reserved slot -- Design/lender_owed.md slice 4).
         //
         // Ids are positional, so appending is safe but INSERTING is not: every
         // id after the insertion point shifts and the mirrored constants in the
@@ -229,6 +233,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             include_bytes!(concat!(env!("OUT_DIR"), "/fbreleasechild-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/blkreclaimchild-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/blkrelendmid-user")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/blkrecvchild-user")),
         ];
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
@@ -693,6 +698,70 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             scheduler::run("blkrelend demo", &[BLKRELEND_BIN], phys_offset, &[Some(range)]);
             let after_blkrelend = free_frames();
             let _ = writeln!(serial, "plinth: {after_blkrelend} frames free after blkrelend");
+        }
+
+        // Block-range reclamation over the IPC blocked-sender path (Design/
+        // lender_owed.md D6 slice 4, the K-026 watch). Every lender above lends
+        // over sys_spawn (the spawn_scheduled give-side); this one lends over IPC
+        // send_cap, and forces the OTHER give-side -- transfer_blocked_to_current,
+        // the path K-026 left un-reserved until 6b68dd5. The kernel grants
+        // blkipclend-user (S) three capabilities: a read BlockRange over device 0
+        // sectors [24, 28) at BLOCK_SLOT (slot 1), a SEND cap to a fresh shared
+        // endpoint (slot 2), and a RECV cap to the same endpoint (slot 3). S spawns
+        // the receiver (blkrecvchild, id 9), hands it the RECV cap, then send_caps
+        // the range on the SEND cap. The receiver is homed to S's core, so it
+        // cannot run until S blocks in the send -- making S a BLOCKED sender when
+        // the receiver arrives, deterministically. The receiver reads a sector
+        // (ramp byte 24) and faults; the range must reclaim to S's reserved
+        // BLOCK_SLOT. Frame counts bracket the demo (S's and the receiver's I/O
+        // frames), and endpoint counts bracket it (the shared endpoint plus the
+        // spawn result channel are both reclaimed). Runs only if device 0 came up
+        // and an endpoint is available.
+        if virtio_blk::ready(0) {
+            const BLKIPCLEND_BIN: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/blkipclend-user"));
+            let before_blkipclend = free_frames();
+            let _ = writeln!(serial, "plinth: {before_blkipclend} frames free before blkipclend");
+            let _ = writeln!(
+                serial,
+                "plinth: {} endpoints free before blkipclend",
+                free_endpoints()
+            );
+            match ipc::create_endpoint() {
+                Some(ep) => {
+                    let range = Capability {
+                        object: CapObject::BlockRange { dev: 0, start: 24, count: 4 },
+                        rights: capability::RIGHT_READ,
+                        origin: None,
+                    };
+                    let send_ep = Capability {
+                        object: CapObject::Endpoint { id: ep },
+                        rights: capability::RIGHT_SEND,
+                        origin: None,
+                    };
+                    let recv_ep = Capability {
+                        object: CapObject::Endpoint { id: ep },
+                        rights: capability::RIGHT_RECV,
+                        origin: None,
+                    };
+                    scheduler::run(
+                        "blkipclend demo",
+                        &[BLKIPCLEND_BIN],
+                        phys_offset,
+                        &[Some(range), Some(send_ep), Some(recv_ep)],
+                    );
+                }
+                None => {
+                    let _ = writeln!(serial, "plinth: blkipclend demo: no endpoint available");
+                }
+            }
+            let after_blkipclend = free_frames();
+            let _ = writeln!(serial, "plinth: {after_blkipclend} frames free after blkipclend");
+            let _ = writeln!(
+                serial,
+                "plinth: {} endpoints free after blkipclend",
+                free_endpoints()
+            );
         }
 
         // Phase 2 storage, load-from-disk: the filesystem library-OS demo. The

@@ -23,6 +23,7 @@ const USER_BINARIES: &[&str] = &[
     "caprelease", "quietworker", "spawnwaitcap",
     "blkreclaim", "blkreclaimchild",
     "blkrelend", "blkrelendmid",
+    "blkipclend", "blkrecvchild",
 ];
 
 // Embedded only by the `bench` build (`cargo xtask bench`), matching the

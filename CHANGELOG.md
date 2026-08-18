@@ -49,8 +49,17 @@ here on 2026-08-13.
   a capability on must not launder the root lender's claim, so the range must
   reclaim to the root A, not the intermediary B. Reverting the origin-preservation
   in `spawn_scheduled` sends it to B instead, red from both sides (A gets `NO_CAP`,
-  B reports "LAUNDERED"). K-026 (the same class on the IPC blocked-sender give-side,
-  a different code path) is now buildable but remains unwatched.
+  B reports "LAUNDERED").
+
+  A third pair, `blkipclend-user` -> `blkrecvchild-user`, watches the same class on
+  the **IPC** give-side (K-026): a sender that owns a `BlockRange` outright lends it
+  over `send_cap` while blocked (the receiver is spawned onto the sender's own core,
+  so it cannot run until the sender blocks -- forcing the blocked-sender rendezvous
+  deterministically), the receiver dies holding it, and the range must reclaim to
+  the sender's reserved slot. Reverting the blocked-sender reservation lands it on
+  the wrong slot, red. Both K-025 and K-026 -- the two arrival-order paths a lent,
+  reclaimable capability can take -- are now watched, so the widening's homecoming
+  guarantee holds no matter which side of a rendezvous arrives first.
 - **The dropped-event count is readable (ABI v2.11).** The kernel has kept a
   sticky per-subscription count of input dropped on a full completion queue since
   the event-ring milestone (v2.5), and surfaced a drop *flag* on the next admitted

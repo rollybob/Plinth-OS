@@ -311,6 +311,25 @@ blkrelend: grandchild died, range came home to root at slot 1
 blkrelend: root reclaimed b0=21
 plinth: blkrelend demo: all done
 
+# Block-range reclamation over the IPC blocked-sender path (Design/lender_owed.md
+# D6 slice 4, the K-026 watch). Every lender above lends over sys_spawn; this one
+# lends over IPC send_cap and forces the blocked-sender give-side
+# (transfer_blocked_to_current). blkipclend-user (S) owns a dev-0 [24,28) range,
+# spawns blkrecvchild (R, id 9) handing it the RECV end of a shared endpoint, then
+# send_caps the range on the SEND end. R is homed to S's core so it cannot run
+# until S blocks in the send -- so S is a BLOCKED sender when R receives. R reads
+# a sector (ramp byte 24) and faults; the range must reclaim to S's reserved
+# BLOCK_SLOT. Load-bearing line: "range came home to sender at slot 1". Reverting
+# K-026 (revoke_from_blocked back to plain revoke_and_unmap) drops the reservation
+# and the range lands off slot 1, red.
+plinth: blkipclend demo: 1 processes
+blkrecvchild: holding the range b0=24, now faulting
+plinth: [user fault] #PF
+plinth: terminating user process
+blkipclend: receiver died, range came home to sender at slot 1
+blkipclend: reclaimed b0=24
+plinth: blkipclend demo: all done
+
 # Phase 2 storage, load-from-disk: the FS library-OS demo. The kernel grants
 # fsdemo a BlockRange over the archive device; fsdemo uses libfs to parse the
 # on-disk archive, find "diskhello" by name, read its ELF off the disk, and
