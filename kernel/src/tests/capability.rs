@@ -497,6 +497,106 @@ pub fn reclaim_declines_when_lender_table_full(_ctx: &mut TestCtx) -> Result<(),
     Ok(())
 }
 
+/// Slice 2's homecoming reservation, at the table level: `reserve` holds a slot
+/// out of `install`'s reach until something comes home to it or the hold is
+/// dropped. Exercised end to end by the fb/blk reclamation demos; pinned here so a
+/// regression surfaces as a unit failure rather than a boot-log diff.
+pub fn reserve_holds_a_slot_against_install(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut t = CapTable::new();
+    t.reserve(0);
+    test_assert!(t.is_reserved(0), "reserve must mark the slot reserved");
+    test_assert!(!t.is_reserved(1), "an untouched slot must not read as reserved");
+
+    // `install` must treat a reserved-but-empty slot as unavailable and skip it.
+    let s = t.install(kernel_cap(CapObject::Frame { addr: 0x1000 })).map_err(|_| "install")?;
+    test_assert!(s == 1, "install must skip the reserved slot 0 and land at 1");
+    test_assert!(t.is_reserved(0), "an install that skipped the reservation must not clear it");
+
+    // `clear_reservation` returns the slot to the ordinary free pool (the
+    // spawn-failure rollback's path when a loan never happened).
+    t.clear_reservation(0);
+    test_assert!(!t.is_reserved(0), "clear_reservation must release the hold");
+    let s0 = t.install(kernel_cap(CapObject::Frame { addr: 0x2000 })).map_err(|_| "install2")?;
+    test_assert!(s0 == 0, "a cleared reservation must return its slot to the free pool");
+    Ok(())
+}
+
+/// `reclaim_to` is the return path's placement: it fills the reserved slot itself
+/// and consumes the reservation, and declines anything else rather than overwrite
+/// -- the property `reclaim_cap_home` leans on for a lent capability to come home
+/// to the slot it left from.
+pub fn reclaim_to_targets_only_its_reserved_slot(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut t = CapTable::new();
+    let cap = kernel_cap(CapObject::Frame { addr: 0x1000 });
+
+    // An unreserved slot is declined -- reclaim_to never invents a reservation.
+    test_assert!(
+        t.reclaim_to(3, cap).is_none(),
+        "reclaim_to must decline a slot that was never reserved"
+    );
+    test_assert!(t.peek(3).is_none(), "a declined reclaim_to must not place anything");
+
+    // A reserved, empty slot accepts, lands in that slot, and clears the hold.
+    t.reserve(3);
+    let landing = t.reclaim_to(3, cap).ok_or("a reserved slot must accept the reclaim")?;
+    test_assert!(landing == 3, "reclaim_to must land in the reserved slot itself");
+    test_assert!(!t.is_reserved(3), "reclaim_to must consume the reservation it filled");
+    test_assert!(t.peek(3).is_some(), "the reclaimed capability must now occupy the slot");
+
+    // A reserved-but-occupied slot is declined, not overwritten.
+    t.reserve(3);
+    test_assert!(
+        t.reclaim_to(3, cap).is_none(),
+        "reclaim_to must decline a reserved-but-occupied slot rather than displace"
+    );
+    Ok(())
+}
+
+/// `install_home` is the single placement rule for an arriving capability
+/// (slice 3's fix for the class): a capability coming home to its own lender lands
+/// in the slot reserved for it, beating first-free; anything else installs
+/// first-free and leaves reservations untouched. `prior` is the origin BEFORE
+/// `lent_to` cleared it, which is why it is passed in rather than read off `cap`.
+pub fn install_home_prefers_reservation_then_falls_back(
+    _ctx: &mut TestCtx,
+) -> Result<(), &'static str> {
+    let mut t = CapTable::new();
+    // Occupy slots 0 and 1 so first-free is 2 -- proving homecoming beats it.
+    t.mint(CapObject::Frame { addr: 1 }, RIGHT_READ).map_err(|_| "m0")?;
+    t.mint(CapObject::Frame { addr: 2 }, RIGHT_READ).map_err(|_| "m1")?;
+    t.reserve(5);
+    let cap = kernel_cap(CapObject::Frame { addr: 3 });
+
+    // Coming home: prior names lender 7 lending from slot 5, dest is 7 -> slot 5.
+    let home = t.install_home(cap, Some(Origin::new(7, 5)), 7).ok_or("must place")?;
+    test_assert!(
+        home == 5,
+        "a capability coming home to its lender lands in the reserved slot, not first-free"
+    );
+    test_assert!(!t.is_reserved(5), "the homecoming must consume the reservation");
+
+    // Not this process's loan: prior lender 9 != dest 7 -> first-free (slot 2),
+    // and an unrelated reservation is left alone.
+    t.reserve(6);
+    let other = t.install_home(cap, Some(Origin::new(9, 6)), 7).ok_or("must place")?;
+    test_assert!(other == 2, "a capability not coming home to THIS process installs first-free");
+    test_assert!(t.is_reserved(6), "an unrelated install must leave slot 6's reservation intact");
+
+    // No origin at all: a plain first-free install (slot 3).
+    let minted = t.install_home(cap, None, 7).ok_or("must place")?;
+    test_assert!(minted == 3, "with no origin, install_home is a plain first-free install");
+
+    // Home lender matches but the home slot is not reserved: reclaim_to declines
+    // and it falls back to first-free (slot 4), still leaving slot 6 held.
+    let unreserved_home = t.install_home(cap, Some(Origin::new(7, 8)), 7).ok_or("must place")?;
+    test_assert!(
+        unreserved_home == 4,
+        "coming home to an unreserved slot must fall back to first-free"
+    );
+    test_assert!(t.is_reserved(6), "the fallback must not disturb an unrelated reservation");
+    Ok(())
+}
+
 /// A Reply capability is the one kind release refuses (D3). It names a caller
 /// that is Blocked-awaiting-reply, and `capability.rs` leans on that -- "the
 /// caller cannot run or exit until replied" is why a Reply needs no generation

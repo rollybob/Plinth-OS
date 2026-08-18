@@ -82,6 +82,18 @@ const TESTS: &[TestCase] = &[
         run: capability::reclaim_declines_when_lender_table_full,
     },
     TestCase {
+        name: "capability::reserve_holds_a_slot_against_install",
+        run: capability::reserve_holds_a_slot_against_install,
+    },
+    TestCase {
+        name: "capability::reclaim_to_targets_only_its_reserved_slot",
+        run: capability::reclaim_to_targets_only_its_reserved_slot,
+    },
+    TestCase {
+        name: "capability::install_home_prefers_reservation_then_falls_back",
+        run: capability::install_home_prefers_reservation_then_falls_back,
+    },
+    TestCase {
         name: "capability::release_action_refuses_reply",
         run: capability::release_action_refuses_reply,
     },
