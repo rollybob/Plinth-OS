@@ -269,6 +269,28 @@ blkwrite: ok (write+read-back verified)
 blkwrite: rdonly write rejected
 plinth: blkwrite demo: all done
 
+# Block-range RECLAMATION (Design/lender_owed.md D6, slice 4): the first lender
+# that does not lend the screen. The kernel grants blkreclaim-user a read
+# BlockRange over device 0 sectors [16, 20); it reads a sector (ramp byte 16),
+# TRANSFERS the range to blkreclaimchild (id 7) which reads a sector of its own
+# to prove it holds it and then FAULTS, and then reads a sector through the
+# capability the kernel returned. The load-bearing line is "range came back at
+# slot 1" -- slot 1 is BLOCK_SLOT, the slot it was lent from, reserved at lend
+# time (slice 2). It is the BlockRange analogue of spawnwaitcap's homecoming,
+# and it is only reachable because slice 4 widened is_reclaimable_kind beyond
+# Framebuffer; before that a lent BlockRange was dropped with the dying child
+# and the wake carried NO_CAP. The post-reclaim read of a DIFFERENT sector
+# (relative 1 -> disk 17, ramp byte 17) confirms the returned range still works.
+# Frames are bracketed (a BlockRange owns none, so only the I/O frames move).
+plinth: blkreclaim demo: 1 processes
+blkreclaim: lent b0=16
+blkreclaimchild: holding the range b0=16, now faulting
+plinth: [user fault] #PF
+plinth: terminating user process
+blkreclaim: child died, range came back at slot 1
+blkreclaim: reclaimed b0=17
+plinth: blkreclaim demo: all done
+
 # Phase 2 storage, load-from-disk: the FS library-OS demo. The kernel grants
 # fsdemo a BlockRange over the archive device; fsdemo uses libfs to parse the
 # on-disk archive, find "diskhello" by name, read its ELF off the disk, and

@@ -70,12 +70,12 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "capability::event_source_rights", run: capability::event_source_rights },
     TestCase { name: "capability::release_action_per_kind", run: capability::release_action_per_kind },
     TestCase {
-        name: "capability::release_action_reclaims_only_lent_framebuffer",
-        run: capability::release_action_reclaims_only_lent_framebuffer,
+        name: "capability::release_action_reclaims_lent_recoverable_kinds",
+        run: capability::release_action_reclaims_lent_recoverable_kinds,
     },
     TestCase {
-        name: "capability::reclaim_target_sends_lent_screen_home",
-        run: capability::reclaim_target_sends_lent_screen_home,
+        name: "capability::reclaim_target_sends_lent_recoverable_home",
+        run: capability::reclaim_target_sends_lent_recoverable_home,
     },
     TestCase {
         name: "capability::reclaim_declines_when_lender_table_full",

@@ -370,13 +370,18 @@ pub fn reclaim_target(cap: &Capability, dying_slot: usize) -> Option<(Origin, Ca
 /// the rest of the process's life, so "would this come back?" has to give the
 /// same answer at both ends.
 ///
-/// The set is `Framebuffer` today (`cap_reclaim.md` D2). `lender_owed.md` D6
-/// rules it widens to `BlockRange` and `EventSource` -- the kinds no syscall can
-/// re-mint, which is also exactly the set that carries no refcount and names no
-/// pool. That widening is slice 4 and is **not** applied here: this function is
-/// the one line it will change.
+/// The set is `Framebuffer`, `BlockRange`, and `EventSource` -- the kinds no
+/// syscall can re-mint, which is also exactly the set that carries no refcount
+/// and names no pool (`lender_owed.md` D6 / cap_reclaim.md D2's "cannot-recreate"
+/// property, applied honestly to every kind). Widened from `Framebuffer`-only in
+/// slice 4 (2026-08-17), once `blkreclaim-user` gave `BlockRange` a lender:
+/// before that a lent non-framebuffer capability was dropped with the dying
+/// borrower and the lender got nothing back.
 pub const fn is_reclaimable_kind(object: &CapObject) -> bool {
-    matches!(object, CapObject::Framebuffer { .. })
+    matches!(
+        object,
+        CapObject::Framebuffer { .. } | CapObject::BlockRange { .. } | CapObject::EventSource { .. }
+    )
 }
 
 /// Does handing this capability away create a NEW loan, one that should reserve
@@ -400,12 +405,14 @@ pub fn lend_reserves_home(cap: &Capability) -> bool {
 }
 
 pub fn release_action(cap: &Capability) -> ReleaseAction {
-    // Scope is `Framebuffer` only (Design/cap_reclaim.md D2, narrowed at ruling
-    // time). `EventSource` was in the draft and was cut: the kernel hands every
-    // process that needs input its own, `sys_spawn` moves exactly one capability
-    // so a lender would have to give up the screen to lend a keyboard, and no
-    // user crate lends one -- an arm with no caller and no test to distinguish it
-    // from dead code. It becomes a one-line change here once a lender exists.
+    // Scope is the reclaimable set -- `Framebuffer`, `BlockRange`, `EventSource`
+    // (Design/lender_owed.md D6, widened 2026-08-17 from cap_reclaim.md D2's
+    // Framebuffer-only). `is_reclaimable_kind` names that set in one place; a lent
+    // capability of any of those kinds goes home to its lender, and every other
+    // kind falls through to the per-kind match below. `EventSource` was cut from
+    // D2's draft for having no lender; slice 4 added the set once `blkreclaim-user`
+    // gave `BlockRange` one, and the shared predicate keeps this death-time answer
+    // and the lend-time reservation from drifting.
     if is_reclaimable_kind(&cap.object) {
         if let Some(origin) = cap.origin {
             return ReleaseAction::ReclaimTo { origin };

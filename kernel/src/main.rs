@@ -205,7 +205,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // VOLUNTARILY RELEASES a transferred framebuffer with cap_release rather
         // than faulting, so the cap_release-on-reserved demo can prove a polite
         // return comes home to the lender's reserved slot -- fbrelease-user
-        // mirrors this id as FBRELEASECHILD_ID).
+        // mirrors this id as FBRELEASECHILD_ID). id 7 = blkreclaimchild (the
+        // child that reads a sector through a TRANSFERRED BlockRange to prove it
+        // holds it, then FAULTS, so the block-reclamation demo can prove a
+        // non-framebuffer capability comes home to the lender's reserved slot --
+        // Design/lender_owed.md slice 4; blkreclaim-user mirrors this id as
+        // BLKRECLAIMCHILD_ID, and is the first lender that does not lend the screen).
         //
         // Ids are positional, so appending is safe but INSERTING is not: every
         // id after the insertion point shifts and the mirrored constants in the
@@ -218,6 +223,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             include_bytes!(concat!(env!("OUT_DIR"), "/quietworker-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/fbreclaimchild-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/fbreleasechild-user")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/blkreclaimchild-user")),
         ];
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
@@ -625,6 +631,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             );
             let after_blkwrite = free_frames();
             let _ = writeln!(serial, "plinth: {after_blkwrite} frames free after blkwrite");
+        }
+
+        // Block-range RECLAMATION (Design/lender_owed.md D6, slice 4): the first
+        // lender that does not lend the screen. Where fbreclaim proves a lent
+        // FRAMEBUFFER survives the borrower's death, this proves the same for a
+        // BlockRange -- the kind slice 4 added to `capability::is_reclaimable_kind`.
+        // The kernel grants blkreclaim-user a read BlockRange over device 0 sectors
+        // [16, 20) -- clear of every other demo's range on this device -- at
+        // BLOCK_SLOT. The process reads a sector to prove the range is its,
+        // TRANSFERS it to a child (blkreclaimchild, id 7) that reads a sector of its
+        // own and then FAULTS holding it, and then reads a sector through the
+        // capability the kernel returned -- asserting it came home to BLOCK_SLOT,
+        // the BlockRange analogue of spawnwaitcap's `cap_slot == FB_SLOT`. Frame
+        // counts bracket the demo: a BlockRange owns no frames, so the parent's and
+        // child's I/O frames are the only movement and both are reclaimed at
+        // teardown (no leak). Runs only if device 0 came up.
+        if virtio_blk::ready(0) {
+            const BLKRECLAIM_BIN: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/blkreclaim-user"));
+            let before_blkreclaim = free_frames();
+            let _ = writeln!(serial, "plinth: {before_blkreclaim} frames free before blkreclaim");
+            let range = Capability {
+                object: CapObject::BlockRange { dev: 0, start: 16, count: 4 },
+                rights: capability::RIGHT_READ,
+                origin: None,
+            };
+            scheduler::run("blkreclaim demo", &[BLKRECLAIM_BIN], phys_offset, &[Some(range)]);
+            let after_blkreclaim = free_frames();
+            let _ = writeln!(serial, "plinth: {after_blkreclaim} frames free after blkreclaim");
         }
 
         // Phase 2 storage, load-from-disk: the filesystem library-OS demo. The

@@ -62,6 +62,7 @@ const USER_CRATES: &[&str] = &[
     "fbreclaimchild", "fbrelease", "fbreleasechild", "shell", "shellapp", "caprelease",
     "quietworker",
     "spawnwaitcap",
+    "blkreclaim", "blkreclaimchild",
     "template", "bench",
 ];
 
@@ -1299,6 +1300,13 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     // reclamation worked. The two differing hashes in the boot log are what say
     // that; this only says nothing was leaked while doing it.
     check_frames_baseline(&actual, "fbreclaim");
+    // The BlockRange counterpart to fbreclaim (lender_owed.md slice 4): the first
+    // non-framebuffer lender. A BlockRange owns no frames (inline data), so the
+    // baseline proves only that the parent's and child's I/O frames are both
+    // reclaimed at teardown -- the homecoming-to-reserved-slot proof is the
+    // asserted `range came back at slot ...` line in expected_boot_log.txt, which
+    // names BLOCK_SLOT and goes red if the reservation is disabled.
+    check_frames_baseline(&actual, "blkreclaim");
     // The same reclamation driven through `spawn_and_wait_cap` (K-012). The frame
     // baseline carries the D7 hazard exactly as fbreclaim's does. The endpoint
     // baseline proves only that the spawn endpoint does not outlive the demo --

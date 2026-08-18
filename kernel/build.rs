@@ -21,6 +21,7 @@ const USER_BINARIES: &[&str] = &[
     "gfxsplit", "gfxbound", "gfxrevoke", "fbreclaim", "fbreclaimchild", "fbrelease",
     "fbreleasechild", "shell", "shellapp",
     "caprelease", "quietworker", "spawnwaitcap",
+    "blkreclaim", "blkreclaimchild",
 ];
 
 // Embedded only by the `bench` build (`cargo xtask bench`), matching the

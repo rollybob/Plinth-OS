@@ -29,6 +29,20 @@ here on 2026-08-13.
 ## [Unreleased]
 
 ### Added
+- **Reclamation covers block ranges and event sources, not just the screen
+  (lender_owed.md slice 4).** Until now only a lent `Framebuffer` came home when
+  its borrower died; a lent `BlockRange` or `EventSource` was dropped with the
+  child. `capability::is_reclaimable_kind` now names all three -- exactly the kinds
+  no syscall can re-mint, which is also the set that carries no refcount -- so any
+  of them lent to a dying child returns to the lender's reserved slot. No ABI
+  surface moved: the death-wake has carried a landing slot since v2.9, and this
+  only widens which capabilities use it. The first non-framebuffer lender,
+  `blkreclaim-user`, drives it: it lends a read `BlockRange` to a child that reads
+  a sector to prove it holds it and then faults, and asserts the range came home
+  to the slot it was lent from. Watched failing both ways -- revert the widening
+  and the wake carries `NO_CAP`; disable the homecoming reservation and the range
+  lands on the wrong slot. K-025 and K-026 (laundering on a re-lend chain) become
+  reachable with this lender but are **not yet watched** -- that is the next step.
 - **The dropped-event count is readable (ABI v2.11).** The kernel has kept a
   sticky per-subscription count of input dropped on a full completion queue since
   the event-ring milestone (v2.5), and surfaced a drop *flag* on the next admitted

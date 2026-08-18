@@ -362,10 +362,12 @@ pub fn release_action_per_kind(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Scope of reclamation (Design/cap_reclaim.md D2, narrowed at ruling time to
-/// `Framebuffer` alone). The decision reads `origin`, which is why the policy
-/// takes a whole `Capability` rather than a bare object (D6, ruled WIDEN).
-pub fn release_action_reclaims_only_lent_framebuffer(
+/// Scope of reclamation (Design/lender_owed.md D6, widened 2026-08-17 from
+/// cap_reclaim.md D2's `Framebuffer`-only). The reclaimable set is exactly the
+/// kinds no syscall can re-mint -- `Framebuffer`, `BlockRange`, `EventSource` --
+/// which is also the set that carries no refcount. The decision reads `origin`,
+/// which is why the policy takes a whole `Capability` rather than a bare object.
+pub fn release_action_reclaims_lent_recoverable_kinds(
     _ctx: &mut TestCtx,
 ) -> Result<(), &'static str> {
     // A LENT framebuffer goes home, naming its lender.
@@ -380,22 +382,34 @@ pub fn release_action_reclaims_only_lent_framebuffer(
         "an owned framebuffer must still just unmap"
     );
 
-    // D2's narrowing, pinned: no OTHER kind reclaims, however it got its origin.
-    // EventSource is the one that was explicitly cut from the draft, so it is the
-    // one most likely to be added back by accident.
+    // Slice 4's widening: a lent BlockRange and a lent EventSource now go home
+    // too, because neither can be re-minted by a syscall. EventSource was the
+    // kind cut from D2's draft for having no lender; blkreclaim-user is now that
+    // lender, so it joins Framebuffer in scope.
     for obj in [
-        CapObject::EventSource { id: 0 },
-        CapObject::CpuTime { budget: 100 },
         CapObject::BlockRange { dev: 0, start: 8, count: 4 },
+        CapObject::EventSource { id: 0 },
     ] {
         test_assert!(
             release_action(&Capability { object: obj, rights: RIGHT_READ, origin: Some(Origin::new(2, 3)) })
-                == ReleaseAction::DropSlot,
-            "only a Framebuffer is in reclamation's scope -- D2 was narrowed deliberately"
+                == ReleaseAction::ReclaimTo { origin: Origin::new(2, 3) },
+            "a lent BlockRange or EventSource must now be reclaimed to its lender (D6 widen)"
         );
     }
-    // A lent Frame still returns to the allocator: pooled resources are correctly
-    // returned by death, and D2 rejected "a loan is a loan" on blast radius.
+
+    // Still OUT of scope, however it got an origin. A CpuTime budget is forfeit,
+    // not returned; the pinned negative is that widening did not sweep it in.
+    test_assert!(
+        release_action(&Capability {
+            object: CapObject::CpuTime { budget: 100 },
+            rights: RIGHT_READ,
+            origin: Some(Origin::new(2, 3)),
+        }) == ReleaseAction::DropSlot,
+        "a CpuTime budget is forfeit, never reclaimed -- not a re-mintable/pooled kind but not recoverable either"
+    );
+    // A lent Frame still returns to the ALLOCATOR, not the lender: pooled
+    // resources are correctly returned by death, and D2 rejected "a loan is a
+    // loan" on blast radius. This is the distinction every frame baseline rests on.
     test_assert!(
         release_action(&Capability {
             object: CapObject::Frame { addr: 0x4000 },
@@ -410,7 +424,7 @@ pub fn release_action_reclaims_only_lent_framebuffer(
 /// Reclamation, as the pure decision plus the install (Design/cap_reclaim.md
 /// D1/D4). The process-table walk needs `static mut TABLE`, which the harness has
 /// no more than it has an address space, so the decision is what is tested here.
-pub fn reclaim_target_sends_lent_screen_home(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+pub fn reclaim_target_sends_lent_recoverable_home(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     // Process 3 dies holding a framebuffer that process 1 lent it.
     let (lender, home) =
         reclaim_target(&fb_cap(Some(Origin::new(1, 3))), 3).ok_or("a lent framebuffer must be reclaimable")?;
@@ -423,23 +437,37 @@ pub fn reclaim_target_sends_lent_screen_home(_ctx: &mut TestCtx) -> Result<(), &
     test_assert!(home.object == fb_cap(None).object, "the object itself must survive intact");
     test_assert!(home.rights == fb_cap(None).rights, "rights must survive intact");
 
+    // Slice 4: a lent BlockRange comes home the same way -- this is the pure
+    // decision behind what blkreclaim-user drives end to end. Its origin must
+    // clear on the way home just as the framebuffer's does.
+    let range = CapObject::BlockRange { dev: 0, start: 16, count: 4 };
+    let (blk_lender, blk_home) = reclaim_target(
+        &Capability { object: range, rights: RIGHT_READ, origin: Some(Origin::new(1, 3)) },
+        3,
+    )
+    .ok_or("a lent BlockRange must now be reclaimable")?;
+    test_assert!(blk_lender.lender() == 1, "the range must go home to its lender");
+    test_assert!(blk_home.origin.is_none(), "the reclaimed range's origin must clear");
+    test_assert!(blk_home.object == range, "the range object must survive intact");
+
     // An OWNED framebuffer is nobody's loan: it dies as before.
     test_assert!(
         reclaim_target(&fb_cap(None), 3).is_none(),
         "an owned framebuffer must not be reclaimed anywhere"
     );
-    // Out of scope per D2, however it got an origin.
+    // Still out of scope, however it got an origin: a CpuTime budget is forfeit,
+    // so lending it and dying sends nothing home.
     test_assert!(
         reclaim_target(
             &Capability {
-                object: CapObject::EventSource { id: 0 },
+                object: CapObject::CpuTime { budget: 100 },
                 rights: RIGHT_READ,
                 origin: Some(Origin::new(1, 3))
             },
             3
         )
         .is_none(),
-        "only a Framebuffer is reclaimable today"
+        "a CpuTime budget is forfeit, never reclaimed"
     );
     Ok(())
 }

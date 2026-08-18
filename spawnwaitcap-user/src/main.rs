@@ -20,19 +20,24 @@
 //!
 //! # Part 1 -- the landing slot (the framebuffer round)
 //!
-//! **This part has to lend a Framebuffer, and that is not a stylistic choice.**
-//! The 08-05 handoff proposed lending "a `Ring`/`Frame`", which does not work
-//! against this kernel: `capability::release_action` scopes reclamation to
-//! `CapObject::Framebuffer` (Design/cap_reclaim.md D2, narrowed at ruling time --
-//! `EventSource` was in the draft and was cut for having no lender). An ordinary
-//! Frame lent to a dying child is simply freed with the child, so the death-wake
-//! carries `NO_CAP` and there is nothing to collect. That was measured, not
-//! assumed: the Frame version of this demo was built first and reported no
-//! landing slot, with its frame bracket flat because the frame went back to the
-//! allocator rather than to the lender. Ring buffers are made of ordinary Frame
-//! capabilities too (their SQ/CQ are Frames), so they are out for the same
-//! reason. Until D2 widens, a Framebuffer is the only thing in this system that
-//! can be lent and recovered.
+//! **This part lends a Framebuffer -- once a necessity, now a choice.** When this
+//! demo was written, a Framebuffer was the only lendable-and-recoverable object:
+//! `capability::release_action` scoped reclamation to `CapObject::Framebuffer`
+//! (Design/cap_reclaim.md D2, narrowed at ruling time), so the 08-05 handoff's
+//! proposal to lend "a `Ring`/`Frame`" did not work -- an ordinary Frame lent to a
+//! dying child is simply freed with it and the death-wake carries `NO_CAP`. That
+//! was measured, not assumed: the Frame version of this demo was built first and
+//! reported no landing slot, its frame bracket flat because the frame went back to
+//! the allocator rather than to the lender.
+//!
+//! Slice 4 (lender_owed.md D6, 2026-08-17) widened `is_reclaimable_kind` to
+//! `Framebuffer | BlockRange | EventSource`, and `blkreclaim-user` now lends a
+//! `BlockRange` a dying child returns -- so this part keeps the Framebuffer by
+//! CHOICE, not because nothing else can be lent. The choice is still the right
+//! one for *this* demo: it reuses `fbreclaimchild-user` as its child and the two
+//! differing hashes below are its proof the screen genuinely came home. A Frame or
+//! Ring remains unlendable (re-mintable / pooled, so freed rather than reclaimed),
+//! which is why the widening stopped at the three kinds no syscall can re-mint.
 //!
 //! **What this asserts that `fbreclaim-user` does not:** that the helper returns
 //! the landing slot at all. `spawn_and_wait` returns two values and drops it, and
