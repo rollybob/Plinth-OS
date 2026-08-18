@@ -1,6 +1,6 @@
 //! Unified-loop demo (Stage 4): one ring multiplexes block I/O and input.
 //!
-//! The payoff of carrying both on one ring (Design/event_rings.md s10): this
+//! The payoff of carrying both on one ring (s10): this
 //! libOS registers a SINGLE ring, issues a block read AND opens a keyboard event
 //! subscription on it, and drives both to completion in ONE `block_on` /
 //! `ring_wait` loop. A real OS's event loop is exactly this shape -- wait on disk

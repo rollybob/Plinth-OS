@@ -1,4 +1,4 @@
-//! Graphics library-OS demo (Stage 2, Design/display.md): the framebuffer as a
+//! Graphics library-OS demo (Stage 2): the framebuffer as a
 //! capability.
 //!
 //! The kernel grants this process a Framebuffer capability (at FB_SLOT) and

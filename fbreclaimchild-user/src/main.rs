@@ -1,4 +1,4 @@
-//! Framebuffer reclamation demo (Design/cap_reclaim.md D6) -- the dying half.
+//! Framebuffer reclamation demo (D6) -- the dying half.
 //!
 //! Spawned by `fbreclaim-user`, which TRANSFERS it the whole-screen framebuffer
 //! capability and then waits. This process maps the screen, draws through the

@@ -1,14 +1,14 @@
 //! A reference async executor over the kernel's completion rings -- block I/O
 //! and input events on one ring.
 //!
-//! This is the library-OS half of Design/async_rings.md and Design/event_rings.md:
+//! This is the library-OS half of the ring ABI:
 //! the kernel ships the ring *mechanism* (register/submit/wait + the in-flight
 //! demux); this is one *policy* built on it -- a minimal `no_std` futures executor
 //! a real library OS may replace. It is what makes depth observable: a caller
 //! issues several reads that overlap on the device, then awaits them all, the
 //! kernel demuxing each completion back by its `user_data` cookie.
 //!
-//! Two future shapes ride the same reactor (event_rings.md s2/s6):
+//! Two future shapes ride the same reactor (s2/s6):
 //!
 //!   - A block `read` is a *one-shot* future: a unique cookie that retires when
 //!     its single completion is reaped.
@@ -68,7 +68,7 @@ const CAP: usize = ENTRIES as usize;
 const SQ_VA: u64 = MAP_END - 3 * PAGE_SIZE;
 const CQ_VA: u64 = MAP_END - 4 * PAGE_SIZE;
 
-// Ring header / entry layout (Design/async_rings.md s4), byte offsets.
+// Ring header / entry layout (s4), byte offsets.
 const HDR_HEAD: u64 = 0;
 const HDR_TAIL: u64 = 4;
 const HDR_MASK: u64 = 8;
@@ -76,14 +76,13 @@ const HDR_SIZE: u64 = 16;
 const SQ_ENTRY: u64 = 32;
 const CQ_ENTRY: u64 = 16;
 
-// SQ entry `op` selectors (Design/async_rings.md s4, event_rings.md s4,
-// Design/block_write.md S1).
+// SQ entry `op` selectors (s4, S1).
 const RING_OP_READ: u32 = 0;
 const RING_OP_EVENT_SUB: u32 = 1;
 const RING_OP_CANCEL: u32 = 2;
 const RING_OP_WRITE: u32 = 3;
 
-/// Drop-flag bit in an event completion's `status` (event_rings.md s5): the
+/// Drop-flag bit in an event completion's `status` (s5): the
 /// kernel sets it on the first event posted after one or more were dropped on a
 /// full CQ. Two things happen with it here, at different points. `reap` COUNTS it
 /// -- every completion draining out of the CQ is inspected, so a drop is tallied
@@ -130,7 +129,7 @@ struct Reactor {
     /// Count of event completions reaped carrying the kernel's `EVENT_DROPPED`
     /// flag -- one per burst of CQ-full drops the kernel surfaced (each flagged
     /// completion marks at least one lost event since the previous one on that
-    /// stream, event_rings.md s5). A lower bound on total loss, not the exact
+    /// stream, s5). A lower bound on total loss, not the exact
     /// count; the exact per-subscription tally lives in the kernel. Read via
     /// `events_dropped()` -- the reason input loss is a reported number rather
     /// than a silent stall.
@@ -304,7 +303,7 @@ pub fn init() -> bool {
 /// How many event completions this reactor has reaped carrying the kernel's
 /// `EVENT_DROPPED` flag since the process started -- a monotonically rising
 /// count of the bursts in which the CQ overran and the kernel dropped input
-/// (event_rings.md s5). Zero on a reader that keeps up. `block_on` already voices
+/// (s5). Zero on a reader that keeps up. `block_on` already voices
 /// each new burst on serial; this is the same number as a value, for a tenant
 /// that wants to poll it (a status line, a metric) rather than read the log. It
 /// is a lower bound on events lost (one tick per drop burst, not per event); the
@@ -325,7 +324,7 @@ pub fn undelivered() -> u32 {
 
 /// Push one block I/O submission entry into the SQ at its tail (the kernel
 /// reads it on the next doorbell). `op` selects `RING_OP_READ` or
-/// `RING_OP_WRITE` (Design/block_write.md S1) -- same entry shape either way.
+/// `RING_OP_WRITE` (S1) -- same entry shape either way.
 /// SAFETY: SQ_VA is this process's mapped SQ frame.
 unsafe fn push_sq(op: u32, ud: u64, range_slot: u64, frame_slot: u64, sector_off: u64, count: u64) {
     let mask = r32(SQ_VA + HDR_MASK);
@@ -342,7 +341,7 @@ unsafe fn push_sq(op: u32, ud: u64, range_slot: u64, frame_slot: u64, sector_off
 
 /// Push one event-control entry (EVENT_SUB or CANCEL) into the SQ at its tail.
 /// For EVENT_SUB, `source_slot` names the EventSource cap (it reuses the read
-/// path's `range_slot` field, event_rings.md s4) and `ud` is the subscription
+/// path's `range_slot` field, s4) and `ud` is the subscription
 /// cookie echoed in every event completion; for CANCEL, `ud` names the live
 /// subscription and `source_slot` is ignored. SAFETY: SQ_VA is this process's
 /// mapped SQ frame.
@@ -401,8 +400,8 @@ impl Future for Read {
     }
 }
 
-/// A pending block write -- the write half of `Read` (Design/block_write.md
-/// S1). Same shape and lifecycle: nothing is submitted until first polled,
+/// A pending block write -- the write half of `Read` (S1). Same shape and
+/// lifecycle: nothing is submitted until first polled,
 /// `Ready(status)` once the completion is reaped.
 pub struct Write {
     ud: u64,
@@ -417,7 +416,7 @@ pub struct Write {
 /// BlockRange at `range_slot`, DMA'd out of the frame at `frame_slot`. The
 /// `BlockRange` cap must carry `RIGHT_WRITE` and the frame cap `RIGHT_READ`
 /// (the kernel reads the frame's existing contents to hand to the device) --
-/// the flipped direction from `read` (Design/block_write.md S3).
+/// the flipped direction from `read` (S3).
 pub fn write(range_slot: u64, frame_slot: u64, sector_off: u64, count: u64) -> Write {
     let r = reactor();
     let ud = r.next_ud;
@@ -445,7 +444,7 @@ impl Future for Write {
     }
 }
 
-/// A multishot event subscription over the ring (event_rings.md s6). Unlike a
+/// A multishot event subscription over the ring (s6). Unlike a
 /// one-shot `Read`, its `user_data` cookie persists across completions: one
 /// `RING_OP_EVENT_SUB` arms a standing subscription on an `EventSource`, and
 /// every event on that source posts a completion the kernel tags with this

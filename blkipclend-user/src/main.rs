@@ -1,4 +1,4 @@
-//! IPC blocked-sender reclamation (Design/lender_owed.md D6 slice 4 / K-026).
+//! IPC blocked-sender reclamation (D6 slice 4 / K-026).
 //! The `blkreclaim`/`blkrelend` chains lend over `sys_spawn`; this one lends over
 //! IPC `send_cap`, and forces the give to take the **blocked-sender** branch --
 //! the one path K-026 left un-reserved.

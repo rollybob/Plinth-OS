@@ -1,4 +1,4 @@
-//! The app a shell launches (D8 skin, D6c -- Design/display_skin.md): a real
+//! The app a shell launches (D8 skin, D6c --): a real
 //! process the home screen `spawn`s and hands the framebuffer to.
 //!
 //! It maps the transferred `Framebuffer` capability, draws its own screen, hashes

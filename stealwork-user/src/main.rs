@@ -1,4 +1,4 @@
-//! Work-stealing demo (worker half, Design/smp_scaling.md S4).
+//! Work-stealing demo (worker half, S4).
 //!
 //! `stealer-user` spawns several copies of this worker back to back. Because
 //! `spawn` homes a child to the SPAWNING core, they all pile onto one core's

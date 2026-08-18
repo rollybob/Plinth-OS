@@ -4,7 +4,7 @@
 //! virtio structures live inside a BAR). This module maps that BAR, negotiates
 //! features the modern way, stands up one split virtqueue, and does block I/O.
 //! Stage 1 polls for completion (a bounded spin that faults on timeout, per
-//! Design/filesystem.md D6); the interrupt-driven path is Stage 4.
+//! D6); the interrupt-driven path is Stage 4.
 //!
 //! Discipline (clean-room, single trusted in-kernel driver): the kernel owns
 //! the virtqueue rings (frames from the allocator) and programs descriptors at
@@ -70,7 +70,7 @@ const VIRTIO_BLK_T_OUT: u32 = 1; // write: memory -> device
 const VIRTIO_BLK_S_OK: u8 = 0;
 
 /// Which way data flows between the device and the caller's frame for one
-/// request (Design/block_write.md S2). Controls the request-header type and
+/// request (S2). Controls the request-header type and
 /// whether the data descriptor is device-writable: a read has the device DMA
 /// *into* the frame (device-writable descriptor), a write has it DMA *out of*
 /// the frame (device-readable descriptor, the same as the header/status
@@ -87,7 +87,7 @@ const SECTOR_SIZE: u64 = 512;
 
 /// Block I/O status codes. The data lands in the caller's frame, so status is
 /// its own word and no read-back byte can be confused for an error. These ride
-/// the CQ entry's `status` field (Design/async_rings.md s4) and are mirrored in
+/// the CQ entry's `status` field (s4) and are mirrored in
 /// libplinth as BLK_*; the block I/O path is the ring ABI (`rings`), the
 /// `block_read` syscall having been retired in ABI v2.4.
 pub const BLK_OK: u64 = 0;
@@ -146,7 +146,7 @@ pub(crate) enum Completion {
     Ring { ring: usize, user_data: u64 },
 }
 
-/// Routing recorded for one in-flight request (Design/async_rings.md s5): the
+/// Routing recorded for one in-flight request (s5): the
 /// completion handler reads `target` to route the result.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Inflight {
@@ -155,7 +155,7 @@ pub(crate) struct Inflight {
 
 /// Per-device in-flight bookkeeping: a free pool of descriptor-chain slots plus
 /// the routing entry for each live slot. This is the completion-demux core
-/// (Design/async_rings.md section 5) factored as pure logic over plain arrays --
+/// (section 5) factored as pure logic over plain arrays --
 /// no MMIO -- so it is unit-testable host-side with a fake used ring, exactly
 /// like `ipc::WaitQueue`. The MMIO (writing descriptors, reading the status
 /// byte and used ring) stays in `VirtioBlk`; this owns only the bookkeeping.
@@ -247,7 +247,7 @@ struct VirtioBlk {
     /// not share the device-written status byte.
     buf_va: u64,
     buf_phys: u64,
-    /// In-flight free pool + completion-demux routing (Design/async_rings.md s5).
+    /// In-flight free pool + completion-demux routing (s5).
     inflights: Inflights,
     /// Last used-ring index we have consumed (the ring's idx is free-running).
     last_used: u16,
@@ -441,7 +441,7 @@ impl VirtioBlk {
     /// completion's `(target, status)` into `out` for the caller to act on after
     /// dropping the device lock. Returns how many it recorded.
     ///
-    /// This is the completion demux (Design/async_rings.md s5): the device's
+    /// This is the completion demux (s5): the device's
     /// echoed head is the routing key, mapping one-to-one to the slot that
     /// issued it. Call under the device lock.
     fn drain_completions(&mut self, out: &mut [(Completion, u64)]) -> usize {
@@ -491,7 +491,7 @@ impl VirtioBlk {
     /// then drain the one completion. Read-only: no boot-time path needs a
     /// polled write, so this stays the shape it always was rather than
     /// generalizing over `Direction` for a caller that does not exist
-    /// (Design/block_write.md S2 sketched a polled `write` sibling, but nothing
+    /// (S2 sketched a polled `write` sibling, but nothing
     /// in this milestone calls it -- the real write path is the ring path
     /// below, `ring_post`, which is direction-aware and exercised by
     /// `blkwrite-user`).
@@ -768,7 +768,7 @@ pub fn read(dev: usize, sector: u64, count: u64, data_phys: u64) -> Result<(), &
 /// Post one ring-submitted request into device `dev`: claim an in-flight slot
 /// recording the CQ routing (`ring` + `user_data`), then post the 3-descriptor
 /// chain at the caller's frame physical address with completion interrupts
-/// enabled. `dir` selects read vs. write (Design/block_write.md S2). Returns
+/// enabled. `dir` selects read vs. write (S2). Returns
 /// `Ok(())` once posted, or `Err(())` when the device's in-flight pool is full
 /// -- the ring drain treats that as backpressure (R6) and stops, leaving the
 /// remaining SQ entries for the libOS to resubmit. The completion IRQ

@@ -1,6 +1,6 @@
-//! The shell -- the visual userspace skin (D8, Design/display_skin.md): a splash,
+//! The shell -- the visual userspace skin (D8): a splash,
 //! a home screen of app icons, keyboard navigation, a mouse cursor, and
-//! launching by click (Design/clickable_apps.md slices 1 and 2).
+//! launching by click (slices 1 and 2).
 //!
 //! It holds the whole-screen `Framebuffer` (FB_SLOT), the keyboard `EventSource`
 //! (KBD_SLOT) and the mouse `EventSource` (MOUSE_SLOT). Two icons are shell-drawn
@@ -55,7 +55,7 @@ const HASH_SIDE: u32 = 128;
 const ICON_LABELS: [&[u8]; 4] = [b"INFO", b"BARS", b"CRASH", b"APP"];
 
 /// Which icons launch a real process, and which `SPAWNABLE` id each one is
-/// (Design/clickable_apps.md C3). `None` is a shell-drawn view.
+/// (C3). `None` is a shell-drawn view.
 ///
 /// This table is library-OS policy and deliberately NOT a kernel registry: the
 /// kernel exposes `SPAWNABLE` ids and `sys_spawn`, and which of them are offered
@@ -80,13 +80,13 @@ const ICON_APPS: [Option<u64>; 4] = [
 const SHELLAPP_ID: u64 = 3;
 /// fbreclaimchild's index in the same table. It maps the screen, draws to prove
 /// it really holds it, and then FAULTS while still holding it -- the case the
-/// whole reclamation milestone exists for (Design/cap_reclaim.md D6, C6 here).
+/// whole reclamation milestone exists for (D6, C6 here).
 const FBRECLAIMCHILD_ID: u64 = 5;
 
 /// Icon cell geometry. The *spacing* (`ICON_W + ICON_GAP`, `ICON_H + ICON_GAP`)
 /// is resolution-independent even though the grid ORIGIN is centred, which is
 /// what lets a scripted pointer journey move between icons in fixed deltas on
-/// any resolution (Design/clickable_apps.md C7).
+/// any resolution (C7).
 const ICON_W: u32 = 200;
 const ICON_H: u32 = 120;
 const ICON_GAP: u32 = 48;
@@ -103,7 +103,7 @@ const CURSOR_FG: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
 
 /// The pointer: a position, a visibility flag, and the pixels it is covering.
 ///
-/// Save-under (Design/clickable_apps.md C4): the block beneath the pointer is
+/// Save-under (C4): the block beneath the pointer is
 /// captured before it is drawn and written back before it moves, so a pointer
 /// move repaints `2 * CURSOR_SIDE^2` pixels instead of the screen. A full repaint
 /// per packet would undo the flicker fix in `cc5c6f7`, which is visible because
@@ -209,7 +209,7 @@ fn draw_splash(fb: &Framebuffer) {
     // The pointer is the same shape of problem and gets the same answer: it lives
     // outside the hashed square too, so `report_over` and `report_click` below
     // emit its state to serial rather than trusting a frame hash to catch it
-    // (Design/clickable_apps.md C4).
+    // (C4).
     sys_write(b"shell: ");
     sys_write(&banner[..n]);
     sys_write(b"\n");
@@ -427,7 +427,7 @@ fn launch_app(
     // with the capability, so the old mapping is gone and touching it would fault
     // -- which is the point: this shell can draw because it holds the capability
     // and mapped it, not because a page-table entry happened to survive the
-    // handoff (Design/fb_mapping.md D3).
+    // handoff (D3).
     let fb = match Framebuffer::map(new_slot, MAP_BASE) {
         Some(fb) => fb,
         None => {
@@ -507,7 +507,7 @@ pub extern "C" fn _start(_idx: u64) -> ! {
 
     // Rebindable: the mapping is torn down whenever the capability leaves this
     // table, so every launch round-trip ends with a fresh `map` (ABI v2.8 fix,
-    // Design/fb_mapping.md D1/D3).
+    // D1/D3).
     let mut fb = match Framebuffer::map(FB_SLOT, MAP_BASE) {
         Some(fb) => fb,
         None => {
@@ -538,7 +538,7 @@ pub extern "C" fn _start(_idx: u64) -> ! {
     // and it is also what makes the scripted journey resolution-independent: from
     // an icon centre, every other icon is a FIXED delta away -- ICON_W + ICON_GAP
     // across, ICON_H + ICON_GAP down -- on any screen size, even though the grid
-    // origin itself is not (Design/clickable_apps.md C7).
+    // origin itself is not (C7).
     {
         let info = fb.info();
         let (ix, iy, iw, ih) = icon_rect(info.width, info.height, sel);
@@ -560,7 +560,7 @@ pub extern "C" fn _start(_idx: u64) -> ! {
     // second launch would hand the app the stale wait-handle instead.
     //
     // **The migration described above stopped happening on 2026-08-10**
-    // (Design/lender_owed.md D2(D), homecoming reservation). The slot a
+    // (D2(D), homecoming reservation). The slot a
     // capability is lent from is now RESERVED for its return, so the screen comes
     // back to the slot it left -- measured across the whole tour as
     // 0x1, 0x1, 0x1, 0x1, 0x1, where it previously walked 0x1, 0x8, 0x9, 0xa, 0xa.
@@ -619,7 +619,7 @@ pub extern "C" fn _start(_idx: u64) -> ! {
                         fb = nfb;
                         fb_slot = nslot;
                         // The homecoming guarantee, guarded where it is relied
-                        // on (lender_owed.md D2(D)): the screen returns to the
+                        // on (D2(D)): the screen returns to the
                         // slot it was lent from, launch after launch, whether
                         // the app exited politely or died holding it.
                         if nslot != prev_slot {
@@ -693,7 +693,7 @@ pub extern "C" fn _start(_idx: u64) -> ! {
                         fb = nfb;
                         fb_slot = nslot;
                         // The homecoming guarantee, guarded where it is relied
-                        // on (lender_owed.md D2(D)): the screen returns to the
+                        // on (D2(D)): the screen returns to the
                         // slot it was lent from, launch after launch, whether
                         // the app exited politely or died holding it.
                         if nslot != prev_slot {

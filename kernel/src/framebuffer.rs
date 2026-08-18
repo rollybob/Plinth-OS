@@ -1,4 +1,4 @@
-//! Framebuffer discovery (Design/display.md).
+//! Framebuffer discovery.
 //!
 //! The bootloader hands the kernel a UEFI GOP linear framebuffer in `BootInfo`
 //! -- a memory-mapped pixel region with a base, geometry, and pixel format. The
@@ -108,7 +108,7 @@ pub fn region() -> Option<FbRegion> {
 }
 
 /// A capability for a horizontal BAND of the framebuffer -- `rows` rows starting
-/// at row `y0` (Design/display.md Stage 4). The band is the same `Framebuffer`
+/// at row `y0` (Stage 4). The band is the same `Framebuffer`
 /// variant with the base offset to the band's first row and the height reduced;
 /// `stride` (and thus the full row pitch) is unchanged, so a band is a contiguous
 /// physical sub-range, disjoint from every other band. fb_map maps exactly the

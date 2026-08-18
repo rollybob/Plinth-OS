@@ -536,7 +536,7 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool) -> Command {
         "-m", "256M",
         "-cpu", "qemu64",
         // Pin the display adapter so OVMF's GOP hands the bootloader a linear
-        // framebuffer with stable geometry (Design/display.md D6, Stage 1).
+        // framebuffer with stable geometry (D6, Stage 1).
         // Smoke/test add `-display none` (headless) in run_capture; the device
         // stays present either way, so the framebuffer exists with or without a
         // host window -- and `run` and `smoke` see identical pixels, so the
@@ -553,8 +553,8 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool) -> Command {
 
     // Plinth is deliberately uniprocessor by default: deterministic serial
     // output is a feature, not a limitation, and `-smp 1` is the regression
-    // net every other check still runs against (Design/broader_hardware.md
-    // D8). PLINTH_SMP=N opts into N cores for testing AP bring-up (Stage B1)
+    // net every other check still runs against (D8). PLINTH_SMP=N opts into
+    // N cores for testing AP bring-up (Stage B1)
     // and, later, real cross-core scheduling (Stage B2) -- off by default, and
     // the kernel does not depend on it for anything `smoke`/`test` assert.
     let smp = std::env::var("PLINTH_SMP").unwrap_or_else(|_| "1".to_string());
@@ -1108,7 +1108,7 @@ fn check_reap(actual: &str) {
     }
 }
 
-/// Verify the cap_release regression (Design/cap_release.md): a released
+/// Verify the cap_release regression: a released
 /// capability slot is reusable, so a process can spawn and join more times than
 /// the system could ever have wait handles outstanding at once.
 ///
@@ -1124,7 +1124,7 @@ fn check_reap(actual: &str) {
 /// still free, because a leaked handle keeps its result endpoint referenced and
 /// `MAX_ENDPOINTS` is 8. The regression is caught either way -- `ROUNDS` clears
 /// both -- but this check should not be cited as evidence about table capacity.
-/// See A-13 in Design/known_bugs.md.
+/// See A-13.
 fn check_caprelease(actual: &str, rounds: u64) {
     let marker = "caprelease: ";
     let got = actual
@@ -1151,7 +1151,7 @@ fn check_caprelease(actual: &str, rounds: u64) {
     }
 }
 
-/// Verify the work-stealing demo (S4, Design/smp_scaling.md section 6). Two
+/// Verify the work-stealing demo (S4, section 6). Two
 /// facts: (1) every worker completed -- `workers` distinct `stealwork[id] done`
 /// lines AND the parent's `stealer: joined <workers> workers` line; (2) at
 /// least one process actually moved to another core's array -- the kernel's
@@ -1289,7 +1289,7 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     check_gfxsplit(&actual);
     check_frames_baseline(&actual, "gfxsplit");
     check_frames_baseline(&actual, "gfxbound");
-    // The D7 hazard (Design/fb_mapping.md): unmapping a framebuffer must not
+    // The D7 hazard: unmapping a framebuffer must not
     // hand its firmware MMIO pages to the frame allocator. If the fb release
     // path ever reuses the Frame path's unmap-AND-deallocate, `after` climbs by
     // ~1000 and this is what catches it.
@@ -1302,20 +1302,20 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     // reclamation worked. The two differing hashes in the boot log are what say
     // that; this only says nothing was leaked while doing it.
     check_frames_baseline(&actual, "fbreclaim");
-    // The BlockRange counterpart to fbreclaim (lender_owed.md slice 4): the first
+    // The BlockRange counterpart to fbreclaim (slice 4): the first
     // non-framebuffer lender. A BlockRange owns no frames (inline data), so the
     // baseline proves only that the parent's and child's I/O frames are both
     // reclaimed at teardown -- the homecoming-to-reserved-slot proof is the
     // asserted `range came back at slot ...` line in expected_boot_log.txt, which
     // names BLOCK_SLOT and goes red if the reservation is disabled.
     check_frames_baseline(&actual, "blkreclaim");
-    // The A -> B -> C re-lend chain (lender_owed.md slice 4 step 2 / K-025). Three
+    // The A -> B -> C re-lend chain (slice 4 step 2 / K-025). Three
     // processes touch the range; a BlockRange owns no frames, so the baseline
     // proves every I/O frame is reclaimed at teardown. The K-025 proof is the
     // asserted `range came home to root at slot ...` line, which goes to NO_CAP if
     // the origin is laundered.
     check_frames_baseline(&actual, "blkrelend");
-    // The IPC blocked-sender reclamation (lender_owed.md slice 4 / K-026). The
+    // The IPC blocked-sender reclamation (slice 4 / K-026). The
     // sender lends a BlockRange over `send_cap` while blocked; the frame baseline
     // proves its and the receiver's I/O frames are reclaimed, and the endpoint
     // baseline proves the shared endpoint plus the spawn result channel are freed.

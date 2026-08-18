@@ -1,4 +1,4 @@
-//! Work-stealing demo (parent half, Design/smp_scaling.md S4).
+//! Work-stealing demo (parent half, S4).
 //!
 //! Forces the imbalance a work-steal resolves, and asserts the workers all
 //! complete. `spawn` is non-blocking and homes each child to the SPAWNING

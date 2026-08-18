@@ -2,7 +2,7 @@
 //!
 //! Stage 1 of storage bring-up. Plinth boots on QEMU q35, where "virtio" means
 //! virtio-pci: virtio-mmio is an arm / `microvm` transport that does not use
-//! the UEFI boot path Plinth relies on (see Design/filesystem.md, D1). Finding
+//! the UEFI boot path Plinth relies on (D1). Finding
 //! the device needs no new mechanism -- the legacy 0xCF8/0xCFC configuration
 //! ports are port I/O, exactly what the PIC/PIT driver already does. ACPI MCFG
 //! / ECAM parsing is a later refinement, not needed to locate one device on

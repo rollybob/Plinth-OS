@@ -103,7 +103,7 @@ impl Framebuffer {
     /// a u32. Out-of-bounds reads yield 0.
     ///
     /// Deliberately raw rather than `-> (r, g, b)`: this exists for save-under
-    /// (Design/clickable_apps.md C4), where a saved pixel must be restored
+    /// (C4), where a saved pixel must be restored
     /// *exactly*. Round-tripping through (r, g, b) is lossy -- `FB_FMT_U8`
     /// averages the three channels on the way in and cannot recover them, and an
     /// unknown layout keeps only red -- so a save/restore built on `put_pixel`
@@ -155,8 +155,8 @@ impl Framebuffer {
 
     /// FNV-1a hash over the `side` x `side` square at the origin, read back
     /// through the mapping byte by byte (via the row stride, so it is
-    /// resolution-independent). This is the determinism proof (Design/display.md
-    /// D6): a known draw yields a known hash, asserted on the serial console.
+    /// resolution-independent). This is the determinism proof (D6): a known
+    /// draw yields a known hash, asserted on the serial console.
     /// `side` is clamped to the screen.
     pub fn hash_origin_square(&self, side: u32) -> u64 {
         const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;

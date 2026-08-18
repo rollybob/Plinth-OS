@@ -1,5 +1,5 @@
 //! On-disk format, mount, and the create/read/delete operations
-//! (Design/readwrite_fs.md S2/S4/S5, Stage 2-3).
+//! (S2/S4/S5, Stage 2-3).
 //!
 //! Layout within the granted `BlockRange` (sectors, relative to the range's
 //! own start):
@@ -29,7 +29,7 @@ use crate::directory::{self, DirError, ENTRY_SIZE};
 const SECTOR: usize = 512;
 const MAGIC: [u8; 8] = *b"PLNTHRW1";
 
-/// Directory capacity (Design/readwrite_fs.md S3: "a fixed cap... chosen
+/// Directory capacity (S3: "a fixed cap... chosen
 /// generously for a demo"). 16 entries comfortably covers the create/read/
 /// delete/reuse demo (S6) with room to spare.
 pub const MAX_ENTRIES: usize = 16;
@@ -56,7 +56,7 @@ const DIR_OFF: usize = BITMAP_OFF + BITMAP_BYTES;
 pub const META_BYTES: usize = DATA_START * SECTOR;
 
 /// One frame's worth of file bytes is this milestone's file-size ceiling
-/// (Design/readwrite_fs.md S4: fixed size at creation, no growth) -- no file
+/// (S4: fixed size at creation, no growth) -- no file
 /// in the S6 demo approaches it.
 pub const MAX_FILE_BYTES: usize = PAGE_SIZE as usize;
 
@@ -104,7 +104,7 @@ impl Mount {
     /// Format `range_slot` (a `BlockRange` of `total_sectors` sectors,
     /// `RIGHT_READ | RIGHT_WRITE`) fresh: a zeroed (all-free) bitmap and
     /// directory plus a written superblock, then read the metadata region
-    /// back and verify it landed -- the round-trip proof `block_write.md`'s
+    /// back and verify it landed -- the round-trip proof the block-write
     /// demo already established for the raw primitive, applied one layer up.
     pub fn format(
         range_slot: u64,

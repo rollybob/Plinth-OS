@@ -1,4 +1,4 @@
-//! Mouse input demo (Design/mouse_input.md S2): an event STREAM over the
+//! Mouse input demo (S2): an event STREAM over the
 //! second `EventSource`.
 //!
 //! Mirrors `evtstream-user` exactly, but subscribes to source 1 (the mouse)

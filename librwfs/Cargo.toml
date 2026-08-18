@@ -1,5 +1,5 @@
-# Standalone crate -- intentionally not a workspace member (Design/
-# readwrite_fs.md S1: a new crate, parallel to libfs). The bitmap allocator
+# Standalone crate -- intentionally not a workspace member (S1: a new
+# crate, parallel to libfs). The bitmap allocator
 # and directory are pure logic over byte slices and build/test on the host;
 # the syscall-backed format/mount layer (Stage 2) builds only on the bare
 # target, the same split libfs uses between archive.rs and load.rs.

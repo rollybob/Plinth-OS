@@ -1,4 +1,4 @@
-//! Framebuffer revocation demo (D7, Design/fb_mapping.md) -- the negative case.
+//! Framebuffer revocation demo (D7) -- the negative case.
 //!
 //! A mapping is not authority. This process maps its framebuffer band, writes
 //! through the mapping to prove it is live, RELEASES the capability that

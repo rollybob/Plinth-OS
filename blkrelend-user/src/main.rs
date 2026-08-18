@@ -1,4 +1,4 @@
-//! Re-lend chain, the ROOT (Design/lender_owed.md D6 slice 4, step 2 / K-025).
+//! Re-lend chain, the ROOT (D6 slice 4, step 2 / K-025).
 //! `blkreclaim-user` proved a lent `BlockRange` comes home when its direct
 //! borrower dies; this proves it comes home to the RIGHT process when the borrower
 //! passes it on and the *grandchild* dies -- the case K-025 got wrong.
@@ -23,7 +23,7 @@
 //!
 //! **The load-bearing assertion is here: A gets the range back at BLOCK_SLOT.**
 //! The kernel records the landing on the LENDER's own scheduler slot
-//! (cap_reclaim.md D7), so A learns it on its next `recv_cap` even though A is
+//! (D7), so A learns it on its next `recv_cap` even though A is
 //! blocked on B, not on the C that died. Watched failing by reverting the K-025
 //! fix in `spawn_scheduled` (preserve-origin -> unconditional overwrite): the
 //! range then homes to B, A's wake carries `NO_CAP`, and the "no landing slot"

@@ -1,4 +1,4 @@
-//! PS/2 mouse -- the second input event source (Design/mouse_input.md).
+//! PS/2 mouse -- the second input event source.
 //!
 //! Owns the i8042's second port: bring it up alongside the keyboard's port-1
 //! init (`keyboard::init` already disables both ports and flushes stale data
@@ -6,7 +6,7 @@
 //! packed `EVENT_MOUSE_MOVE` event per packet into `input::record` (S1: one
 //! event per packet, not one per axis, so a CQ-full drop cannot desync a
 //! surviving dx/dy from a dropped button sample). Like the keyboard, the
-//! handler never switches processes (input.md D7); a blocked reader wakes at
+//! handler never switches processes (D7); a blocked reader wakes at
 //! the next scheduler tick.
 //!
 //! A missing mouse (no port-2 device, e.g. a stripped-down machine type) must
@@ -157,7 +157,7 @@ impl Packet {
 
 /// Decode one PS/2 axis from its magnitude byte and 9th (sign) bit. The true
 /// value is a 9-bit two's complement (-256..255); clamped to i8 (-128..127)
-/// per mouse_input.md S1 -- the packed `Event` has no room for more, and a
+/// per S1 -- the packed `Event` has no room for more, and a
 /// single packet's delta exceeding +-127 counts is not reached at normal
 /// tracking rates. The 9-bit overflow flag (byte 0 bits 6/7) is deliberately
 /// not consulted: clamping already bounds the result, so the extra precision

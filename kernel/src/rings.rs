@@ -1,4 +1,4 @@
-//! Async completion rings (Design/async_rings.md): per-process shared-memory
+//! Async completion rings: per-process shared-memory
 //! submission/completion queues for block I/O.
 //!
 //! The library OS produces SQ entries and reaps CQ entries from memory; the
@@ -54,7 +54,7 @@ const RING_HDR_SIZE: u64 = 16;
 const MAX_ENTRIES: u64 = 64;
 
 /// SQ entry `op` field. v1 was reads only (R1); event rings add two multishot
-/// control ops (event_rings.md s4).
+/// control ops (s4).
 const RING_OP_READ: u32 = 0;
 /// Open a multishot event subscription: the `range_slot` field names an
 /// `EventSource` cap (RIGHT_READ), `user_data` is the stream cookie echoed in
@@ -63,7 +63,7 @@ const RING_OP_EVENT_SUB: u32 = 1;
 /// Cancel a live subscription named by its `user_data` cookie on this ring.
 const RING_OP_CANCEL: u32 = 2;
 /// Write `count` sectors from the I/O frame to the `BlockRange`'s device --
-/// the write half of RING_OP_READ (Design/block_write.md S1). Same entry
+/// the write half of RING_OP_READ (S1). Same entry
 /// shape; only the cap-check direction and the virtio request type differ.
 const RING_OP_WRITE: u32 = 3;
 
@@ -290,7 +290,7 @@ pub fn ring_submit(ring_slot: u64) -> u64 {
 
 /// Dispatch one SQ entry (read-once kernel copy) by `op`. READ is the block
 /// path; EVENT_SUB / CANCEL are the multishot event-subscription control ops
-/// (event_rings.md s4). An unknown op is completed with an error and consumed,
+/// (s4). An unknown op is completed with an error and consumed,
 /// so a malformed entry never wedges the ring.
 fn post_entry(
     id: usize,
@@ -374,7 +374,7 @@ fn post_read(
 }
 
 /// Validate one block-write entry against CURRENT and post it to the device.
-/// The write half of `post_read` (Design/block_write.md S1/S3): the request
+/// The write half of `post_read` (S1/S3): the request
 /// must lie inside the holder's BlockRange (RIGHT_WRITE this time -- the
 /// direction the cap must be minted for), and the I/O frame must be the
 /// holder's with RIGHT_READ (the kernel reads its existing contents to hand to
@@ -454,7 +454,7 @@ pub fn post_completion(id: usize, user_data: u64, status: u64) -> Option<usize> 
 
 /// Post an event completion into ring `id`'s CQ, dropping the newest event if
 /// the CQ is full (the producer-initiated backpressure the block path never
-/// needs, event_rings.md s5). Returns `(admitted, wake)`: `admitted` is false
+/// needs, s5). Returns `(admitted, wake)`: `admitted` is false
 /// iff the event was dropped on a full CQ (the caller bumps the subscription's
 /// dropped count); `wake` is the owner to wake if it was parked in `ring_wait`.
 fn post_event(id: usize, user_data: u64, status: u32) -> (bool, Option<usize>) {
@@ -551,7 +551,7 @@ fn post_cancel(id: usize, user_data: u64) -> Outcome {
 /// Post an event-subscription error completion and consume the entry. The status
 /// is `EVENT_SUB_ERR` (0): a real event always packs a nonzero kind byte
 /// (`Event::pack`), so a zero status is the shim's unambiguous "not an event ->
-/// subscribe failed" signal (event_rings.md s5).
+/// subscribe failed" signal (s5).
 fn finish_event_err(id: usize, user_data: u64) -> Outcome {
     post_status(id, user_data, EVENT_SUB_ERR);
     Outcome::Consumed
@@ -601,11 +601,11 @@ pub fn release(id: usize) {
     subs.release_ring(id);
 }
 
-// --- event subscriptions: the multishot routing core (event_rings.md) --------
+// --- event subscriptions: the multishot routing core --------
 //
 // Input is producer-initiated -- a keystroke answers no request -- so it rides
-// the ring as a *multishot* subscription, not a one-shot read (event_rings.md
-// s2): one RING_OP_EVENT_SUB arms a standing subscription naming an EventSource,
+// the ring as a *multishot* subscription, not a one-shot read (s2): one
+// RING_OP_EVENT_SUB arms a standing subscription naming an EventSource,
 // and every event on that source posts a completion into the subscribing ring's
 // CQ tagged with the subscription's user_data, until a RING_OP_CANCEL. The SQ
 // thus carries control (subscribe, cancel), not one entry per event.
@@ -696,7 +696,7 @@ pub(crate) const MAX_SUBS: usize = MAX_RINGS * 4;
 /// reader learns it missed events between the last reaped completion and this
 /// one. It overlays the always-zero high bits of a packed key event
 /// (`Event::pack` puts the make/break value, 0 or 1, in bits 24..32), so it
-/// never collides with a real event field. (event_rings.md s4/s5.)
+/// never collides with a real event field. (s4/s5.)
 pub(crate) const EVENT_DROPPED: u32 = 1 << 31;
 
 /// One multishot subscription: every event on `source` posts a completion into

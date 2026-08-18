@@ -29,7 +29,7 @@ mod elf;
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod fault;
 mod frame_alloc;
-// The framebuffer bring-up (Stage 1 of the visual milestone, Design/display.md)
+// The framebuffer bring-up (Stage 1 of the visual milestone)
 // draws + hashes the GOP framebuffer only on the userspace boot path; the test
 // build stops before it.
 #[cfg_attr(feature = "tests", allow(dead_code))]
@@ -55,7 +55,7 @@ mod input;
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod keyboard;
 mod memory;
-// The PS/2 mouse device (the second event source, Design/mouse_input.md) runs
+// The PS/2 mouse device (the second event source) runs
 // only on the userspace boot path; its IRQ12 vector is installed in every
 // build (interrupts::init). Its packet decode (`Packet`/`decode_axis`) is
 // pure logic exercised by the test suite, like the keyboard's `Event` coding.
@@ -118,7 +118,7 @@ const BOOTLOADER_CONFIG: BootloaderConfig = {
     // physical memory must be reachable from kernel virtual addresses.
     c.mappings.physical_memory = Some(Mapping::Dynamic);
     // Map the UEFI GOP framebuffer into the kernel address space for the Stage 1
-    // display bring-up (Design/display.md). Dynamic placement matches
+    // display bring-up. Dynamic placement matches
     // physical_memory above; the bootloader sets up GOP and fills
     // boot_info.framebuffer when a display adapter is present (the smoke QEMU
     // pins one with -vga std). This is the default, set explicitly for clarity.
@@ -193,13 +193,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // faults before sending, to exercise death-time reaping), id 2 =
         // stealwork (a CPU-bound worker the work-stealing S4 demo spawns en
         // masse onto one core), id 3 = shellapp (the app the D8 shell launches
-        // and hands the framebuffer to -- Design/display_skin.md; shell-user
-        // mirrors this id as SHELLAPP_ID), id 4 = quietworker (a silent
+        // and hands the framebuffer to -- shell-user mirrors this id as
+        // SHELLAPP_ID), id 4 = quietworker (a silent
         // grantee, spawned in a loop by the cap_release demo -- a chatty child
         // would add twenty lines to expected_boot_log for nothing), id 5 =
         // fbreclaimchild (the child that FAULTS holding a transferred
         // framebuffer, so the reclamation demo can prove the capability comes
-        // home -- Design/cap_reclaim.md D6; fbreclaim-user mirrors this id as
+        // home -- D6; fbreclaim-user mirrors this id as
         // FBRECLAIMCHILD_ID, and spawnwaitcap-user reuses the same child rather
         // than shipping a near-copy of it), id 6 = fbreleasechild (the child that
         // VOLUNTARILY RELEASES a transferred framebuffer with cap_release rather
@@ -209,16 +209,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // child that reads a sector through a TRANSFERRED BlockRange to prove it
         // holds it, then FAULTS, so the block-reclamation demo can prove a
         // non-framebuffer capability comes home to the lender's reserved slot --
-        // Design/lender_owed.md slice 4; blkreclaim-user mirrors this id as
+        // slice 4; blkreclaim-user mirrors this id as
         // BLKRECLAIMCHILD_ID, and is the first lender that does not lend the screen).
         // id 8 = blkrelendmid (the INTERMEDIARY in the A -> B -> C re-lend chain:
         // it receives a BlockRange on loan from blkrelend-user, re-lends it to
         // blkreclaimchild, and proves the range goes home to the ROOT rather than
-        // back to itself -- the K-025 watch, Design/lender_owed.md slice 4 step 2).
+        // back to itself -- the K-025 watch, slice 4 step 2).
         // id 9 = blkrecvchild (the RECEIVER in the K-026 IPC blocked-sender watch:
         // blkipclend-user send_caps it a BlockRange while blocked, it receives over
         // IPC and faults holding it, so reclamation must route the range home to
-        // the blocked sender's reserved slot -- Design/lender_owed.md slice 4).
+        // the blocked sender's reserved slot -- slice 4).
         //
         // Ids are positional, so appending is safe but INSERTING is not: every
         // id after the insertion point shifts and the mirrored constants in the
@@ -238,7 +238,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
 
-        // Stage 1 display bring-up (Design/display.md): draw a fixed test
+        // Stage 1 display bring-up: draw a fixed test
         // pattern into the GOP framebuffer the bootloader mapped for us and hash
         // a fixed sub-rectangle to serial, proving the framebuffer exists under
         // the test config and that a known draw is byte-deterministic. This is a
@@ -278,15 +278,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         // Bring up the i8042 keyboard (the first input event source) and unmask
         // IRQ1. Scancodes flow through `input::record`, which routes them to any
-        // ring subscribed to the source (event_rings.md); the evt/kbd demos
+        // ring subscribed to the source; the evt/kbd demos
         // below prove that producer -> subscription -> reader path end to end.
         // Input is raw scancodes -- the keymap is libOS policy, so nothing here
         // turns a scancode into a character.
         keyboard::init();
         let _ = writeln!(serial, "plinth: keyboard ready (i8042, IRQ1)");
 
-        // Bring up the i8042's second port (the mouse, source 1,
-        // Design/mouse_input.md) and unmask IRQ12, if a device answers. A
+        // Bring up the i8042's second port (the mouse, source 1) and unmask
+        // IRQ12, if a device answers. A
         // missing mouse is logged, not a boot fault (S4) -- the rest of boot
         // proceeds either way, and the mouse demo below grants the
         // EventSource only if `mouse::present()`.
@@ -499,7 +499,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let _ = writeln!(serial, "plinth: {after_spawn} frames free after spawn");
         let _ = writeln!(serial, "plinth: {} endpoints free after spawn", free_endpoints());
 
-        // cap_release demo (Design/cap_release.md, ABI v2.8): a capability slot,
+        // cap_release demo (ABI v2.8): a capability slot,
         // once released, is genuinely reusable. A capability table is a fixed 16
         // slots with no heap behind it, and until v2.8 nothing could empty one on
         // request except frame_free -- which type-checked for Frame, so a spent
@@ -521,7 +521,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let _ = writeln!(serial, "plinth: {after_caprel} frames free after caprelease");
         let _ = writeln!(serial, "plinth: {} endpoints free after caprelease", free_endpoints());
 
-        // Work-stealing demo (SMP scaling S4, Design/smp_scaling.md section 6).
+        // Work-stealing demo (SMP scaling S4, section 6).
         // The parent spawns three CPU-bound workers back to back; spawn homes
         // every child to the spawning core, so all four processes pile onto one
         // core's run queue while the other cores sit idle. The two facts this
@@ -600,7 +600,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_async} frames free after asyncblk");
         }
 
-        // Block write path (Design/block_write.md): the write half of the ring
+        // Block write path: the write half of the ring
         // ABI. The kernel grants blkwrite-user a BlockRange over device 0
         // sectors [8, 12) -- clear of every other demo's range on this device --
         // minted with RIGHT_READ | RIGHT_WRITE, since the demo round-trips
@@ -616,7 +616,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // every other demo's range -- is minted RIGHT_READ only. The demo
         // attempts a write through it and asserts the kernel rejects with
         // BLK_E_RIGHTS: the negative-case mirror of blk-user's out-of-range
-        // probe, closing the gap block_write.md's follow-up note flagged (no
+        // probe, closing the gap the block-write follow-up note flagged (no
         // demo asserted a write through a RIGHT_READ-only grant is rejected).
         if virtio_blk::ready(0) {
             const BLKWRITE_BIN: &[u8] =
@@ -643,7 +643,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_blkwrite} frames free after blkwrite");
         }
 
-        // Block-range RECLAMATION (Design/lender_owed.md D6, slice 4): the first
+        // Block-range RECLAMATION (D6, slice 4): the first
         // lender that does not lend the screen. Where fbreclaim proves a lent
         // FRAMEBUFFER survives the borrower's death, this proves the same for a
         // BlockRange -- the kind slice 4 added to `capability::is_reclaimable_kind`.
@@ -672,7 +672,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_blkreclaim} frames free after blkreclaim");
         }
 
-        // Block-range RE-LEND chain (Design/lender_owed.md D6 slice 4 step 2, the
+        // Block-range RE-LEND chain (D6 slice 4 step 2, the
         // K-025 watch). blkreclaim above proves a lent BlockRange comes home when
         // its DIRECT borrower dies; this proves it comes home to the RIGHT process
         // when the borrower passes it on. The kernel grants blkrelend-user (A) a
@@ -700,8 +700,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_blkrelend} frames free after blkrelend");
         }
 
-        // Block-range reclamation over the IPC blocked-sender path (Design/
-        // lender_owed.md D6 slice 4, the K-026 watch). Every lender above lends
+        // Block-range reclamation over the IPC blocked-sender path (D6
+        // slice 4, the K-026 watch). Every lender above lends
         // over sys_spawn (the spawn_scheduled give-side); this one lends over IPC
         // send_cap, and forces the OTHER give-side -- transfer_blocked_to_current,
         // the path K-026 left un-reserved until 6b68dd5. The kernel grants
@@ -902,7 +902,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_uni} frames free after unified");
         }
 
-        // Mouse input (Design/mouse_input.md S2): a second EventSource. The
+        // Mouse input (S2): a second EventSource. The
         // kernel grants mouse-user a read capability on input source 1 (the
         // mouse) and nothing else; the process opens a multishot subscription
         // (the same libos stream adapter the keyboard's evtstream-user uses)
@@ -927,7 +927,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_mouse} frames free after mouse");
         }
 
-        // Read-write filesystem (Design/readwrite_fs.md S6): the librwfs
+        // Read-write filesystem (S6): the librwfs
         // library OS over the block write path. The kernel grants rwfs-user a
         // BlockRange over device 0 sectors [32, 96) -- clear of every other
         // demo's range on this device -- minted RIGHT_READ | RIGHT_WRITE (a
@@ -953,7 +953,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_rwfs} frames free after rwfs");
         }
 
-        // Visual userspace (Stage 2, Design/display.md): the framebuffer as a
+        // Visual userspace (Stage 2): the framebuffer as a
         // capability. The kernel grants gfx-user a whole-screen Framebuffer
         // capability (at GRANT_SLOT) and nothing about pixels; the graphics
         // library OS (libgfx) maps it with fb_map and draws straight into the
@@ -980,7 +980,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_gfx} frames free after gfx");
         }
 
-        // Visual userspace (Stage 3, Design/display.md): bitmap text + an
+        // Visual userspace (Stage 3): bitmap text + an
         // input-driven frame. The kernel grants gfxtext-user the whole-screen
         // Framebuffer (slot 1) AND the keyboard EventSource (slot 2); the
         // graphics libOS draws a fixed "PLINTH" title and echoes a line read
@@ -1014,7 +1014,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_gfxtext} frames free after gfxtext");
         }
 
-        // Visual userspace (Stage 4, Design/display.md) -- the thesis climax:
+        // Visual userspace (Stage 4) -- the thesis climax:
         // sub-region multiplexing. The kernel splits the screen into two disjoint
         // horizontal bands and grants one to each of two concurrent graphics
         // library OSes (gfxsplit-user, slot index in RDI -> top/bottom). Each maps
@@ -1068,7 +1068,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let _ = writeln!(serial, "plinth: {after_bound} frames free after gfxbound");
             }
 
-            // Negative, in time rather than space (D7, Design/fb_mapping.md):
+            // Negative, in time rather than space (D7):
             // gfxrevoke-user maps its band, draws through it to prove the
             // mapping is live, releases the capability, and writes to the same
             // address again -- which now faults, because losing the capability
@@ -1097,7 +1097,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let _ = writeln!(serial, "plinth: {after_revoke} frames free after gfxrevoke");
             }
 
-            // Reclamation (Design/cap_reclaim.md D6): the case where the process
+            // Reclamation (D6): the case where the process
             // that LOSES a framebuffer capability is not the one that gets it
             // back. fbreclaim-user is granted the whole screen, draws and hashes
             // a frame, transfers the capability to a child that FAULTS while
@@ -1149,7 +1149,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // It reuses fbreclaimchild (SPAWNABLE id 5) rather than adding a
             // near-copy of it, and it lends a Framebuffer because that is the
             // only thing it CAN lend: `release_action` scopes reclamation to
-            // Framebuffer (cap_reclaim.md D2, narrowed at ruling time), so an
+            // Framebuffer (D2, narrowed at ruling time), so an
             // ordinary Frame lent to a dying child is freed with the child and
             // the wake carries NO_CAP. That was measured -- the Frame version was
             // built first and reported no landing slot.
@@ -1232,7 +1232,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
         }
 
-        // Visual userspace skin (D8, Design/display_skin.md) -- the finale: a
+        // Visual userspace skin (D8) -- the finale: a
         // shell (splash + a home screen of app icons + arrow-key navigation)
         // entirely as library-OS policy over the whole-screen Framebuffer (slot
         // 1) and the keyboard EventSource (slot 2). Three icons are shell-drawn
@@ -1261,7 +1261,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 origin: None,
             };
             // The mouse EventSource, granted as a THIRD capability so the shell
-            // can hit-test clicks (Design/clickable_apps.md slice 1). Granted
+            // can hit-test clicks (slice 1). Granted
             // unconditionally, unlike the mouse demo above, which is gated on
             // `mouse::present()`: the source exists in the kernel's table whether
             // or not the i8042's second port answered, so subscribing always
@@ -1283,7 +1283,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // `interactive` build (cargo xtask run) omits this, so the shell
             // waits for REAL arrow keys and you drive the cursor yourself.
             //
-            // The second launch is deliberate (Design/cap_release.md D7): both
+            // The second launch is deliberate (D7): both
             // bugs found on 2026-06-27 -- the capability-slot migration and the
             // wait-handle leak -- only appear on a RELAUNCH, and a one-launch
             // tour is exactly why smoke missed them. It is a regression guard for

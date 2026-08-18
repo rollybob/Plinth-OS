@@ -19,7 +19,7 @@
 //!
 //! Nr 5 (frame_free) was retired in ABI v2.8: `cap_release` generalises it to
 //! every capability kind, and a frame release is exactly what it used to do.
-//! `libplinth::sys_frame_free` survives as a wrapper. See Design/cap_release.md.
+//! `libplinth::sys_frame_free` survives as a wrapper.
 //!
 //! Nr 10 (block_read) was retired in ABI v2.3: a blocking read must suspend and
 //! resume with a return value, which needs the full resumable trap frame only an
@@ -195,7 +195,7 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         // gate op was itself retired in v2.4 -- block I/O is now the ring ABI
         // below. The number is left unused.
         11 => sys_spawn_from_buffer(a1, a2, a3),
-        // Async completion rings (ABI v2.4, Design/async_rings.md). register and
+        // Async completion rings (ABI v2.4). register and
         // submit are non-blocking, so they ride the fast `syscall` path; the
         // blocking `ring_wait` is on the `int 0x80` gate (op 6, see ipc.rs).
         12 => crate::rings::ring_register(a1, a2, a3),
@@ -444,7 +444,7 @@ fn sys_fb_map(slot: u64, va: u64, info_ptr: u64) -> u64 {
 
     // Track the mapping under its capability, so that losing the capability --
     // by transfer or by cap_release -- tears the mapping down with it
-    // (Design/fb_mapping.md D1/D2). One record covers the whole contiguous run.
+    // (D1/D2). One record covers the whole contiguous run.
     {
         let mut cur = process::current().lock();
         let Some(proc) = cur.as_mut() else {
@@ -491,7 +491,7 @@ fn sys_fb_map(slot: u64, va: u64, info_ptr: u64) -> u64 {
 /// for `Frame` -- so an endpoint capability a process was *done* with (the
 /// spawn wait handle, after the join) was stuck there for the process's whole
 /// life. That is the leak `shell-user` hit: one slot per app launch, table full
-/// after ~9. See Design/cap_release.md.
+/// after ~9.
 ///
 /// The per-kind decision is `capability::release_action`, shared with
 /// `process::teardown` so the two cannot drift. No rights are required:
@@ -551,7 +551,7 @@ fn sys_cap_release(slot: u64) -> u64 {
         }
         // The authority is leaving, so the access goes with it. Nothing is
         // freed: the pages are firmware MMIO, never allocated from anywhere
-        // (Design/fb_mapping.md D1 -- this is what cap_release.md D5 deferred).
+        // (D1 -- this is what D5 deferred).
         capability::ReleaseAction::UnmapFramebuffer => {
             process::unmap_fb_for_slot(proc, slot as usize);
         }
@@ -771,7 +771,7 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
         let mut cur = process::current().lock();
         match cur.as_mut() {
             // Reserve the slot the capability is leaving, so it has somewhere
-            // guaranteed to come home to (`lender_owed.md` D2(D)).
+            // guaranteed to come home to (D2(D)).
             Some(p) => process::revoke_and_unmap_for_lend(p, transfer_slot as usize),
             None => None,
         }
@@ -792,7 +792,7 @@ fn spawn_scheduled(binary: &[u8], transfer_slot: u64) -> u64 {
         origin: None,
     };
     // The caller is lending this capability to the child, so record the caller
-    // as its origin (Design/cap_reclaim.md D3). Kept separate from
+    // as its origin (D3). Kept separate from
     // `transferred`, which stays the pristine original for the rollback below:
     // if the spawn fails the move did not happen, and the caller must get back
     // exactly the capability it had.

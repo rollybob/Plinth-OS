@@ -49,7 +49,7 @@ pub const USER_LAZY_END: u64 = 0x1900_0000;
 
 pub const MAX_USER_MAPS: usize = 16;
 
-/// Live framebuffer mappings tracked per process (Design/fb_mapping.md D2).
+/// Live framebuffer mappings tracked per process (D2).
 ///
 /// Four is headroom, not a measurement: every demo maps one region, and the
 /// shape that wants more than one is a process holding the whole screen *and* a
@@ -84,7 +84,7 @@ pub struct FbMap {
 /// Record a framebuffer mapping. Returns false if there is no free record.
 ///
 /// Pure, so the in-kernel harness can reach it -- a syscall needs a current
-/// process and a live address space (Design/cap_release.md D4's precedent).
+/// process and a live address space (D4's precedent).
 pub fn fb_record(maps: &mut [Option<FbMap>; MAX_FB_MAPS], m: FbMap) -> bool {
     for entry in maps.iter_mut() {
         if entry.is_none() {
@@ -180,7 +180,7 @@ pub struct Process {
     pub maps: [Option<(u64, usize)>; MAX_USER_MAPS],
     /// Live fb_map results, tracked separately from `maps` because a
     /// framebuffer region is one contiguous run of ~1000 unpooled pages
-    /// (Design/fb_mapping.md D2).
+    /// (D2).
     pub fb_maps: [Option<FbMap>; MAX_FB_MAPS],
     /// The process's self-paging handler, if it registered one.
     pub fault: Option<FaultReg>,
@@ -220,7 +220,7 @@ static CURRENT: [Mutex<Option<Process>>; crate::percpu::MAX_CORES] =
 /// that slot reads `process = None` for as long as it runs. Any pass that means
 /// "every live capability table" is therefore wrong if it walks `TABLE` alone --
 /// it silently skips whatever is executing on another core. That was a real bug
-/// in the first cut of the `origin` sweep (Design/cap_reclaim_build.md section 0).
+/// in the first cut of the `origin` sweep (section 0).
 ///
 /// **Callers must not already hold a `current()` guard**, or this deadlocks on
 /// their own core. Safe from `on_exit`, which has already taken its process out.
@@ -373,7 +373,7 @@ pub fn spawn_process(transferred: Option<Capability>) -> Process {
     debug_assert_eq!(slot, CPU_CAP_SLOT, "CPU-time capability landed in an unexpected slot");
     if let Some(cap) = transferred {
         // `install`, not `mint`: this is a capability *moving* into the new
-        // process, so its `origin` moves with it (Design/cap_reclaim.md D3).
+        // process, so its `origin` moves with it (D3).
         let granted =
             proc.caps.install(cap).expect("fresh table has room for a grant");
         debug_assert_eq!(granted, GRANT_SLOT, "granted capability landed in an unexpected slot");
@@ -459,7 +459,7 @@ pub fn run(binary: &[u8], phys_offset: u64) -> Result<Outcome, &'static str> {
 /// half of an IPC capability transfer (the mint into the receiver is the
 /// other half); it is also the building block a transfer-over-spawn would use.
 /// `revoke_and_unmap`, but holding the slot open for the capability's return
-/// (`Design/lender_owed.md` D2(D)).
+/// (D2(D)).
 ///
 /// Reserves only for kinds that can actually come home, asking
 /// `capability::is_reclaimable_kind` -- the same predicate `release_action` uses
@@ -493,7 +493,7 @@ pub fn revoke_and_unmap(proc: &mut Process, slot: usize) -> Option<Capability> {
         }
     }
     // Same rule, other kind: handing a framebuffer away takes the access with
-    // the authority. Before Design/fb_mapping.md D1 this case was missing, so a
+    // the authority. Before D1 this case was missing, so a
     // process that transferred its framebuffer kept drawing through the
     // surviving mapping -- which `shell-user` relied on by name.
     if matches!(cap.object, CapObject::Framebuffer { .. }) {
@@ -507,7 +507,7 @@ pub fn revoke_and_unmap(proc: &mut Process, slot: usize) -> Option<Capability> {
 /// Nothing is freed. The pages name firmware MMIO and were never allocated
 /// from anywhere, so this must never route through the frame path -- doing so
 /// would hand ~1000 pages of MMIO to the frame allocator to be served later as
-/// ordinary memory (Design/fb_mapping.md D7). The frame baselines around every
+/// ordinary memory (D7). The frame baselines around every
 /// demo are what would catch that, and they must not move.
 pub fn unmap_fb_for_slot(proc: &mut Process, slot: usize) {
     let l4 = proc.l4;
@@ -537,7 +537,7 @@ pub fn teardown(mut proc: Process, boot_frames: &[Option<(u64, u64)>]) {
         // The same per-kind release policy `cap_release` runs, from the one
         // shared decision function -- so a new capability kind cannot be
         // reclaimed correctly at death and leak on request, or vice versa
-        // (Design/cap_release.md D4).
+        // (D4).
         match crate::capability::release_action(&cap) {
             // Frame capabilities are the only kind that owns a poolable
             // resource. The mappings were already torn down by the loop above.
@@ -567,7 +567,7 @@ pub fn teardown(mut proc: Process, boot_frames: &[Option<(u64, u64)>]) {
             // happened. `scheduler::reclaim_lent_caps` copied this capability's
             // VALUE out and installed it in the lender's table BEFORE
             // `ipc::reap_dying` ran -- it has to, because `reap_dying` issues the
-            // wake that carries the landing slot (Design/cap_reclaim.md D5, and
+            // wake that carries the landing slot (D5, and
             // 6.5 for why the natural home here is too late).
             //
             // DO NOT move reclamation into this arm. Teardown runs after the

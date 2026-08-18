@@ -49,7 +49,7 @@ const IPC_RECV: u64 = 1;
 const IPC_CALL: u64 = 2;
 const IPC_REPLY: u64 = 3;
 /// Op 4 (event_recv) was retired in ABI v2.5: input is now the multishot
-/// event-ring path (`RING_OP_EVENT_SUB` + `ring_wait`, event_rings.md), and
+/// event-ring path (`RING_OP_EVENT_SUB` + `ring_wait`), and
 /// `libplinth::sys_event_recv` is a single-subscription shim over it -- exactly
 /// as block_read became a ring shim. The number is left unused.
 ///
@@ -68,7 +68,7 @@ const RING_WAIT: u64 = 6;
 /// error: a peer controls the full payload word, so an in-band error sentinel
 /// would be ambiguous. The rendezvous path produces `IPC_OK`; `IPC_PEER_DIED`
 /// is delivered by the death-time reaping (`reap_dying`) when a process blocked
-/// on a peer outlives it. See Design/ipc.md.
+/// on a peer outlives it.
 const IPC_OK: u64 = 0;
 const IPC_ERR: u64 = 1;
 const IPC_PEER_DIED: u64 = 2;
@@ -430,7 +430,7 @@ pub(crate) fn reap_dying(caps: &CapTable) {
     }
 }
 
-// `landing_for` lived here until 2026-07-30 (Design/cap_reclaim.md D7). It
+// `landing_for` lived here until 2026-07-30 (D7). It
 // scanned a slice of (lender, landing) pairs that `on_exit` threaded through to
 // this module, which meant the landing slot only existed for the duration of the
 // death-wake -- so a lender that had not yet blocked could not be told, and
@@ -578,7 +578,7 @@ fn ipc_recv(ep_slot: u64, frame_ptr: u64) -> u64 {
         // wake to attach a landing slot to. Reclamation still ran -- it is
         // unconditional in `on_exit` -- and recorded where the capability landed
         // on this process's own scheduler slot, so the answer is taken from there
-        // rather than invented here (Design/cap_reclaim.md D7).
+        // rather than invented here (D7).
         //
         // Until 2026-07-30 this wrote `NO_CAP` unconditionally and the comment
         // explained why that was correct. It was not: whenever a capability had
@@ -705,7 +705,7 @@ fn transfer_current_to_blocked(receiver: usize, cap_slot: u64) -> u64 {
     // The revoke above is the give half of the move; account it (no free --
     // the matching mint below re-references the endpoint).
     note_cap_removed(&cap, false);
-    // The lender is recorded on the way in (Design/cap_reclaim.md D3), and the
+    // The lender is recorded on the way in (D3), and the
     // homecoming rule inside `lent_to` clears it when the capability is going
     // back to whoever lent it.
     let prior = cap.origin;

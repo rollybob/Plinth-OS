@@ -1,4 +1,4 @@
-//! Text rendering + an input-driven frame (Stage 3, Design/display.md).
+//! Text rendering + an input-driven frame (Stage 3).
 //!
 //! The kernel grants this process the whole-screen Framebuffer capability (at
 //! FB_SLOT) AND the keyboard EventSource (at slot 2). It clears the screen,
@@ -57,8 +57,8 @@ pub extern "C" fn _start(_id: u64) -> ! {
     sys_write(&buf[..n]);
     sys_write(b"'\n");
 
-    // The determinism proof: a known frame yields a known hash (Design/display.md
-    // D6), now over text rendered through the capability.
+    // The determinism proof: a known frame yields a known hash (D6),
+    // now over text rendered through the capability.
     let hash = fb.hash_origin_square(HASH_SIDE);
     sys_write(b"gfxtext: framebuffer hash ");
     write_hex(hash);

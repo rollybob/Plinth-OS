@@ -1,4 +1,4 @@
-//! Framebuffer mapping records (Design/fb_mapping.md D2/D7).
+//! Framebuffer mapping records (D2/D7).
 //!
 //! The bookkeeping half of "a live framebuffer mapping exists only while the
 //! process holds a capability naming it". The unmapping itself needs a live

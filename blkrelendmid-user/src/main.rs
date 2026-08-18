@@ -1,4 +1,4 @@
-//! Re-lend chain, the INTERMEDIARY (Design/lender_owed.md D6 slice 4, step 2 /
+//! Re-lend chain, the INTERMEDIARY (D6 slice 4, step 2 /
 //! K-025). Spawned by `blkrelend-user` (A), which transfers it a read `BlockRange`
 //! it does NOT own outright -- the range is on loan from A. This process reads a
 //! sector to prove it holds the range, then RE-LENDS it to a grandchild

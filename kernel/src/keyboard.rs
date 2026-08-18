@@ -1,4 +1,4 @@
-//! i8042 PS/2 keyboard -- the first input event source (Design/input.md, D1).
+//! i8042 PS/2 keyboard -- the first input event source (D1).
 //!
 //! This module owns the keyboard *device*: bring up the i8042 controller, take
 //! its IRQ1, and push each scancode into the keyboard event ring as a raw

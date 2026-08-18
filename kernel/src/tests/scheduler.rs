@@ -5,7 +5,7 @@
 //! without ever entering userspace. The context-switch mechanism itself is
 //! exercised by the integration smoke (the interleaving spin demo); there is
 //! no way to assert an exact preemptive trace as a unit test, by design (see
-//! Design/timer_scheduler.md section 2).
+//! section 2).
 
 use super::TestCtx;
 use crate::capability::{CapObject, Capability, Origin, RIGHT_MAP, RIGHT_WRITE};
@@ -211,7 +211,7 @@ pub fn round_robin_cycle(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     Ok(())
 }
 
-// ---- Design/cap_reclaim.md D7: the pending reclamation landing slot ----------
+// ---- D7: the pending reclamation landing slot ----------
 //
 // The sentinel spelled the way scheduler.rs spells it -- `NO_CAP` is ipc.rs's and
 // is private there.

@@ -1,4 +1,4 @@
-//! Read-write filesystem demo (Design/readwrite_fs.md S6): create, read,
+//! Read-write filesystem demo (S6): create, read,
 //! delete, and reuse over the new `librwfs` library OS.
 //!
 //! The kernel grants this process a BlockRange over device 0 sectors

@@ -1,6 +1,6 @@
 //! cap_release demo: a capability slot, once released, is genuinely reusable.
 //!
-//! This is the regression test for the 2026-06-27 crash (Design/cap_release.md).
+//! This is the regression test for the 2026-06-27 crash.
 //! A capability table is a fixed 16 slots with no heap behind it, and until ABI
 //! v2.8 a process had no way to give one back. Every `spawn` mints a RECV
 //! capability -- the wait handle -- into the caller's table, and after the join
@@ -20,7 +20,7 @@
 //! creates one for its result channel, so a leaked handle -- which is what keeps
 //! that endpoint referenced -- exhausts the pool long before the 16-slot table it
 //! also occupies. The demo is unaffected and still catches the leak; only the
-//! explanation was wrong. See assumption A-13 in Design/known_bugs.md.
+//! explanation was wrong. See assumption A-13.
 //!
 //! Worth being precise about, because the 06-27 crash this guards against WAS a
 //! table-full failure. This demo cannot actually reach a full table -- the pool
@@ -32,7 +32,7 @@
 //! longer copies either of them.** `MAX_ENDPOINTS` and `MAX_CAPS` are
 //! kernel-side, but `ABI.md` now publishes both as guaranteed minimums and
 //! `libplinth` carries them, so `ROUNDS` below is derived rather than chosen
-//! against numbers this crate cannot see (`lender_owed.md` D9). The hazard that
+//! against numbers this crate cannot see (D9). The hazard that
 //! closes is concrete: a literal that stopped exceeding a grown endpoint pool
 //! would leave this demo green while asserting nothing -- the exact failure
 //! class A-13 was filed for. Growing a kernel limit now fails the kernel build

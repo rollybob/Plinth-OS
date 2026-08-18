@@ -23,14 +23,14 @@
 //! **This part lends a Framebuffer -- once a necessity, now a choice.** When this
 //! demo was written, a Framebuffer was the only lendable-and-recoverable object:
 //! `capability::release_action` scoped reclamation to `CapObject::Framebuffer`
-//! (Design/cap_reclaim.md D2, narrowed at ruling time), so the 08-05 handoff's
+//! (D2, narrowed at ruling time), so the 08-05 handoff's
 //! proposal to lend "a `Ring`/`Frame`" did not work -- an ordinary Frame lent to a
 //! dying child is simply freed with it and the death-wake carries `NO_CAP`. That
 //! was measured, not assumed: the Frame version of this demo was built first and
 //! reported no landing slot, its frame bracket flat because the frame went back to
 //! the allocator rather than to the lender.
 //!
-//! Slice 4 (lender_owed.md D6, 2026-08-17) widened `is_reclaimable_kind` to
+//! Slice 4 (D6, 2026-08-17) widened `is_reclaimable_kind` to
 //! `Framebuffer | BlockRange | EventSource`, and `blkreclaim-user` now lends a
 //! `BlockRange` a dying child returns -- so this part keeps the Framebuffer by
 //! CHOICE, not because nothing else can be lent. The choice is still the right
@@ -77,13 +77,13 @@
 //! under that control, taking one endpoint with it -- the arithmetic is exact,
 //! and `caprelease-user` under the same treatment dies at 8 with no part 1 ahead
 //! of it. Both `caprelease-user` and the xtask message described this as a table
-//! overrun until this session; see assumption A-13 in Design/known_bugs.md.
+//! overrun until this session; see assumption A-13.
 //!
 //! This does not weaken the test -- the leak is caught either way, and `ROUNDS`
 //! clears both limits. It does mean the loop never actually reaches a full table,
 //! so do not cite it as evidence about table behaviour. `ROUNDS` is derived from
 //! the minimums `ABI.md` publishes rather than copied from the kernel, so it
-//! still clears both if either limit grows (`lender_owed.md` D9).
+//! still clears both if either limit grows (D9).
 //!
 //! **Part 2 deliberately transfers nothing and spawns the silent worker.** The
 //! handle is minted by every spawn regardless of whether a capability rides
@@ -122,7 +122,7 @@ const QUIETWORKER_ID: u64 = 4;
 /// reclaimed framebuffer. The derived value clears both -- the same number as
 /// `caprelease-user`, now for the structural reason rather than by both crates
 /// happening to pick it: `ABI.md` publishes the limits as guaranteed minimums
-/// and `libplinth` derives the count from them (`lender_owed.md` D9).
+/// and `libplinth` derives the count from them (D9).
 const ROUNDS: u64 = libplinth::REUSE_ROUNDS;
 
 /// Side of the hashed square. 128 to match every other framebuffer demo, so the
@@ -189,7 +189,7 @@ pub extern "C" fn _start(_id: u64) -> ! {
         fail(b"spawnwaitcap: no landing slot -- the helper reported nothing\n", 3);
     }
     // The homecoming guarantee, asserted directly rather than inferred from a
-    // green run (`lender_owed.md` D2(D)): a lent capability returns to the slot
+    // green run (D2(D)): a lent capability returns to the slot
     // it left from, because that slot was reserved the moment the loan started.
     //
     // Watched failing before it was believed. With the reservation disabled in

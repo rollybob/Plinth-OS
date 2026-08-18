@@ -1,5 +1,5 @@
-//! AP bring-up -- broader hardware, Stage B1 + B2.2 (Design/broader_hardware.md
-//! section 5.1/5.2, section 8).
+//! AP bring-up -- broader hardware, Stage B1 + B2.2 (section 5.1/5.2,
+//! section 8).
 //!
 //! The BSP wakes each Application Processor with the INIT-SIPI-SIPI sequence
 //! via the Local APIC, pointing it at a 16-bit real-mode trampoline placed at
@@ -23,7 +23,7 @@
 //! shared structure -- joining the scheduler is Stage B2.3's job.
 //!
 //! Two correctness hazards specific to sharing the BSP's existing `kernel_l4`
-//! with a freshly-started core, both flagged in Design/broader_hardware.md
+//! with a freshly-started core, both flagged in
 //! section 10:
 //!
 //! - The trampoline's own code, while still executing from its low physical
@@ -481,7 +481,7 @@ pub fn start_aps<W: Write>(out: &mut W, topology: Option<&acpi::Topology>, phys_
     // between "enable paging" and "jmp into ordinary kernel code" -- every AP
     // that made it to ap_entry64 is long past needing it, and one that timed
     // out is not going to use it later either. Tear it down per
-    // Design/broader_hardware.md section 10.
+    // section 10.
     memory::unmap_identity(TRAMPOLINE_PHYS, FRAME_SIZE);
 
     let _ = writeln!(out, "plinth: smp: {online} ap(s) online");

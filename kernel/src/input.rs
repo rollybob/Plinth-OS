@@ -1,12 +1,11 @@
-//! Input event sources: the producer half of the input path (Design/input.md,
-//! Design/event_rings.md).
+//! Input event sources: the producer half of the input path.
 //!
 //! A device (the i8042 keyboard, later a mouse) is an *event source*. Its IRQ
 //! handler is the single producer: it calls `record`, which routes the raw
 //! `Event` to every ring subscribed to that source (the multishot event-ring
 //! path, `rings::deliver_event`) -- posting a completion into each subscriber's
 //! CQ and waking an owner parked in `ring_wait`. There is no per-source staging
-//! buffer any more (event_rings.md S6): the subscriber's CQ is the buffer, and a
+//! buffer any more (S6): the subscriber's CQ is the buffer, and a
 //! source with no subscriber drops the event. Producer and consumer never run
 //! concurrently -- the IRQ handler and the kernel reader both run IF=0 under the
 //! BKL -- so the routing needs no further locking.
@@ -23,14 +22,14 @@ use crate::process;
 
 /// Event kinds.
 pub const EVENT_KEY: u8 = 1;
-/// A mouse motion+button sample (Design/mouse_input.md S1): one packed event
+/// A mouse motion+button sample (S1): one packed event
 /// per PS/2 packet, not split per axis, so the CQ-full drop-newest policy
-/// (event_rings.md s5) drops a whole packet atomically rather than risking a
+/// (s5) drops a whole packet atomically rather than risking a
 /// desynced dx/dy/button triplet with no boundary tag to detect it.
 pub const EVENT_MOUSE_MOVE: u8 = 2;
 
 /// One raw input event. Fixed-size and `Copy`; packs into the low 32 bits of a
-/// CQ completion's `status` field (event_rings.md s4).
+/// CQ completion's `status` field (s4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Event {
     /// Event kind (`EVENT_KEY`, ...).
@@ -54,7 +53,7 @@ impl Event {
         }
     }
 
-    /// A mouse motion+button event (mouse_input.md S1). `dx`/`dy` are one
+    /// A mouse motion+button event (S1). `dx`/`dy` are one
     /// PS/2 packet's signed-byte deltas, packed into `code` (dx in the high
     /// byte, dy in the low byte); `buttons` is the current bitmask (bit 0/1/2
     /// = left/right/middle), masked to 7 bits so it never collides with the
@@ -70,13 +69,13 @@ impl Event {
     /// Pack into the low 32 bits of a word: kind in bits 0..8, code in 8..24,
     /// value in 24..32. The kind byte is always nonzero (`EVENT_KEY` = 1,
     /// `EVENT_MOUSE_MOVE` = 2), which the event-ring shim relies on to tell a
-    /// real event from a zero subscribe-error status (event_rings.md s5).
+    /// real event from a zero subscribe-error status (s5).
     pub const fn pack(self) -> u64 {
         (self.kind as u64) | ((self.code as u64) << 8) | ((self.value as u64) << 24)
     }
 }
 
-/// Well-known event sources (Design/input.md s7, mouse_input.md).
+/// Well-known event sources (s7).
 pub const SOURCE_KEYBOARD: usize = 0;
 pub const SOURCE_MOUSE: usize = 1;
 const N_SOURCES: usize = 2;
@@ -170,7 +169,7 @@ pub fn deliver_synthetic() {
     }
 }
 
-// --- synthetic mouse injection (test scaffold, mouse_input.md S3) -----------
+// --- synthetic mouse injection (test scaffold, S3) -----------
 //
 // Mirrors the keyboard's synthetic scaffold above: QEMU's HMP monitor has no
 // `sendkey`-clean equivalent for relative mouse motion deterministic enough to

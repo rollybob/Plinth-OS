@@ -30,7 +30,7 @@ here on 2026-08-13.
 
 ### Added
 - **Reclamation covers block ranges and event sources, not just the screen
-  (lender_owed.md slice 4).** Until now only a lent `Framebuffer` came home when
+  (slice 4).** Until now only a lent `Framebuffer` came home when
   its borrower died; a lent `BlockRange` or `EventSource` was dropped with the
   child. `capability::is_reclaimable_kind` now names all three -- exactly the kinds
   no syscall can re-mint, which is also the set that carries no refcount -- so any

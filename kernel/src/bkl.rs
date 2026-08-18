@@ -1,5 +1,5 @@
 //! The single big kernel lock (Stage B2, design D4 --
-//! Design/broader_hardware.md section 5.3).
+//! section 5.3).
 //!
 //! One lock, acquired as the first action of every kernel-entry dispatch
 //! body (the timer tick, the syscall/IPC dispatchers, the fault handlers,

@@ -8,7 +8,7 @@
 //! completion the kernel tags with this stream's cookie, and the executor yields
 //! them one per `next()`. Correctness is asserted, never transcript-matched: each
 //! event must arrive once, in order, carrying its scancode -- the many-event path
-//! the single-shot event_recv could not express (Design/event_rings.md s2/s6/s8).
+//! the single-shot event_recv could not express (s2/s6/s8).
 //!
 //! The kernel grants this process one capability: a read EventSource on the
 //! keyboard (source 0). In headless smoke a scripted scancode sequence is

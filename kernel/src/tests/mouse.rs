@@ -1,4 +1,4 @@
-//! PS/2 mouse tests: pure packet-decode logic (Design/mouse_input.md S1/S2).
+//! PS/2 mouse tests: pure packet-decode logic (S1/S2).
 //!
 //! No IRQ, no device -- `Packet::push`/`decode_axis` are exercised directly,
 //! the same way `tests::input` exercises `Event` encoding without a real

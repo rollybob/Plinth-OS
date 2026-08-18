@@ -1,6 +1,6 @@
 //! Unit tests for the virtio-blk in-flight pool + completion demux.
 //!
-//! `Inflights` is the completion-routing core (Design/async_rings.md section 5)
+//! `Inflights` is the completion-routing core (section 5)
 //! factored out of the live driver so it is pure logic over plain arrays -- no
 //! MMIO, no device, no scheduler -- the same move that makes `ipc::WaitQueue`
 //! and `scheduler::pick_next` testable. Here we drive it the way a completion

@@ -24,7 +24,7 @@ plinth: GDT + TSS loaded
 plinth: IDT loaded
 plinth: syscall interface ready
 
-# Display bring-up (Design/display.md). The bootloader maps a UEFI GOP linear
+# Display bring-up. The bootloader maps a UEFI GOP linear
 # framebuffer; the kernel only DISCOVERS it (capturing the physical base +
 # geometry) and reports "present" -- it never draws a pixel. "present" proves a
 # framebuffer exists under the test QEMU config (-vga std, headless). The
@@ -53,12 +53,12 @@ plinth: smp: 0 ap(s) online
 
 # Console input bring-up (Stage 1): the i8042 keyboard comes up as the first
 # event source and IRQ1 is unmasked. Scancodes flow through input::record, which
-# routes them to any ring subscribed to the source (event_rings.md); the evt/kbd
+# routes them to any ring subscribed to the source; the evt/kbd
 # demos below prove that producer -> subscription -> reader path end to end, so
 # there is no separate boot selftest line.
 plinth: keyboard ready (i8042, IRQ1)
 
-# Mouse bring-up (Design/mouse_input.md): the i8042's second port comes up as
+# Mouse bring-up: the i8042's second port comes up as
 # the second event source (source 1) and IRQ12 is unmasked. QEMU's q35 machine
 # always exposes a PS/2 mouse on this port, so this line is deterministic under
 # the smoke config; a real-hardware port without one would instead see "no
@@ -202,14 +202,14 @@ plinth: [user fault] #PF
 plinth: terminating user process
 plinth: spawn demo: all done
 
-# cap_release regression (Design/cap_release.md, ABI v2.8): a released capability
+# cap_release regression (ABI v2.8): a released capability
 # slot is genuinely reusable. 20 spawn -> join -> release round-trips; a build
 # that leaks the spent wait handle cannot get past round 8 -- measured 2026-08-10
 # by deleting the release. Note round 8, not the round ~15 this comment claimed:
 # what runs out is the EIGHT-endpoint pool (a leaked handle keeps its result
 # endpoint referenced), not the 16-slot capability table, which still had fifteen
-# slots free. The regression is caught either way. See A-13 in
-# Design/known_bugs.md. The child (quietworker, SPAWNABLE id 4) is silent, so the
+# slots free. The regression is caught either way. See A-13.
+# The child (quietworker, SPAWNABLE id 4) is silent, so the
 # whole regression costs two asserted lines. The summary line ("caprelease: 20 spawn
 # round-trips, slots reused") is checked by xtask's check_caprelease rather than
 # asserted here -- same treatment as the spawn demo's parent output, since a
@@ -219,7 +219,7 @@ plinth: spawn demo: all done
 plinth: caprelease demo: 1 processes
 plinth: caprelease demo: all done
 
-# Work-stealing demo (SMP scaling S4, Design/smp_scaling.md section 6). The
+# Work-stealing demo (SMP scaling S4, section 6). The
 # parent spawns three CPU-bound workers back to back; all pile onto one core's
 # run queue while other cores idle; idle cores steal them. Two facts proved:
 # (1) every worker completes (the parent joins all three); (2) at least one
@@ -253,7 +253,7 @@ asyncblk: start
 asyncblk: ok (4 reads overlapped, each frame verified)
 plinth: asyncblk demo: all done
 
-# Block write path (Design/block_write.md): the write half of the ring ABI.
+# Block write path: the write half of the ring ABI.
 # The kernel grants blkwrite-user a BlockRange over device 0 sectors [8,12),
 # minted with RIGHT_WRITE instead of RIGHT_READ -- the multiplexing guarantee
 # now gates the write direction. The demo writes a fixed pattern, reads the
@@ -269,7 +269,7 @@ blkwrite: ok (write+read-back verified)
 blkwrite: rdonly write rejected
 plinth: blkwrite demo: all done
 
-# Block-range RECLAMATION (Design/lender_owed.md D6, slice 4): the first lender
+# Block-range RECLAMATION (D6, slice 4): the first lender
 # that does not lend the screen. The kernel grants blkreclaim-user a read
 # BlockRange over device 0 sectors [16, 20); it reads a sector (ramp byte 16),
 # TRANSFERS the range to blkreclaimchild (id 7) which reads a sector of its own
@@ -291,7 +291,7 @@ blkreclaim: child died, range came back at slot 1
 blkreclaim: reclaimed b0=17
 plinth: blkreclaim demo: all done
 
-# Block-range RE-LEND chain (Design/lender_owed.md D6 slice 4 step 2, the K-025
+# Block-range RE-LEND chain (D6 slice 4 step 2, the K-025
 # watch). A = blkrelend-user is granted dev-0 [20, 24) and lends it to B =
 # blkrelendmid (id 8), which RE-LENDS it to C = blkreclaimchild (id 7) which
 # faults holding it. C reads its transferred range (ramp byte 20) before
@@ -311,8 +311,8 @@ blkrelend: grandchild died, range came home to root at slot 1
 blkrelend: root reclaimed b0=21
 plinth: blkrelend demo: all done
 
-# Block-range reclamation over the IPC blocked-sender path (Design/lender_owed.md
-# D6 slice 4, the K-026 watch). Every lender above lends over sys_spawn; this one
+# Block-range reclamation over the IPC blocked-sender path (D6
+# slice 4, the K-026 watch). Every lender above lends over sys_spawn; this one
 # lends over IPC send_cap and forces the blocked-sender give-side
 # (transfer_blocked_to_current). blkipclend-user (S) owns a dev-0 [24,28) range,
 # spawns blkrecvchild (R, id 9) handing it the RECV end of a shared endpoint, then
@@ -394,7 +394,7 @@ unified: start
 unified: ok (1 read + 3 events on one ring)
 plinth: unified demo: all done
 
-# Mouse input (Design/mouse_input.md S2): a second EventSource. mouse-user
+# Mouse input (S2): a second EventSource. mouse-user
 # subscribes to source 1 (the mouse) through the same libos stream adapter
 # evtstream-user uses, and reaps a scripted 3-packet sequence (dx, dy, buttons
 # per packet), asserting each decodes correctly and in order, then cancels.
@@ -404,7 +404,7 @@ mouse: start
 mouse: ok (3 packets in order)
 plinth: mouse demo: all done
 
-# Read-write filesystem (Design/readwrite_fs.md S6): the librwfs library OS
+# Read-write filesystem (S6): the librwfs library OS
 # over the block write path. rwfs-user formats its granted range fresh,
 # creates two files, reads each back, deletes one, creates a third sized to
 # need exactly the freed run, and asserts it landed at the deleted file's
@@ -420,7 +420,7 @@ rwfs: bitmap reclaim verified (c.txt reused a.txt's sector)
 rwfs: ok (create/read/delete/reuse verified)
 plinth: rwfs demo: all done
 
-# Visual userspace (Stage 2, Design/display.md): the framebuffer as a capability.
+# Visual userspace (Stage 2): the framebuffer as a capability.
 # The kernel grants gfx-user a whole-screen Framebuffer capability (at GRANT_SLOT)
 # and nothing about pixels; the graphics library OS (libgfx) maps it with fb_map
 # and draws straight into the mapped memory -- the kernel multiplexes the raw
@@ -439,7 +439,7 @@ gfx: framebuffer hash 0xa89206aa6c9abb25
 gfx: ok
 plinth: gfx demo: all done
 
-# Visual userspace (Stage 3, Design/display.md): bitmap text + an input-driven
+# Visual userspace (Stage 3): bitmap text + an input-driven
 # frame. The kernel grants gfxtext-user the whole-screen Framebuffer (slot 1) and
 # the keyboard EventSource (slot 2); libgfx draws a fixed "PLINTH" title and
 # echoes a line read through the keyboard -- raw scancodes decoded by libinput's
@@ -456,7 +456,7 @@ gfxtext: framebuffer hash 0x1b5bf12a50c91325
 gfxtext: ok
 plinth: gfxtext demo: all done
 
-# Visual userspace (Stage 4, Design/display.md) -- the thesis climax: sub-region
+# Visual userspace (Stage 4) -- the thesis climax: sub-region
 # multiplexing. The kernel splits the screen into two disjoint horizontal bands
 # and grants one to each of two concurrent graphics library OSes; each maps ONLY
 # its band (fb_map maps the band's contiguous rows) and draws it, confined by the
@@ -480,7 +480,7 @@ plinth: [user fault] #PF
 plinth: terminating user process
 plinth: gfxbound demo: all done
 
-# Framebuffer revocation (D7, Design/fb_mapping.md) -- the other negative, and the
+# Framebuffer revocation (D7) -- the other negative, and the
 # only thing that proves access does not outlive authority. gfxrevoke-user maps its
 # band, draws through it (so the mapping is demonstrably live), releases the
 # Framebuffer capability, then stores to the SAME address and is #PF-terminated.
@@ -498,7 +498,7 @@ plinth: [user fault] #PF
 plinth: terminating user process
 plinth: gfxrevoke demo: all done
 
-# Framebuffer RECLAMATION (Design/cap_reclaim.md D6) -- the case where the process
+# Framebuffer RECLAMATION (D6) -- the case where the process
 # that loses the capability is not the one that gets it back. fbreclaim-user is
 # granted the whole screen, draws and hashes a frame, TRANSFERS the capability to a
 # child, and the child FAULTS while holding it. By fault, not a clean exit: a clean
@@ -543,7 +543,7 @@ plinth: fbreclaim demo: all done
 #
 # It lends a Framebuffer because that is the only thing it CAN lend. The 08-05
 # handoff proposed lending a Ring or an ordinary Frame; `release_action` scopes
-# reclamation to Framebuffer (cap_reclaim.md D2, narrowed at ruling time), so a
+# reclamation to Framebuffer (D2, narrowed at ruling time), so a
 # lent Frame is freed with the dying child and the wake carries NO_CAP. Measured,
 # not assumed -- the Frame version was built first and reported no landing slot,
 # with a flat frame bracket because the frame went to the allocator rather than to
@@ -578,7 +578,7 @@ plinth: fbreclaim demo: all done
 # the handle pins the endpoint. Seven rather than eight because the framebuffer
 # round above leaks one too under that control. caprelease-user, which has no
 # such round ahead of it, dies at exactly 8. Both demos described this as a table
-# overrun until 2026-08-10; see A-13 in Design/known_bugs.md. The round number is
+# overrun until 2026-08-10; see A-13. The round number is
 # the diagnostic -- round 0 would be the helper never working at all.
 plinth: spawnwaitcap demo: 1 processes
 spawnwaitcap: lent hash 0x69d3ede9a07b7784
@@ -616,7 +616,7 @@ fbrelease: child released the screen
 fbrelease: returned hash 0xd12799246c3d6e04
 plinth: fbrelease demo: all done
 
-# Visual userspace skin (D8, Design/display_skin.md) -- the finale: a shell with a
+# Visual userspace skin (D8) -- the finale: a shell with a
 # splash, a home screen of app icons, arrow-key navigation and a MOUSE POINTER,
 # all library-OS policy over the whole-screen Framebuffer (slot 1), the keyboard
 # EventSource (slot 2) and the mouse EventSource (slot 3). Scripted scancode AND
@@ -629,13 +629,13 @@ plinth: fbrelease demo: all done
 # hash equals "home" hash (same title bar), proving the shell redrew home
 # identically after getting the screen back. Frame counts bracket the demo.
 #
-# The SECOND launch is the regression guard (Design/cap_release.md D7). Both bugs
+# The SECOND launch is the regression guard (D7). Both bugs
 # found on 2026-06-27 only appear on a relaunch: the framebuffer capability does
 # not come back to FB_SLOT (the shell must track where recv_cap landed it), and
 # the spent wait handle used to be unreleasable. Every line of the second launch
 # is identical to the first -- that sameness IS the assertion.
 #
-# Clickable apps, slice 1 (Design/clickable_apps.md). Two things are new here and
+# Clickable apps, slice 1. Two things are new here and
 # both are asserted on serial rather than in a frame hash, deliberately (C4):
 #
 #   - "cursor over ..." reports which icon the pointer is over, emitted only when
@@ -704,7 +704,7 @@ shellapp: returning the screen
 shell: app returned the screen
 shell: back home hash 0x4b82ddae83e366a5
 # Clickable apps, slice 2 -- the demonstration the whole cap_reclaim milestone was
-# built for (Design/clickable_apps.md C6), and the first time it has existed.
+# built for (C6), and the first time it has existed.
 #
 # The pointer moves one column left onto CRASH and clicks. CRASH is a real app
 # (fbreclaimchild, SPAWNABLE id 5): it maps the screen, draws to prove the mapping

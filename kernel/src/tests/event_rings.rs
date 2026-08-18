@@ -1,4 +1,4 @@
-//! Event-ring routing + CQ-full backpressure tests (event_rings.md, Stage 1).
+//! Event-ring routing + CQ-full backpressure tests (Stage 1).
 //!
 //! `Subscriptions` is the multishot-routing core, factored as pure logic over a
 //! fixed pool -- no CQ frame, no IRQ, no scheduler -- exactly as `Inflights` is

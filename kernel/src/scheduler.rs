@@ -108,7 +108,7 @@ struct Slot {
     pending_call: bool,
     /// Where a capability reclaimed to this process landed in its own table,
     /// or `NO_CAP` for none pending (ipc.rs owns the sentinel). Written by
-    /// `reclaim_lent_caps` when a borrower dies (Design/cap_reclaim.md D7);
+    /// `reclaim_lent_caps` when a borrower dies (D7);
     /// read-and-cleared by whichever path reports it first -- the death-wake in
     /// `reap_dying` if this process was already blocked, or `ipc_recv`'s
     /// synchronous dead-peer return if it arrived late.
@@ -161,7 +161,7 @@ static mut WAIT_LINKS: [Option<usize>; MAX_PROCESSES] = [None; MAX_PROCESSES];
 /// per-core array suffices -- no need to live in `percpu::PerCpu`.
 static mut CURRENT_SLOT: [usize; percpu::MAX_CORES] = [0; percpu::MAX_CORES];
 
-/// Each core's own ready/running queue (`Design/smp_scaling.md` S1, replacing
+/// Each core's own ready/running queue (S1, replacing
 /// D5's claim-on-first-run `owner` tag): `CORE_QUEUE[core][i]` is `Some(table
 /// slot)` if position `i` in `core`'s queue holds that process, `None` if the
 /// position is unused. A `TABLE` slot index appears in exactly one core's
@@ -342,7 +342,7 @@ extern "C" {
 /// Count of successful work-steals (a process moved from one core's array to
 /// another's, `try_steal`). Monotonic for the life of the boot; the S4 demo
 /// reads a before/after delta to prove a steal actually fired during it (the
-/// one fact only stealing produces -- `Design/smp_scaling.md` section 6).
+/// one fact only stealing produces -- section 6).
 static STEAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Is the preemptive scheduler currently driving execution?
@@ -667,7 +667,7 @@ fn setup_process(
     for cap in caps.iter().flatten() {
         // `install`, not `mint`: a spawn grant may be a capability the caller is
         // *lending* to the child, and its `origin` -- set by the caller before it
-        // got here -- is part of what moves (Design/cap_reclaim.md D3). Kernel
+        // got here -- is part of what moves (D3). Kernel
         // grants arrive with `origin: None` and are unaffected.
         if proc.caps.install(*cap).is_err() {
             memory::destroy_address_space(l4);
@@ -871,7 +871,7 @@ pub fn on_exit() -> ! {
     // refcount decrements and frees the slot (hardening D5).
     // Send home anything this process borrowed, BEFORE the wake below -- the
     // lender's table has to be filled before the lender is told, because
-    // `reap_dying` is what tells it (Design/cap_reclaim.md D5, and section 6.5
+    // `reap_dying` is what tells it (D5, and section 6.5
     // of that doc for why the obvious placement in `teardown` is too late).
     reclaim_lent_caps(&proc.caps, cur);
     ipc::reap_dying(&proc.caps);
@@ -879,7 +879,7 @@ pub fn on_exit() -> ! {
     // capability may keep naming it as a lender. Must run before the slot is
     // handed out again; runs here, next to the other death-time bookkeeping.
     //
-    // Ordering note for the reclamation pass (Design/cap_reclaim_build.md B4):
+    // Ordering note for the reclamation pass (B4):
     // that pass belongs BEFORE `reap_dying`, because it has to fill the lender's
     // table before the lender is woken -- `reap_dying` is what wakes it. This
     // sweep is independent of that and can stay here: it clears origins that
@@ -1338,7 +1338,7 @@ pub fn take_pending_call(slot: usize) -> bool {
 }
 
 /// Record that a reclaimed capability landed at `landing` in `slot`'s table
-/// (Design/cap_reclaim.md D7). **First write wins**: a lender that had lent the
+/// (D7). **First write wins**: a lender that had lent the
 /// dying process two capabilities keeps the first, which preserves D5's one-slot
 /// limit exactly rather than quietly changing which one is reported. Both are in
 /// its table either way; only one is named.
@@ -1463,7 +1463,7 @@ pub enum ReclaimHome {
 /// hitting (K-025, the cooperative-hand-back strand).
 ///
 /// Home to the slot the capability left from if that slot is still reserved for
-/// it (`lender_owed.md` D2(D)); the fallback to `reclaim` (first free) is what
+/// it (D2(D)); the fallback to `reclaim` (first free) is what
 /// every lend did before reservation existed. As of 2026-08-13 every lend path
 /// reserves, so a reclaimable capability should always find its slot held open
 /// and the fallback should be unreachable for one -- it is kept rather than
@@ -1500,7 +1500,7 @@ pub fn reclaim_cap_home(cap: &Capability, origin: capability::Origin, home: Capa
 }
 
 /// Return every capability the dying process at `dying_slot` borrowed to the
-/// process that lent it (Design/cap_reclaim.md D1).
+/// process that lent it (D1).
 ///
 /// Returns the `(lender_slot, landing_slot)` pairs, so the caller can tell each
 /// lender where its capability landed. Bounded by `MAX_CAPS` -- a dying process
@@ -1535,7 +1535,7 @@ fn reclaim_lent_caps(dying: &CapTable, dying_slot: usize) {
         match reclaim_cap_home(&cap, origin, home) {
             // Record where it landed on the lender's own slot, so the fact
             // outlives this call and both delivery paths read it from one place
-            // (Design/cap_reclaim.md D7, ABI v2.9). First write wins.
+            // (D7, ABI v2.9). First write wins.
             ReclaimHome::Landed(landing) => set_reclaim_landing(lender, landing as u64),
             // Table full: dies as it would have anyway (D4's second fallback).
             ReclaimHome::LenderFull => {}
@@ -1553,7 +1553,7 @@ fn reclaim_lent_caps(dying: &CapTable, dying_slot: usize) {
 /// Clear every `origin` naming `slot` from every live capability table.
 ///
 /// Called when a process exits, because `origin` records a process-table slot
-/// and the table reuses slots (Design/cap_reclaim_build.md section 0). A lender
+/// and the table reuses slots (section 0). A lender
 /// is not pinned the way `Reply { caller }`'s callee is: it can exit while its
 /// borrower lives, and if the origin outlived it, a later reclamation would mint
 /// the capability into whatever unrelated process had taken the slot.

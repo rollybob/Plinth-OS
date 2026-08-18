@@ -1,4 +1,4 @@
-//! IPC blocked-sender reclamation (Design/lender_owed.md D6 slice 4 / K-026) --
+//! IPC blocked-sender reclamation (D6 slice 4 / K-026) --
 //! the RECEIVER/dying half. Spawned by `blkipclend-user` (S), which hands it the
 //! RECV end of a shared endpoint and then `send_cap`s a `BlockRange` on the SEND
 //! end. Because S sends before this process has run, S is a BLOCKED sender when

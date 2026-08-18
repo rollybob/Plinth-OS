@@ -1,4 +1,4 @@
-//! Sub-region multiplexing demo (Stage 4, Design/display.md) -- the thesis
+//! Sub-region multiplexing demo (Stage 4) -- the thesis
 //! climax. Run as TWO concurrent processes, each granted a DISJOINT horizontal
 //! band of the screen (process 0 the top, process 1 the bottom). Each maps its
 //! band, fills it with a distinct colour, and draws a label -- confined to its

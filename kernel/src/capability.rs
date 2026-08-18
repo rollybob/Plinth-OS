@@ -100,7 +100,7 @@ pub enum CapObject {
     /// table slot (like an Endpoint), so teardown releases it via `rings::release`
     /// (the SQ/CQ frames are ordinary Frame capabilities, freed on their own).
     Ring { id: usize },
-    /// The linear framebuffer (Design/display.md): a memory-mapped pixel region
+    /// The linear framebuffer: a memory-mapped pixel region
     /// the bootloader's UEFI GOP set up, named together with the geometry needed
     /// to draw into it. `RIGHT_MAP` gates `fb_map`, which maps the region into
     /// the holder's address space; `RIGHT_WRITE` marks it writable. The kernel
@@ -111,7 +111,7 @@ pub enum CapObject {
     /// Geometry is carried inline (like `BlockRange`'s sectors): `phys_base` is
     /// the region's physical base, `stride` the pixels per row (>= width), and
     /// `format` the pixel layout (0=rgb, 1=bgr, 2=u8, 3=other). v1 grants the
-    /// whole screen; a sub-region grant (Design/display.md Stage 4) is the same
+    /// whole screen; a sub-region grant (Stage 4) is the same
     /// variant with a smaller rect and an offset `phys_base`, the display
     /// analogue of disjoint `BlockRange`s. Pure inline data naming firmware MMIO,
     /// not a pooled resource, so teardown just drops it -- no reference count,
@@ -132,7 +132,7 @@ pub struct Capability {
     pub object: CapObject,
     pub rights: u8,
     /// The process that lent this capability, as a process-table slot, or
-    /// `None` if the kernel minted it (Design/cap_reclaim.md D3).
+    /// `None` if the kernel minted it (D3).
     ///
     /// Set at transfer time so a holder's death can return an unre-mintable
     /// capability to its lender instead of destroying it. `None` means "nobody
@@ -146,7 +146,7 @@ pub struct Capability {
     /// lender is not pinned and can exit while the borrower lives, after which
     /// its slot may be reused by an unrelated process. What keeps this honest is
     /// the exit-time sweep that clears every `origin` naming a departing slot
-    /// (Design/cap_reclaim_build.md section 0). Without that sweep this field is
+    /// (section 0). Without that sweep this field is
     /// a hazard, not a record.
     ///
     pub origin: Option<Origin>,
@@ -154,14 +154,14 @@ pub struct Capability {
 
 /// Where a lent capability goes home to: the lender, and the slot it left from.
 ///
-/// Widened from a bare process slot on 2026-08-10 (`Design/lender_owed.md` D2,
+/// Widened from a bare process slot on 2026-08-10 (D2,
 /// ruled (D) -- homecoming reservation). The lender's slot answers *who* is owed
 /// it, which is all reclamation needed while the kernel chose the landing slot
 /// itself; `cap_slot` answers *where it goes*, which is what lets the lender know
 /// the answer before the borrower has even died.
 ///
 /// `u8` each, against `MAX_PROCESSES = 4` and `MAX_CAPS = 16`. Both are
-/// placeholders and both may grow (`lender_owed.md` D9); `u8` leaves room for
+/// placeholders and both may grow (D9); `u8` leaves room for
 /// 256 of each, and the day either passes that, this struct is the one place to
 /// widen. Deliberately not `usize`: `caps: CapTable` is the first field of
 /// `Process`, so every byte here is multiplied by `MAX_CAPS` and then by
@@ -196,7 +196,7 @@ impl Origin {
 
 impl Capability {
     /// This capability as it should appear in `dest`'s table after `source`
-    /// hands it over (Design/cap_reclaim.md D3).
+    /// hands it over (D3).
     ///
     /// Ordinarily the new origin is `source`: whoever gave it away is who it
     /// goes back to if the new holder dies.
@@ -236,7 +236,7 @@ impl Capability {
     /// above -- compare process slots, never "did it come back to the slot it
     /// left from" -- was written when those two tests gave visibly different
     /// answers, because a hand-back landed wherever `install` chose. Under
-    /// homecoming reservation (`lender_owed.md` D2(D)) a returning capability
+    /// homecoming reservation (D2(D)) a returning capability
     /// *does* come back to the slot it left, so **the two tests now agree in
     /// every case a demo exercises** and a slot-identity test would pass the
     /// whole suite. It is still wrong: the re-lending case (A -> B -> C, C hands
@@ -280,14 +280,14 @@ pub enum ReleaseAction {
     /// Unmap every framebuffer mapping made through this slot. Nothing is
     /// freed -- the pages name firmware MMIO and were never allocated from
     /// anywhere -- but they must stop being reachable, because the authority
-    /// that justified the mapping is leaving (Design/fb_mapping.md D1).
+    /// that justified the mapping is leaving (D1).
     ///
     /// Deliberately NOT `FreeFrame`: routing a framebuffer through the frame
     /// path would hand ~1000 pages of MMIO to the frame allocator, which would
     /// later serve them as ordinary memory.
     UnmapFramebuffer,
     /// Unmap as `UnmapFramebuffer` does, but do **not** destroy the capability:
-    /// hand it back to the process at `lender` (Design/cap_reclaim.md D1/D2).
+    /// hand it back to the process at `lender` (D1/D2).
     ///
     /// This variant exists because `UnmapFramebuffer` conflates two things that
     /// reclamation has to separate. The dying holder's mapping must still die
@@ -299,7 +299,7 @@ pub enum ReleaseAction {
     /// Deliberately NOT `FreeFrame`, for the same reason `UnmapFramebuffer` is
     /// not: a framebuffer names ~1000 pages of firmware MMIO, and routing them
     /// into the frame allocator would have it serve them later as ordinary
-    /// memory (Design/fb_mapping.md D7). The frame baselines are what would
+    /// memory (D7). The frame baselines are what would
     /// catch that, and they must not move.
     ReclaimTo { origin: Origin },
     /// Nothing pooled: emptying the slot is the whole of the release.
@@ -346,14 +346,14 @@ pub fn reclaim_target(cap: &Capability, dying_slot: usize) -> Option<(Origin, Ca
 /// and the harness has neither.
 ///
 /// Takes the whole `Capability`, not just its object, because the decision now
-/// depends on `origin` (Design/cap_reclaim.md D6, ruled WIDEN rather than adding
-/// a sibling function). The payoff of `cap_release.md` D4 was that this policy is
+/// depends on `origin` (D6, ruled WIDEN rather than adding
+/// a sibling function). The payoff of D4 was that this policy is
 /// written exactly once, because two places make the decision and must not drift;
 /// a second function would have re-created the drift on day one.
 ///
 /// **Both callers now act on `ReclaimTo` the same way -- send the capability
 /// home -- and that symmetry was a ruling.** Reclamation was first ruled only for
-/// a holder that *dies* (Design/cap_reclaim.md), and `sys_cap_release` used to
+/// a holder that *dies*, and `sys_cap_release` used to
 /// treat `ReclaimTo` as plain `UnmapFramebuffer` for a live process giving a
 /// capability up. That stranded the lender's reserved slot when a borrower
 /// politely released instead of crashing -- a crash returned the screen, a
@@ -372,7 +372,7 @@ pub fn reclaim_target(cap: &Capability, dying_slot: usize) -> Option<(Origin, Ca
 ///
 /// The set is `Framebuffer`, `BlockRange`, and `EventSource` -- the kinds no
 /// syscall can re-mint, which is also exactly the set that carries no refcount
-/// and names no pool (`lender_owed.md` D6 / cap_reclaim.md D2's "cannot-recreate"
+/// and names no pool (D6 / D2's "cannot-recreate"
 /// property, applied honestly to every kind). Widened from `Framebuffer`-only in
 /// slice 4 (2026-08-17), once `blkreclaim-user` gave `BlockRange` a lender:
 /// before that a lent non-framebuffer capability was dropped with the dying
@@ -406,7 +406,7 @@ pub fn lend_reserves_home(cap: &Capability) -> bool {
 
 pub fn release_action(cap: &Capability) -> ReleaseAction {
     // Scope is the reclaimable set -- `Framebuffer`, `BlockRange`, `EventSource`
-    // (Design/lender_owed.md D6, widened 2026-08-17 from cap_reclaim.md D2's
+    // (D6, widened 2026-08-17 from D2's
     // Framebuffer-only). `is_reclaimable_kind` names that set in one place; a lent
     // capability of any of those kinds goes home to its lender, and every other
     // kind falls through to the per-kind match below. `EventSource` was cut from
@@ -427,7 +427,7 @@ pub fn release_action(cap: &Capability) -> ReleaseAction {
         // mapping must go with the authority. Until v2.8 it did not: the
         // mapping outlived both release and transfer, so a process could keep
         // drawing through pixels it no longer had any right to. That is closed
-        // (Design/fb_mapping.md D1); the invariant is that a live framebuffer
+        // (D1); the invariant is that a live framebuffer
         // mapping exists only while the process holds a capability naming it.
         CapObject::Framebuffer { .. } => ReleaseAction::UnmapFramebuffer,
         // Pure inline data naming no pooled resource. A CpuTime budget is
@@ -458,7 +458,7 @@ pub enum CapError {
 pub struct CapTable {
     slots: [Option<Capability>; MAX_CAPS],
     /// Slots held open for a capability that is out on loan and will come back
-    /// here (`Design/lender_owed.md` D2, ruled (D) -- homecoming reservation).
+    /// here (D2, ruled (D) -- homecoming reservation).
     ///
     /// A reserved slot is empty but **not free**: `install` skips it, so nothing
     /// else can take the place a lent capability is coming home to. That is the
@@ -496,7 +496,7 @@ impl CapTable {
     ///
     /// Separate from the revoke so the caller can unmap first: the lending path
     /// runs `process::revoke_and_unmap_for_lend`, which must take the mapping
-    /// down with the authority (`fb_mapping.md` D1) before the slot is spoken
+    /// down with the authority (D1) before the slot is spoken
     /// for.
     pub fn reserve(&mut self, slot: usize) {
         if let Some(r) = self.reserved.get_mut(slot) {
@@ -515,7 +515,7 @@ impl CapTable {
     /// fall through to `install`.
     ///
     /// **Every path that puts a capability into a table should call this rather
-    /// than `install`.** Slice 2 of `lender_owed.md` taught `install` to skip
+    /// than `install`.** Slice 2 taught `install` to skip
     /// reserved slots but taught only the death path to target them, so the
     /// cooperative hand-back landed past its own reservation and stranded a slot
     /// per launch -- green the whole time. That is a rule living in more places
@@ -616,7 +616,7 @@ impl CapTable {
     /// Clear every `origin` naming `slot`, returning how many were cleared.
     ///
     /// Run against every live table when a process exits
-    /// (Design/cap_reclaim_build.md section 0). Without it, `origin` is a hazard
+    /// (section 0). Without it, `origin` is a hazard
     /// rather than a record: a lender can exit while its borrower lives, and the
     /// process table reuses slots, so a surviving origin would eventually name
     /// an unrelated process and reclamation would hand that stranger the screen.

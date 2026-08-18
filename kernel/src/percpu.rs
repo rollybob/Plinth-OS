@@ -1,5 +1,5 @@
 //! Per-CPU data reached through `IA32_GS_BASE` (Stage B2, design D6 --
-//! Design/broader_hardware.md section 5.2).
+//! section 5.2).
 //!
 //! Only the scalars a naked-asm stub actually needs `gs:`-relative live
 //! here: `syscall_entry`'s stack-switch scratch and `sched_start`/
@@ -24,7 +24,7 @@ use x86_64::registers::model_specific::GsBase;
 use x86_64::VirtAddr;
 
 /// Upper bound on online cores. Generous for a toy kernel's `-smp` test
-/// range (2/3/4, Design/broader_hardware.md Stage B1); raise if a demo ever
+/// range (2/3/4, Stage B1); raise if a demo ever
 /// needs more.
 pub const MAX_CORES: usize = 8;
 

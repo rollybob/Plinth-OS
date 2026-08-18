@@ -1,4 +1,4 @@
-//! Block-range reclamation demo (Design/lender_owed.md D6, slice 4) -- the
+//! Block-range reclamation demo (D6, slice 4) -- the
 //! lending half. The first non-framebuffer lender in the tree, and the reason
 //! slice 4 needs one: until now every lender lent the screen, so nothing
 //! exercised reclamation for a `BlockRange` or proved the homecoming reservation
@@ -12,7 +12,7 @@
 //!
 //! **The load-bearing assertion is `cap_slot == BLOCK_SLOT`.** A lent capability
 //! comes home to the slot it left from, because that slot was reserved the moment
-//! the loan started (`lender_owed.md` D2(D), slice 2). Slice 2 proved this for a
+//! the loan started (D2(D), slice 2). Slice 2 proved this for a
 //! `Framebuffer`; this demo proves the same for a `BlockRange`, which is only
 //! reclaimable at all because slice 4 widened `capability::is_reclaimable_kind`
 //! to `Framebuffer | BlockRange | EventSource`. Watched failing two ways, each a
@@ -122,7 +122,7 @@ pub extern "C" fn _start(_id: u64) -> ! {
         sys_write(b"blkreclaim: no landing slot -- the death-wake reported nothing\n");
         sys_exit(7);
     }
-    // The homecoming guarantee, asserted directly (lender_owed.md D2(D)): the
+    // The homecoming guarantee, asserted directly (D2(D)): the
     // range returns to the slot it was lent from, because that slot was reserved
     // the moment the loan started. With the reservation disabled the kernel picks
     // the first free slot (slot 2) instead, and this fires.

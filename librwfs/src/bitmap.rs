@@ -1,5 +1,4 @@
-//! A bitmap free-space allocator over a byte slice (Design/readwrite_fs.md
-//! S2).
+//! A bitmap free-space allocator over a byte slice (S2).
 //!
 //! One bit per sector in the filesystem's granted range, packed LSB-first
 //! into bytes immediately after the superblock. Mirrors the kernel frame

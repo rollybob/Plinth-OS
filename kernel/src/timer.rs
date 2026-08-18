@@ -1,6 +1,6 @@
 //! The periodic tick that drives preemptive scheduling -- the PIT (8254) under
 //! the PIC fallback, the Local APIC's own per-core timer once Stage A2 has
-//! brought up the APIC (Design/broader_hardware.md D9).
+//! brought up the APIC (D9).
 //!
 //! This module owns the timer *device(s)*: program a periodic source and count
 //! ticks. Every interrupt-*controller* operation (the remap, the unmask, the

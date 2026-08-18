@@ -5,8 +5,8 @@
 //! lives here and nowhere else. Devices (the PIT timer, the i8042 keyboard, the
 //! virtio-blk completion line) drive their own device registers but route every
 //! controller operation through this module, so nothing above it knows whether a
-//! PIC or an APIC delivers the interrupt. See Design/input.md section 4 and
-//! Design/broader_hardware.md Stage A2.
+//! PIC or an APIC delivers the interrupt. See section 4 and
+//! Stage A2.
 //!
 //! At boot the 8259 PIC is remapped off the CPU exception vectors and fully
 //! masked. If ACPI handed us an interrupt topology (`acpi::Topology`), the seam
@@ -53,7 +53,7 @@ const SPURIOUS_VECTOR: u8 = 0xFF;
 /// IPI vector used to wake an idling core so it re-checks for claimable
 /// scheduler work (Stage B2.3, D4/section 5.4). Clear of every other vector
 /// in use: line IRQs at `VECTOR_BASE..=VECTOR_BASE+12` (incl. IRQ12, the
-/// mouse, mouse_input.md), virtio MSI-X at 0x30/0x31
+/// mouse), virtio MSI-X at 0x30/0x31
 /// (`virtio_blk::MSIX_VECTOR_BASE`), spurious at 0xFF.
 const RESCHEDULE_VECTOR: u8 = 0xF0;
 
@@ -129,7 +129,7 @@ pub fn mark_core_online(core_id: usize, apic_id: u8) {
 
 /// Is `core_id` actually up and able to run a process? Core 0 (the BSP) always
 /// is; any other core is once `mark_core_online` has recorded it. Used by the
-/// scheduler's home-core assignment (`Design/smp_scaling.md` S1: a real
+/// scheduler's home-core assignment (S1: a real
 /// per-core array, placed at setup/spawn time) so a newly created process is
 /// never homed to a core that never came up under this boot's `-smp` count.
 ///

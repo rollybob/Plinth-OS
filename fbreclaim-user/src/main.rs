@@ -1,4 +1,4 @@
-//! Framebuffer reclamation demo (Design/cap_reclaim.md D6) -- the lending half.
+//! Framebuffer reclamation demo (D6) -- the lending half.
 //!
 //! The positive statement of a negative property: **a lent capability survives
 //! the borrower's death.** This process is granted the whole screen, draws and
@@ -30,7 +30,7 @@
 //! That was K-023, and it made this demo pass most of the time rather than
 //! always.
 //!
-//! `Design/cap_reclaim.md` D7 closed it: the landing slot is recorded on the
+//! D7 closed it: the landing slot is recorded on the
 //! lender's scheduler slot and BOTH delivery paths read it from there, so the
 //! result no longer depends on which of us reached the kernel first. The demo is
 //! therefore ordering-independent by construction rather than by luck -- if it

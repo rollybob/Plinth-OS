@@ -1,7 +1,7 @@
 //! Input event tests.
 //!
 //! The per-source `EventRing` retired with the move to multishot event rings
-//! (event_rings.md S6): its bounded-SPSC + drop-newest logic now lives on the
+//! (S6): its bounded-SPSC + drop-newest logic now lives on the
 //! CQ and is exercised by `tests::event_rings`. What remains here is the pure
 //! `Event` encoding -- the raw scancode -> packed-event mapping the kernel ships
 //! and the libOS keymap consumes.

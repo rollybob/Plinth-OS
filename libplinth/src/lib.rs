@@ -340,7 +340,7 @@ pub const BLK_E_DEV: u64 = 4;
 
 // --- Async completion rings (ABI v2.4) --------------------------------------
 //
-// The block path is now the ring ABI (Design/async_rings.md). The kernel ships
+// The block path is now the ring ABI. The kernel ships
 // the ring mechanism; this is a *reference* single-in-flight use of it -- the
 // `sys_block_read` shim below. A real library OS may build a many-in-flight
 // async executor over the same three calls instead.
@@ -404,7 +404,7 @@ pub fn sys_ring_dropped(ring: u64, user_data: u64) -> u64 {
 
 // --- Block storage: the single-in-flight ring shim --------------------------
 
-// SQ/CQ entry/header layout (Design/async_rings.md s4), as byte offsets.
+// SQ/CQ entry/header layout (s4), as byte offsets.
 const RING_HDR_HEAD: u64 = 0;
 const RING_HDR_TAIL: u64 = 4;
 const RING_HDR_MASK: u64 = 8;
@@ -752,7 +752,7 @@ pub fn spawn_and_wait_cap(child_id: u64, transfer_slot: u64) -> (u64, u64, u64) 
 // ---------------------------------------------------------------------------
 // Input events: the single-subscription event-ring shim
 // ---------------------------------------------------------------------------
-// Input is the multishot event-ring path (Design/event_rings.md): a
+// Input is the multishot event-ring path: a
 // RING_OP_EVENT_SUB arms a standing subscription on an EventSource, and every
 // event posts a completion into the ring's CQ. The old blocking `event_recv`
 // int 0x80 op was retired in ABI v2.5; `sys_event_recv` is now a thin shim --
@@ -770,15 +770,15 @@ pub const EVENT_ERR: u64 = 1;
 
 /// Event kind (EVENT_KEY = 1, ...), the low byte of a packed event.
 pub const EVENT_KEY: u8 = 1;
-/// A mouse motion+button sample (Design/mouse_input.md S1): one packed event
+/// A mouse motion+button sample (S1): one packed event
 /// per PS/2 packet, decode with `mouse_dx`/`mouse_dy`/`mouse_buttons`.
 pub const EVENT_MOUSE_MOVE: u8 = 2;
 
-// SQ op selectors for the event-ring control entries (event_rings.md s4).
+// SQ op selectors for the event-ring control entries (s4).
 const RING_OP_EVENT_SUB: u32 = 1;
 const RING_OP_CANCEL: u32 = 2;
 
-/// Drop-flag bit in an event completion's status (event_rings.md s5): set when
+/// Drop-flag bit in an event completion's status (s5): set when
 /// the kernel dropped events on a full CQ. The shim reaps one event at a time so
 /// its own CQ rarely overflows, but the kernel can still drop when a burst
 /// arrives between two `sys_event_recv` calls. Rather than mask the flag off and
@@ -930,7 +930,7 @@ pub fn sys_event_recv(source_slot: u64) -> (u64, u64) {
 }
 
 /// How many events the kernel has reported dropped on the blocking-shim event
-/// ring since the process started (event_rings.md s5) -- the `EVENT_DROPPED` flag
+/// ring since the process started (s5) -- the `EVENT_DROPPED` flag
 /// this shim used to mask off and forget, kept as a count. Zero on a reader that
 /// keeps up. For the shim path (`sys_event_recv`, libinput); the ring reactor has
 /// its own `libos::ring::events_dropped`, and the exact per-subscription count is

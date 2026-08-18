@@ -1,4 +1,4 @@
-//! Block-range reclamation demo (Design/lender_owed.md D6, slice 4) -- the dying
+//! Block-range reclamation demo (D6, slice 4) -- the dying
 //! half. The `BlockRange` counterpart to `fbreclaimchild-user`.
 //!
 //! Spawned by a lender -- `blkreclaim-user` directly, or `blkrelendmid-user` as

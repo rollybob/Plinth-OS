@@ -1,4 +1,4 @@
-//! Block write demo (Design/block_write.md): the write half of the ring ABI.
+//! Block write demo: the write half of the ring ABI.
 //!
 //! The kernel grants this process a BlockRange over device 0 sectors [8, 12),
 //! minted with RIGHT_WRITE instead of every other block demo's RIGHT_READ --

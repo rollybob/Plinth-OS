@@ -225,7 +225,7 @@ pub fn map_kernel_mmio(phys: u64, size: u64) -> Result<u64, &'static str> {
 /// does NOT cover raw low physical addresses at their own value). This is a
 /// transient mapping: `unmap_identity` removes it once every AP has moved
 /// past it into normal phys-offset-mapped kernel code, per
-/// Design/broader_hardware.md section 10.
+/// section 10.
 pub fn map_identity(phys: u64, size: u64) -> Result<(), &'static str> {
     let mut fa_guard = FRAME_ALLOC.lock();
     let fa = fa_guard.as_mut().ok_or("frame allocator not initialised")?;
@@ -294,7 +294,7 @@ pub fn user_accessible(l4: u64, va: u64) -> bool {
 
 /// Translate a kernel virtual address to its physical address, if mapped.
 /// Used at boot to learn the framebuffer's physical base from the virtual
-/// address the bootloader mapped it at (Design/display.md, framebuffer.rs), so
+/// address the bootloader mapped it at (framebuffer.rs), so
 /// the region can be re-mapped into a user address space.
 pub fn kernel_phys_of(va: u64) -> Option<u64> {
     let mapper = unsafe { mapper_for(kernel_l4()) };

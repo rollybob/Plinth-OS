@@ -1,4 +1,4 @@
-//! A fixed-maximum-entry, mutable directory (Design/readwrite_fs.md S3).
+//! A fixed-maximum-entry, mutable directory (S3).
 //!
 //! Same packed-record shape as the read-only archive's directory
 //! (`libfs::archive`: 40-byte records, a 32-byte NUL-padded name plus

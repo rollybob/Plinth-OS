@@ -30,7 +30,7 @@ fn fb_cap(origin: Option<Origin>) -> Capability {
 }
 
 /// A transfer records the giver as the lender, and `install` preserves it where
-/// `mint` would silently drop it (Design/cap_reclaim.md D3).
+/// `mint` would silently drop it (D3).
 pub fn origin_recorded_on_transfer(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     // Process 1 hands a kernel-minted capability to process 2.
     let lent = fb_cap(None).lent_to(Origin::new(1, 3), 2);
@@ -108,7 +108,7 @@ pub fn relending_preserves_the_root_lenders_claim(_ctx: &mut TestCtx) -> Result<
 
 /// A lender's exit must clear its slot from every surviving capability, because
 /// `origin` names a process-table slot and the table reuses slots
-/// (Design/cap_reclaim_build.md section 0). Without this, reclamation would
+/// (section 0). Without this, reclamation would
 /// eventually mint the screen into an unrelated process.
 pub fn origin_cleared_when_lender_exits(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     let mut table = CapTable::new();
@@ -311,7 +311,7 @@ pub fn event_source_rights(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// The release policy (Design/cap_release.md D4): every capability kind maps to
+/// The release policy (D4): every capability kind maps to
 /// exactly one action, and the two callers -- `cap_release` and
 /// `process::teardown` -- both read it from here, so they cannot drift apart.
 ///
@@ -339,7 +339,7 @@ pub fn release_action_per_kind(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     // A Framebuffer owns nothing poolable either, but it is NOT a plain
     // DropSlot: its mapping has to come down with the authority, or a process
     // that transfers or releases the screen keeps drawing on it
-    // (Design/fb_mapping.md D1). Pinned separately from the list below so that
+    // (D1). Pinned separately from the list below so that
     // regressing it back to DropSlot fails here rather than silently.
     test_assert!(
         release_action(&fb_cap(None)) == ReleaseAction::UnmapFramebuffer,
@@ -362,8 +362,8 @@ pub fn release_action_per_kind(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Scope of reclamation (Design/lender_owed.md D6, widened 2026-08-17 from
-/// cap_reclaim.md D2's `Framebuffer`-only). The reclaimable set is exactly the
+/// Scope of reclamation (D6, widened 2026-08-17 from
+/// D2's `Framebuffer`-only). The reclaimable set is exactly the
 /// kinds no syscall can re-mint -- `Framebuffer`, `BlockRange`, `EventSource` --
 /// which is also the set that carries no refcount. The decision reads `origin`,
 /// which is why the policy takes a whole `Capability` rather than a bare object.
@@ -421,8 +421,8 @@ pub fn release_action_reclaims_lent_recoverable_kinds(
     Ok(())
 }
 
-/// Reclamation, as the pure decision plus the install (Design/cap_reclaim.md
-/// D1/D4). The process-table walk needs `static mut TABLE`, which the harness has
+/// Reclamation, as the pure decision plus the install (D1/D4). The
+/// process-table walk needs `static mut TABLE`, which the harness has
 /// no more than it has an address space, so the decision is what is tested here.
 pub fn reclaim_target_sends_lent_recoverable_home(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     // Process 3 dies holding a framebuffer that process 1 lent it.

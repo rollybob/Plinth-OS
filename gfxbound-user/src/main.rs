@@ -1,4 +1,4 @@
-//! Sub-region boundary demo (Stage 4, Design/display.md) -- the negative case.
+//! Sub-region boundary demo (Stage 4) -- the negative case.
 //!
 //! Granted a single horizontal band, this process deliberately writes one row
 //! PAST its band: the byte just after its mapping, which is the next band's first

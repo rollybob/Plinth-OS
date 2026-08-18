@@ -119,8 +119,8 @@ against the cost to determinism rather than taken for granted.
   fresh every run and rewritten as one unit after every create/delete. The
   read-only archive is unchanged and remains the boot/initramfs format --
   this is a second, separate format for runtime-mutable files, the same
-  "additive, not a rewrite" shape `filesystem.md` used to defer a hypothetical
-  FAT libOS. A `rwfs-user` demo proves the bitmap actually reclaims freed
+  "additive, not a rewrite" shape the filesystem design used to defer a
+  hypothetical FAT libOS. A `rwfs-user` demo proves the bitmap actually reclaims freed
   space, not just hides it: a file created after a delete lands at the exact
   sector the deleted file held.
 - [x] **Visual userspace.** The UEFI GOP linear framebuffer the `bootloader`
