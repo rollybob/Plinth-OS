@@ -343,6 +343,77 @@ fn emit_hash(tag: &[u8], fb: &Framebuffer, cur: &mut Cursor) {
     }
 }
 
+/// The four loss counters, sampled together -- the instrument that tells K-027's
+/// two candidate layers apart.
+///
+/// K-027 is a hang: in a view the shell services only the keyboard, and a key
+/// press is eventually swallowed. Two sites can swallow it, and the mechanism has
+/// never been confirmed, so the fix has been held. Every number below already
+/// existed; nothing in this tree read any of them, which is why twelve days of
+/// green smoke and a hand-reproduced hang still left the cause a hypothesis.
+///
+/// Reading the result:
+///
+/// * `kbd` -- the kernel's exact count of events dropped on the KEYBOARD
+///   subscription's full CQ. **This is the decisive number.** Nonzero means the
+///   kernel discarded a keystroke, which is the leading hypothesis: the 16-entry
+///   CQ is shared by both subscriptions, `cq_post` drops the NEWEST completion
+///   when full, and under a mouse flood the newest thing is the key just pressed.
+/// * `mouse` -- the same count for the mouse subscription. Nonzero on its own is
+///   expected under a flood and is not the bug: a lost packet costs pointer
+///   accuracy, not a keystroke.
+/// * `bursts` -- reactor-wide count of reaped completions carrying the kernel's
+///   `EVENT_DROPPED` flag. A lower bound on kernel-side loss, and a cross-check on
+///   `kbd`/`mouse`: it can lag, because the flag only rides out on the next
+///   completion that is actually admitted.
+/// * `undeliv` -- completions reaped from the CQ and then discarded because the
+///   reactor's 16-entry `done` table was full. This is loss INSIDE the libOS, the
+///   site that was the original K-027 diagnosis and was refuted as the trigger.
+///   Nonzero here would reopen it.
+///
+/// So: `kbd` climbing confirms the kernel-CQ mechanism, `undeliv` climbing
+/// reopens the reactor-table one, and both staying zero while the shell hangs
+/// refutes both and means the key was lost somewhere else entirely.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Drops {
+    kbd: u32,
+    mouse: u32,
+    bursts: u32,
+    undeliv: u32,
+}
+
+impl Drops {
+    /// Read all four at once, so they describe the same instant. `dropped()` is a
+    /// kernel query (ABI v2.11) and is read-only -- sampling neither clears a
+    /// count nor perturbs delivery, so polling it in a loop is safe.
+    fn sample(kbd: &ring::EventStream, mouse: &ring::EventStream) -> Drops {
+        Drops {
+            kbd: kbd.dropped(),
+            mouse: mouse.dropped(),
+            bursts: ring::events_dropped(),
+            undeliv: ring::undelivered(),
+        }
+    }
+}
+
+/// Emit one labelled sample. Deterministic in the scripted tour (the synthetic
+/// scaffold delivers one event per idle and the consumer drains between each, so
+/// nothing can ever be dropped and every number is 0) -- which is what makes the
+/// baseline line assertable in smoke, and therefore proof that the query path
+/// works rather than silently erroring.
+fn emit_drops(tag: &[u8], d: Drops) {
+    sys_write(tag);
+    sys_write(b"kbd=");
+    write_dec(d.kbd as u64);
+    sys_write(b" mouse=");
+    write_dec(d.mouse as u64);
+    sys_write(b" bursts=");
+    write_dec(d.bursts as u64);
+    sys_write(b" undeliv=");
+    write_dec(d.undeliv as u64);
+    sys_write(b"\n");
+}
+
 /// Launch the app: hand it the framebuffer, wait for it back, remap and redraw.
 ///
 /// Returns the framebuffer and the slot the capability came home in. Both the
@@ -453,6 +524,7 @@ fn open_icon(
     sel: usize,
     cur: &mut Cursor,
     kbd: &mut ring::EventStream,
+    mouse: &ring::EventStream,
     keymap: &mut Keymap,
 ) -> (Framebuffer, u64) {
     if let Some(app_id) = ICON_APPS[sel] {
@@ -463,11 +535,46 @@ fn open_icon(
     cur.hide(&fb);
     draw_view(&fb, ICON_LABELS[sel]);
     emit_hash(b"shell: view hash ", &fb, cur);
-    // Keyboard-only wait: a pointer has nothing to click on in a view, and any
-    // mouse packets that arrive meanwhile stay queued on their own cookie in the
-    // reactor rather than being dropped, so none are lost.
+    // Keyboard-only wait, and the K-027 instrument.
+    //
+    // This comment used to claim that mouse packets arriving here "stay queued on
+    // their own cookie in the reactor rather than being dropped, so none are
+    // lost". That is false, and it served as the bug's alibi: this loop services
+    // ONE of the two subscriptions the shell holds, while the other keeps
+    // producing into a completion queue they SHARE. Corrected rather than
+    // deleted, per the 2026-08-13 ruling -- what a wrong comment got wrong is
+    // worth keeping.
+    //
+    // What actually happens is the open question. The counters below are sampled
+    // on entry and re-read after every wake, so a real interactive session (a
+    // human moving the mouse in a view, which is the only thing that has ever
+    // reproduced this -- the synthetic scaffold delivers one event per idle and
+    // structurally cannot outrun the consumer) records WHICH layer lost the key.
+    // Nothing is fixed here; this only makes the mechanism observable, which is
+    // the precondition the held fix has been waiting on.
+    let mut prev = Drops::sample(kbd, mouse);
+    emit_drops(b"shell: view drops ", prev);
     loop {
         let ev = ring::block_on(kbd.next());
+
+        // Sample after each wake, and speak only on a change, so a quiet session
+        // stays silent and the scripted tour's transcript is unchanged.
+        let now = Drops::sample(kbd, mouse);
+        if now != prev {
+            if now.kbd != prev.kbd {
+                // The decisive observation. A keystroke was discarded by the
+                // kernel on the shared CQ -- K-027's leading hypothesis, holding
+                // the evidence it has always lacked.
+                sys_write(b"shell: K-027 keystroke dropped by the kernel\n");
+            }
+            if now.undeliv != prev.undeliv {
+                // The refuted-as-trigger site, firing after all.
+                sys_write(b"shell: K-027 completion discarded by the reactor table\n");
+            }
+            emit_drops(b"shell: view drops ", now);
+            prev = now;
+        }
+
         if event_kind(ev) != EVENT_KEY {
             continue;
         }
@@ -615,7 +722,7 @@ pub extern "C" fn _start(_idx: u64) -> ! {
                     Key::Enter => {
                         let prev_slot = fb_slot;
                         let (nfb, nslot) =
-                            open_icon(fb, fb_slot, sel, &mut cur, &mut kbd, &mut keymap);
+                            open_icon(fb, fb_slot, sel, &mut cur, &mut kbd, &mouse, &mut keymap);
                         fb = nfb;
                         fb_slot = nslot;
                         // The homecoming guarantee, guarded where it is relied
@@ -689,7 +796,7 @@ pub extern "C" fn _start(_idx: u64) -> ! {
                         move_selection(&fb, &mut cur, prev, sel);
                         let prev_slot = fb_slot;
                         let (nfb, nslot) =
-                            open_icon(fb, fb_slot, sel, &mut cur, &mut kbd, &mut keymap);
+                            open_icon(fb, fb_slot, sel, &mut cur, &mut kbd, &mouse, &mut keymap);
                         fb = nfb;
                         fb_slot = nslot;
                         // The homecoming guarantee, guarded where it is relied
