@@ -184,22 +184,34 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   this contract, so nothing correctly written can have depended on it -- but the
   effect is observable, which is why this is a version bump rather than a silent
   improvement.
-- **Which lends reserve.** Only a kind that can come home at all (today,
-  `Framebuffer` -- see v2.9) and only when lent by its **outright owner**.
-  Passing on a capability you are yourself borrowing reserves nothing: it does
-  not go home to you, it goes home to whoever lent it originally. The claim
-  follows the capability across any number of hops and always names the root
-  lender.
+- **Which lends reserve.** Only a kind that can come home at all -- see the
+  reclamation scope in v2.9, widened 2026-08-18 to `Framebuffer`, `BlockRange`,
+  and `EventSource` (the kinds no syscall can re-mint) -- and only when lent by
+  its **outright owner**. The reservation holds across every give-side a lend can
+  take: the `spawn` transfer and both IPC rendezvous directions (whether the
+  sender was already blocked or arrived to a waiting receiver) reserve alike, so
+  arrival order never decides whether a loan is reservable. Passing on a
+  capability you are yourself borrowing reserves nothing: it does not go home to
+  you, it goes home to whoever lent it originally. The claim follows the
+  capability across any number of hops and always names the root lender.
 - **The notification still exists and is unchanged.** `recv`/`recv_cap` still
   report the landing slot alongside `IPC_PEER_DIED` exactly as in v2.9. It is
   simply no longer the only way to find out, so its narrowness stops being
   load-bearing.
-- **What this does not change.** Reclamation scope is still `Framebuffer` only.
-  Nothing is reclaimed from a live holder, there is still no revocation protocol,
-  and a voluntary `cap_release` of a borrowed capability still destroys it. If a
-  lender's table is genuinely full when a capability tries to come home it is
-  dropped, as before -- but a reservation makes that far less likely, since the
-  slot it needs is the one being held for it.
+- **What this does not change.** Nothing is reclaimed from a live holder, and
+  there is still no revocation protocol. If a lender's table is genuinely full
+  when a capability tries to come home it is dropped, as before -- but a
+  reservation makes that far less likely, since the slot it needs is the one being
+  held for it.
+- **Two later refinements to this contract, no version bump (no syscall surface
+  moved).** (1) A voluntary `cap_release` of a *borrowed* reclaimable capability
+  now routes it home to its lender's reserved slot rather than destroying it
+  (2026-08-15): a polite hand-back and a borrower's death now behave alike, where
+  before a release stranded the reserved slot. (2) The reclamation scope, and with
+  it the set of lends that reserve, widened from `Framebuffer` alone to
+  `Framebuffer`, `BlockRange`, and `EventSource` -- the full set of kinds no
+  syscall can re-mint (2026-08-18). A lent `BlockRange` or `EventSource` now comes
+  home when its borrower dies (or releases it), instead of being dropped.
 
 ### v2.9 (getting a lent capability back when the borrower dies)
 
@@ -218,14 +230,17 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   correctly-written caller could have relied on the old behaviour. This one adds
   information a correct v2.8 caller may not expect, so it is compatibility-
   relevant even though nothing in-tree depended on the old guarantee.
-- **What it deliberately does not do.** Only `Framebuffer` is returned this way,
-  because it is the one kind no syscall can mint: a lost one cannot be replaced
-  for the rest of the boot, which is what makes losing it terminal rather than
-  merely costly. Kinds that own pooled resources (`Frame`, `Ring`) are still
+- **What it deliberately does not do (two of these -- the `Framebuffer`-only
+  scope and the `cap_release` behaviour -- were relaxed later; see the v2.10
+  refinements).** Only `Framebuffer` is returned this way at v2.9, because it was
+  the one kind no syscall can mint that had a lender then: a lost one cannot be
+  replaced for the rest of the boot, which is what makes losing it terminal rather
+  than merely costly. Kinds that own pooled resources (`Frame`, `Ring`) are still
   released to their pools at death -- a loan is *not* treated as a loan in
   general. Nothing is reclaimed from a *live* holder; there is no revocation
   protocol and no abort. And a voluntary `cap_release` of a borrowed framebuffer
-  still destroys it, exactly as before -- only death returns it.
+  destroyed it at v2.9 -- only death returned it (relaxed 2026-08-15: a release
+  now routes it home).
 - **Exactly which wait sees the landing slot.** Reclamation always happens; the
   *notification* is narrower, so it is worth stating precisely. The slot is
   delivered to a lender that waits with **`recv` / `recv_cap`** on a channel the
