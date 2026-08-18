@@ -35,9 +35,13 @@ process from a busy one). The UEFI GOP linear framebuffer is multiplexed by a
 `Framebuffer` capability: a graphics library OS (`libgfx`) maps it and does all
 the drawing -- pixels, an 8x8 font, text -- in unprivileged code, and the screen
 can be split into disjoint horizontal bands handed to separate graphics libOSes,
-each confined to its rows by paging. No network yet, and the single lock is
-intentionally left whole -- a benchmark showed it only contends near 100%
-kernel residency, so splitting it earns nothing real workloads would feel.
+each confined to its rows by paging. A capability lent to another process is a
+bounded loan rather than a handoff: the kinds no syscall can re-mint come home
+to the lender's reserved slot when the borrower dies or hands them back, across
+spawn and both IPC directions and however many hops deep the loan was re-lent.
+No network yet, and the single lock is intentionally left whole -- a benchmark
+showed it only contends near 100% kernel residency, so splitting it earns
+nothing real workloads would feel.
 See the [README](README.md) for the full demo.
 
 ## Phase 1 -- an adoptable reference
@@ -140,6 +144,26 @@ against the cost to determinism rather than taken for granted.
   and hand it the framebuffer capability, which the app draws into and transfers
   back over the spawn channel (display capability as transferable focus,
   shell -> app -> shell). All of it library-OS policy; no kernel or ABI change.
+- [x] **Capability lifetime -- lending without losing.** A capability handed to
+  another process used to be gone for good: if the borrower died, a resource no
+  syscall can re-mint died with it, so the shell could not safely hand the screen
+  to an app and get it back. Lending is now a bounded loan. The kernel records the
+  giver on the capability at transfer time and returns it when the borrower dies
+  or releases it (ABI v2.9), and a lend *reserves the slot it left from*, so the
+  lender knows where it will land before the loan begins (v2.10) -- chosen over
+  widening the death notification, because a lender blocked in `call`, or not
+  waiting on the dying process at all, structurally cannot receive one. Scope is
+  the full set of kinds no syscall can re-mint -- `Framebuffer`, `BlockRange`,
+  `EventSource` -- and the guarantee holds across every give-side (the `spawn`
+  transfer and both IPC rendezvous directions, so arrival order never decides it)
+  and across any number of hops: a re-lent capability goes home to the root
+  lender, never to the intermediary. Each path has a demo that was watched failing
+  against a deliberately reverted kernel before it was trusted -- `fbreclaim-user`
+  and `blkreclaim-user` for the direct lend, `blkrelend-user`/`blkrelendmid-user`
+  for an A->B->C re-lend chain, `blkipclend-user` for a blocked sender. What it
+  deliberately does not do: nothing is ever reclaimed from a *live* holder. There
+  is no revocation protocol, and that is the next question this opens rather than
+  one it answers.
 - **Broader hardware.** SMP and real-machine device support, each taken on its
   own merits. Split into stages, because adding a second CPU ends the
   single-core invariant the no-lock kernel rested on -- a concurrency redesign,
@@ -177,14 +201,22 @@ against the cost to determinism rather than taken for granted.
 
 ## Stability
 
-The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.8**.
+The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.11**.
 v2 added IPC and revised `spawn`, the one incompatible change from v1 (made
 while Phase 2 is still pre-release); v2.1 (`spawn_from_buffer`), v2.2
 (console input), v2.3 (`block_read` moved to the blocking gate), v2.4
 (async completion rings, retiring `block_read`), v2.5 (input as multishot
 ring subscriptions, retiring `event_recv`), v2.6 (`RING_OP_WRITE`, the
 write half of the block ring ABI), v2.7 (the `Framebuffer` capability +
-the `fb_map` syscall), and v2.8 (`cap_release`, retiring `frame_free`) are
-all additive over v2 but for the three retired-and-shimmed ops. Within a
-major series, new capabilities are added without breaking existing programs.
-Anything not in ABI.md is an implementation detail and may move.
+the `fb_map` syscall), v2.8 (`cap_release`, retiring `frame_free`), and
+v2.11 (`ring_dropped`, making a subscription's dropped-event count
+readable) are all additive over v2 but for the three retired-and-shimmed
+ops. Two are not: v2.9 (a lent capability comes home when its borrower
+dies) gives an existing status field a meaning a correct v2.8 caller may
+not expect, and v2.10 (the lend reserves the slot it left from) is
+observable -- a program counting its free slots sees one fewer per
+outstanding loan. Neither breaks anything correctly written, but both are
+compatibility-relevant, which is why each is a version bump rather than a
+silent improvement. Within a major series, new capabilities are added without
+breaking existing programs. Anything not in ABI.md is an implementation detail
+and may move.
