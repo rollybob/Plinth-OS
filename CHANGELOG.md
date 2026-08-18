@@ -404,7 +404,7 @@ here on 2026-08-13.
   content -- proving the write reached the device. It also holds a second,
   `RIGHT_READ`-only `BlockRange` and asserts a write through it is rejected
   with `BLK_E_RIGHTS` -- the negative case for the rights-direction check.
-- A read-write filesystem library OS, `librwfs` (Design/readwrite_fs.md),
+- A read-write filesystem library OS, `librwfs`,
   built entirely on the block write path with **zero kernel or ABI change**
   -- every decision in it is library-OS policy over `block_read`/`block_write`,
   the exokernel argument applied one layer up from the read-only archive. A

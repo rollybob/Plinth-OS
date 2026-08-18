@@ -97,7 +97,7 @@ against the cost to determinism rather than taken for granted.
   model. A `RING_OP_WRITE` op (v2.6) added the write half: the same entry shape
   with the two cap-checks' direction reversed (`BlockRange` via `RIGHT_WRITE`,
   the I/O frame via `RIGHT_READ`), proving the ring mechanism needed no change
-  to carry the opposite direction (Design/block_write.md).
+  to carry the opposite direction.
 - [x] **Console input.** The i8042 keyboard's IRQ feeds raw scancodes behind an
   interrupt-controller seam; an `EventSource` capability multiplexes the device.
   Input rides the **same completion rings as block I/O**: a keystroke answers no
@@ -109,9 +109,8 @@ against the cost to determinism rather than taken for granted.
   alongside the read future; keymaps and line editing are a library OS
   (`libinput`); the kernel ships only raw events. A second `EventSource` --
   the i8042 mouse on IRQ12, raw dx/dy/button packets -- proved the mechanism
-  generalizes past one device with zero ABI or ring changes
-  (Design/mouse_input.md).
-- [x] **A read-write filesystem.** `librwfs` (Design/readwrite_fs.md), a
+  generalizes past one device with zero ABI or ring changes.
+- [x] **A read-write filesystem.** `librwfs`, a
   second library OS over the same block ring ABI, with **zero kernel or ABI
   change** -- the write path already proved the mechanism generalized; this
   is the policy built on top. A bitmap allocator and a fixed-maximum-entry
@@ -136,14 +135,14 @@ against the cost to determinism rather than taken for granted.
   graphics libOSes, confined to their rows by paging -- and a band holder that
   writes past its grant is `#PF`-terminated (the display analogue of disjoint
   `BlockRange`s). A `gfxtext-user` demo also echoes a keyboard line on-screen,
-  joining the framebuffer and the keyboard `EventSource` in one libOS
-  (Design/display.md). On top of it all, a **shell skin** (Design/display_skin.md,
-  `shell-user`): a splash, a home screen of app icons, and arrow-key navigation
-  (libinput decodes the extended cursor scancodes; libgfx centers text and draws
-  borders) -- and selecting the app icon makes the shell `spawn` a real process
-  and hand it the framebuffer capability, which the app draws into and transfers
-  back over the spawn channel (display capability as transferable focus,
-  shell -> app -> shell). All of it library-OS policy; no kernel or ABI change.
+  joining the framebuffer and the keyboard `EventSource` in one libOS. On top of
+  it all, a **shell skin** (`shell-user`): a splash, a home screen of app icons,
+  and arrow-key navigation (libinput decodes the extended cursor scancodes;
+  libgfx centers text and draws borders) -- and selecting the app icon makes the
+  shell `spawn` a real process and hand it the framebuffer capability, which the
+  app draws into and transfers back over the spawn channel (display capability
+  as transferable focus, shell -> app -> shell). All of it library-OS policy; no
+  kernel or ABI change.
 - [x] **Capability lifetime -- lending without losing.** A capability handed to
   another process used to be gone for good: if the borrower died, a resource no
   syscall can re-mint died with it, so the shell could not safely hand the screen
