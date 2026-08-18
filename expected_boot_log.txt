@@ -291,6 +291,26 @@ blkreclaim: child died, range came back at slot 1
 blkreclaim: reclaimed b0=17
 plinth: blkreclaim demo: all done
 
+# Block-range RE-LEND chain (Design/lender_owed.md D6 slice 4 step 2, the K-025
+# watch). A = blkrelend-user is granted dev-0 [20, 24) and lends it to B =
+# blkrelendmid (id 8), which RE-LENDS it to C = blkreclaimchild (id 7) which
+# faults holding it. C reads its transferred range (ramp byte 20) before
+# faulting. When C dies the range must reclaim to the ROOT lender A -- named by
+# the surviving origin (D8) -- not to the intermediary B: that is K-025. The two
+# load-bearing lines are "range came home to root at slot 1" (slot 1 = A's
+# BLOCK_SLOT) and "re-lent, range went to root not here" (B saw nothing return).
+# With the K-025 fix reverted, C's death sends the range to B: A's wake carries
+# NO_CAP ("no landing slot ... laundered") and B prints "LAUNDERED", both red.
+plinth: blkrelend demo: 1 processes
+blkrelend: root lent b0=20
+blkreclaimchild: holding the range b0=20, now faulting
+plinth: [user fault] #PF
+plinth: terminating user process
+blkrelendmid: re-lent, range went to root not here
+blkrelend: grandchild died, range came home to root at slot 1
+blkrelend: root reclaimed b0=21
+plinth: blkrelend demo: all done
+
 # Phase 2 storage, load-from-disk: the FS library-OS demo. The kernel grants
 # fsdemo a BlockRange over the archive device; fsdemo uses libfs to parse the
 # on-disk archive, find "diskhello" by name, read its ELF off the disk, and

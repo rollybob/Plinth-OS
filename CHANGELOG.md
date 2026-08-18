@@ -41,8 +41,16 @@ here on 2026-08-13.
   a sector to prove it holds it and then faults, and asserts the range came home
   to the slot it was lent from. Watched failing both ways -- revert the widening
   and the wake carries `NO_CAP`; disable the homecoming reservation and the range
-  lands on the wrong slot. K-025 and K-026 (laundering on a re-lend chain) become
-  reachable with this lender but are **not yet watched** -- that is the next step.
+  lands on the wrong slot.
+
+  A second lender chain, `blkrelend-user` -> `blkrelendmid-user` ->
+  `blkreclaimchild-user`, extends this to three levels (A lends to B, B re-lends to
+  C, C dies holding the range) and **watches K-025 failing**: a borrower that passes
+  a capability on must not launder the root lender's claim, so the range must
+  reclaim to the root A, not the intermediary B. Reverting the origin-preservation
+  in `spawn_scheduled` sends it to B instead, red from both sides (A gets `NO_CAP`,
+  B reports "LAUNDERED"). K-026 (the same class on the IPC blocked-sender give-side,
+  a different code path) is now buildable but remains unwatched.
 - **The dropped-event count is readable (ABI v2.11).** The kernel has kept a
   sticky per-subscription count of input dropped on a full completion queue since
   the event-ring milestone (v2.5), and surfaced a drop *flag* on the next admitted

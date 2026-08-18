@@ -211,6 +211,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // non-framebuffer capability comes home to the lender's reserved slot --
         // Design/lender_owed.md slice 4; blkreclaim-user mirrors this id as
         // BLKRECLAIMCHILD_ID, and is the first lender that does not lend the screen).
+        // id 8 = blkrelendmid (the INTERMEDIARY in the A -> B -> C re-lend chain:
+        // it receives a BlockRange on loan from blkrelend-user, re-lends it to
+        // blkreclaimchild, and proves the range goes home to the ROOT rather than
+        // back to itself -- the K-025 watch, Design/lender_owed.md slice 4 step 2).
         //
         // Ids are positional, so appending is safe but INSERTING is not: every
         // id after the insertion point shifts and the mirrored constants in the
@@ -224,6 +228,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             include_bytes!(concat!(env!("OUT_DIR"), "/fbreclaimchild-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/fbreleasechild-user")),
             include_bytes!(concat!(env!("OUT_DIR"), "/blkreclaimchild-user")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/blkrelendmid-user")),
         ];
         process::set_phys_offset(phys_offset);
         process::set_spawnable(SPAWNABLE);
@@ -660,6 +665,34 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             scheduler::run("blkreclaim demo", &[BLKRECLAIM_BIN], phys_offset, &[Some(range)]);
             let after_blkreclaim = free_frames();
             let _ = writeln!(serial, "plinth: {after_blkreclaim} frames free after blkreclaim");
+        }
+
+        // Block-range RE-LEND chain (Design/lender_owed.md D6 slice 4 step 2, the
+        // K-025 watch). blkreclaim above proves a lent BlockRange comes home when
+        // its DIRECT borrower dies; this proves it comes home to the RIGHT process
+        // when the borrower passes it on. The kernel grants blkrelend-user (A) a
+        // read BlockRange over device 0 sectors [20, 24) -- clear of blkreclaim's
+        // [16, 20). A lends it to blkrelendmid (B, id 8), which re-lends it to
+        // blkreclaimchild (C, id 7) which faults holding it. When C dies the range
+        // must reclaim to its ROOT lender A, named by the surviving origin (D8),
+        // NOT to the intermediary B: that is K-025. A asserts the range came home
+        // to its own BLOCK_SLOT; B asserts nothing came back to it. Watched failing
+        // by reverting the K-025 origin-preservation in spawn_scheduled. Frame
+        // counts bracket the whole chain (A's, B's and C's I/O frames all reclaimed
+        // at teardown). Runs only if device 0 came up.
+        if virtio_blk::ready(0) {
+            const BLKRELEND_BIN: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/blkrelend-user"));
+            let before_blkrelend = free_frames();
+            let _ = writeln!(serial, "plinth: {before_blkrelend} frames free before blkrelend");
+            let range = Capability {
+                object: CapObject::BlockRange { dev: 0, start: 20, count: 4 },
+                rights: capability::RIGHT_READ,
+                origin: None,
+            };
+            scheduler::run("blkrelend demo", &[BLKRELEND_BIN], phys_offset, &[Some(range)]);
+            let after_blkrelend = free_frames();
+            let _ = writeln!(serial, "plinth: {after_blkrelend} frames free after blkrelend");
         }
 
         // Phase 2 storage, load-from-disk: the filesystem library-OS demo. The

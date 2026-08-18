@@ -1,9 +1,11 @@
 //! Block-range reclamation demo (Design/lender_owed.md D6, slice 4) -- the dying
 //! half. The `BlockRange` counterpart to `fbreclaimchild-user`.
 //!
-//! Spawned by `blkreclaim-user`, which TRANSFERS it a read capability over a
-//! `BlockRange` and then waits. This process reads a sector THROUGH that range
-//! to prove it genuinely holds it, and then FAULTS while still holding it.
+//! Spawned by a lender -- `blkreclaim-user` directly, or `blkrelendmid-user` as
+//! the grandchild C of the A -> B -> C re-lend chain -- which TRANSFERS it a read
+//! capability over a `BlockRange` and then waits. This process reads a sector
+//! THROUGH that range to prove it genuinely holds it, and then FAULTS while still
+//! holding it.
 //!
 //! It dies by fault rather than by a clean exit for the same reason
 //! `fbreclaimchild-user` does: a clean exit could be expected to hand the
@@ -17,8 +19,15 @@
 //! `fbreclaimchild-user`. Without it the parent re-reading afterwards would prove
 //! only that the parent holds *a* `BlockRange`, not that the one it lent out
 //! survived the borrower's death -- and a `block_read` that silently did nothing
-//! would pass just as well. Reading a real sector and checking its ramp byte is
-//! what makes "this process genuinely has the range" observable.
+//! would pass just as well. Reading a real sector is what makes "this process
+//! genuinely has the range" observable.
+//!
+//! It is **range-agnostic**: it reads relative sector 0 of whatever range it was
+//! handed and prints the ramp byte, rather than checking against a hardcoded
+//! value. That is what lets it serve as the dying holder for more than one lender
+//! (`blkreclaim-user` lends `[16, 20)` -> byte 16; the re-lend chain lends
+//! `[20, 24)` -> byte 20). The caller's boot-log line pins the expected byte, so a
+//! wrong range still fails smoke without this crate knowing which range it holds.
 
 #![no_std]
 #![no_main]
@@ -27,13 +36,6 @@ use libplinth::{
     sys_block_read, sys_exit, sys_frame_alloc, sys_frame_map, sys_write, write_dec, BLK_OK,
     MAP_BASE, SPAWN_GRANT_SLOT, SYS_ERR,
 };
-
-/// First disk sector of the range `blkreclaim-user` lends (dev 0, `[16, 20)`).
-/// The ramp disk's byte j of sector s is `(s + j) & 0xFF` (xtask `block_image`),
-/// so a relative-offset-0 read is disk sector 16 and byte 0 must be 16. Mirrored
-/// from `blkreclaim-user`'s `RANGE_START`; the two must agree on what a correct
-/// read looks like.
-const RANGE_START: u64 = 16;
 
 #[no_mangle]
 pub extern "C" fn _start(_id: u64) -> ! {
@@ -48,21 +50,19 @@ pub extern "C" fn _start(_id: u64) -> ! {
         sys_exit(2);
     }
 
-    // Prove the range is genuinely ours: read relative sector 0 (disk sector 16)
-    // through the TRANSFERRED capability at SPAWN_GRANT_SLOT and check the ramp
-    // byte. A read that reaches the device and returns the right byte means this
-    // process really holds the range -- the kernel is off the verification path
-    // once the bytes are in our frame.
+    // Prove the range is genuinely ours: read relative sector 0 through the
+    // TRANSFERRED capability at SPAWN_GRANT_SLOT. A read that reaches the device
+    // and lands bytes in our frame means this process really holds the range --
+    // the kernel is off the verification path once the bytes are here. The ramp
+    // byte printed below is checked by the caller's boot-log expectation (16 for
+    // blkreclaim's range, 20 for the re-lend chain's), so a wrong range is caught
+    // there without this crate hardcoding which range it holds.
     if sys_block_read(SPAWN_GRANT_SLOT, frame, 0, 1) != BLK_OK {
         sys_write(b"blkreclaimchild: in-range read failed\n");
         sys_exit(3);
     }
     // SAFETY: the frame is mapped at MAP_BASE and the device just DMA'd a sector.
     let b0 = unsafe { (MAP_BASE as *const u8).read_volatile() };
-    if b0 as u64 != RANGE_START & 0xFF {
-        sys_write(b"blkreclaimchild: wrong ramp byte -- range is not ours\n");
-        sys_exit(4);
-    }
     sys_write(b"blkreclaimchild: holding the range b0=");
     write_dec(b0 as u64);
     sys_write(b", now faulting\n");

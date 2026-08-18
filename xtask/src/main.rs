@@ -63,6 +63,7 @@ const USER_CRATES: &[&str] = &[
     "quietworker",
     "spawnwaitcap",
     "blkreclaim", "blkreclaimchild",
+    "blkrelend", "blkrelendmid",
     "template", "bench",
 ];
 
@@ -1307,6 +1308,12 @@ fn run_smoke_checks(uefi_path: &Path, with_transcript: bool) {
     // asserted `range came back at slot ...` line in expected_boot_log.txt, which
     // names BLOCK_SLOT and goes red if the reservation is disabled.
     check_frames_baseline(&actual, "blkreclaim");
+    // The A -> B -> C re-lend chain (lender_owed.md slice 4 step 2 / K-025). Three
+    // processes touch the range; a BlockRange owns no frames, so the baseline
+    // proves every I/O frame is reclaimed at teardown. The K-025 proof is the
+    // asserted `range came home to root at slot ...` line, which goes to NO_CAP if
+    // the origin is laundered.
+    check_frames_baseline(&actual, "blkrelend");
     // The same reclamation driven through `spawn_and_wait_cap` (K-012). The frame
     // baseline carries the D7 hazard exactly as fbreclaim's does. The endpoint
     // baseline proves only that the spawn endpoint does not outlive the demo --
