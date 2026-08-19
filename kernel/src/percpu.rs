@@ -26,7 +26,23 @@ use x86_64::VirtAddr;
 /// Upper bound on online cores. Generous for a toy kernel's `-smp` test
 /// range (2/3/4, Stage B1); raise if a demo ever
 /// needs more.
-pub const MAX_CORES: usize = 8;
+/// Raised 8 -> 16 on 2026-08-18 (`real_hardware.md` D1). The reference machine
+/// reports **exactly 8** logical processors, so at 8 there was no headroom at
+/// all: any hyperthreaded quad-core filled the table exactly, and a six- or
+/// eight-core desktop would have run on half its cores.
+///
+/// Over-limit APs are *not* dropped silently -- `smp::start_aps` prints
+/// `smp: apic id N skipped (MAX_CORES reached)` and carries on with the cores it
+/// has, so exceeding this degrades loudly rather than failing. 16 is therefore a
+/// comfort limit, not a correctness one, and a 64-thread machine still boots.
+///
+/// It is not free: `AP_BOOT_STACKS` and `SYSCALL_STACKS` are 64 KiB per core
+/// each, so every slot costs 128 KiB of BSS whether or not a core ever fills it.
+/// 8 -> 16 adds 1 MiB to the image. That is why this is 16 and not 64 -- past
+/// the point where a machine has more cores than this, a statically sized table
+/// is the wrong shape and the answer is to allocate per-core state, not to grow
+/// the constant.
+pub const MAX_CORES: usize = 16;
 
 /// The boot processor's core id, by convention -- the same role `apic_id 0`
 /// usually plays, but kept distinct: a core id is this kernel's own dense
