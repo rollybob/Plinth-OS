@@ -11,6 +11,9 @@ edition = "2021"
 
 [dependencies]
 libplinth = { path = "../libplinth" }
+# Glyph data only. Shared with the kernel's diagnostic console so there is one
+# font rather than two (real_hardware.md D11); the drawing stays here.
+libfont = { path = "../libfont" }
 
 [profile.release]
 opt-level = 3

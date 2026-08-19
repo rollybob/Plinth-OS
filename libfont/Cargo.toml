@@ -1,0 +1,20 @@
+# Standalone crate -- intentionally not a workspace member, like libgfx and
+# libplinth. It is built for x86_64-unknown-none by whatever depends on it, and
+# that will shortly include the KERNEL as well as user-side crates, which is
+# unusual here and deliberate: this crate carries glyph *data*, not policy, so
+# both sides can share it without the kernel taking on a library OS.
+#
+# It has no dependencies at all, and should not acquire any. The moment it needs
+# one it has stopped being a font table.
+[workspace]
+
+[package]
+name = "libfont"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
