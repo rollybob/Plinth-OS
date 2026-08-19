@@ -94,6 +94,26 @@ plinth: virtio-blk[1] msix vector 0x31
 plinth: virtio-blk[0] sector 0 read ok (ramp verified)
 plinth: virtio-blk[1] sector 0 read ok (distinct disk)
 
+# Device MMIO is mapped UNCACHED, and this line is the assertion that it is.
+#
+# Until 2026-08-18 it was not. map_kernel_mmio built a NO_CACHE mapping at
+# phys_offset + phys and skipped any page already translating there -- and since
+# the bootloader's Mapping::Dynamic window spans the BARs with huge pages, that
+# skip was taken for ALL SIX device mappings (LAPIC, I/O APIC, both MSI-X tables,
+# both virtio BARs). Every device register was reached through the bootloader's
+# CACHEABLE mapping and the NO_CACHE flag was dead code. QEMU treats BAR accesses
+# as device MMIO whatever the page attributes say, which is exactly why twelve
+# months of green boots never showed it; on real hardware it means writes that
+# coalesce or arrive late, stale reads, and MSI-X writes that may never land.
+#
+# Device MMIO now goes into a private PML4 slot claimed at boot, so every page is
+# mapped fresh and uncached and there is no "already mapped?" case to get wrong.
+# The count is the check: 12 pages is the current device set, and a change means
+# a device was added or a mapping path moved -- either way it wants a look rather
+# than a silent update. This is also the watchable half of a hazard QEMU cannot
+# otherwise demonstrate (real_hardware.md D2).
+plinth: mmio: 12 pages mapped uncached
+
 plinth: running hello
 hello: ring 3
 hello: frame mapped and writable

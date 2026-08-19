@@ -320,6 +320,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         if virtio_blk::ready(1) {
             virtio_blk::selftest_read(&mut serial, phys_offset, 1, false);
         }
+        // Every device is mapped by now (interrupt controllers in irq::init, BARs
+        // and MSI-X tables in virtio_blk::init), so this count is final. It is
+        // asserted in the smoke as the standing check that device registers go
+        // through the uncached window and nowhere else: before 2026-08-18 the
+        // mapper silently inherited the bootloader's CACHEABLE huge-page window
+        // for all six of these, which QEMU forgives and real hardware does not
+        // (real_hardware.md D2). A change in this number means a device was added
+        // or a mapping path changed -- either way, look at it.
+        let (mmio_pages, _mmio_base) = memory::mmio_stats();
+        let _ = writeln!(serial, "plinth: mmio: {mmio_pages} pages mapped uncached");
+
         // The boot selftests above ran polled (no process to block yet). From
         // here on, runtime block_read blocks and is woken by the completion IRQ:
         // install each device's INTx handler and unmask its line (Stage 4).
