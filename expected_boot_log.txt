@@ -675,25 +675,36 @@ shell: home hash 0x4b82ddae83e366a5
 # begins over icon 0. That is also what makes the journey below resolution-
 # independent: from an icon centre every other icon is a fixed delta away.
 shell: cursor over icon 0
-shell: view hash 0x2a82b4e08a822325
-# The K-027 instrument, sampled on entering a view and after every wake inside
-# it. All four are 0 here and that is the point twice over: it is the assertion
-# that the kernel drop query (ABI v2.11) actually answers for a live
-# subscription rather than silently erroring, and it is the baseline a real
-# interactive session is read against.
-#
-# Zero is also the honest limit of this line. The synthetic scaffold delivers
-# one event per idle pass and the consumer drains between every one, so nothing
-# can ever be dropped here no matter how many packets the tour scripts -- the
-# delivery MODEL is the limit, not the array size. A scripted run therefore
-# cannot make these numbers move, and a green smoke is not evidence about K-027
-# either way. The mechanism is confirmed or refuted by a human with a real
-# mouse under `cargo xtask run`, where `kbd` climbing means the kernel dropped
-# the keystroke and `undeliv` climbing means the reactor table did.
-shell: view drops kbd=0 mouse=0 bursts=0 undeliv=0
-# The journey: right across the gap between the columns (over nothing), onto
-# icon 1, then down onto icon 3. Four packets, three changes of answer.
+# The pointer crosses out of icon 0 here, at home, before Enter opens the view.
+# This line sat AFTER the view until 2026-08-18: the packet that caused it used
+# to be stranded in the reactor unconsumed until the shell came back, because a
+# view serviced only the keyboard. That stranding was K-027. A view now services
+# the mouse too, so the move is accounted for when it happens.
 shell: cursor over none
+shell: view hash 0x2a82b4e08a822325
+# The K-027 regression assertion. Everything below this line depends on it.
+#
+# The shell is held inside this view for twenty-one idle passes while twenty-one
+# mouse packets are delivered to it -- a screen with no use for a pointer. Before
+# the fix those packets piled up unconsumed in the libOS reactor's 16-entry
+# staging table, and the SEVENTEENTH completion, the next keystroke, was reaped
+# from the completion queue and discarded with nowhere to put it. Backspace never
+# arrived and the shell hung here forever, so a regression does not merely change
+# this line -- the tour stops dead at this point and every expectation after it
+# fails.
+#
+# All four reading 0 is the assertion. `undeliv` is the confirmed mechanism and
+# must stay 0. `kbd` is the kernel-side site, which cannot fire under this
+# workload because the reactor drains the queue empty on every wake -- it is
+# asserted anyway so that a change in that property is not silent. The line is
+# also proof that the kernel drop query (ABI v2.11) answers for a live
+# subscription rather than silently erroring.
+#
+# The padding that makes this bite lives in main.rs (twenty 0xAA scancodes and
+# twenty no-motion packets, which MUST stay equal in count). Shortening it below
+# seventeen in-view passes retires the test without failing it.
+shell: view drops kbd=0 mouse=0 bursts=0 undeliv=0
+# The journey resumes: onto icon 1, then down onto icon 3.
 shell: cursor over icon 1
 shell: cursor over icon 3
 shell: launching app

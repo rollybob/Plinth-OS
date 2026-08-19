@@ -1298,9 +1298,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // click (CRASH) pending, and the whole of slice 2 never runs. Any
             // scancode that decodes to nothing would do; a release is the least
             // surprising.
+            // The twenty 0xAA after the first Enter are the K-027 regression
+            // guard, and they are load-bearing. They hold the shell inside a view
+            // for twenty-one idle passes while the mouse queue below feeds it
+            // twenty-one no-motion packets. A view services only the keyboard, so
+            // before the fix those packets pile up unconsumed in the libOS
+            // reactor's 16-entry staging table, and the SEVENTEENTH completion --
+            // the next keystroke -- is reaped from the CQ and discarded with
+            // nowhere to go, so Backspace never arrives and the shell hangs
+            // forever. Removing this padding, or dropping it below seventeen
+            // passes, silently retires the only automated test for that hang.
+            //
+            // This is what the 08-13 attempt could not do: it armed twenty
+            // packets into a queue capped at sixteen, exactly the table size, so
+            // it reached the boundary and never crossed it.
             #[cfg(not(feature = "interactive"))]
             input::arm_synthetic(&[
-                0xE0, 0x4D, 0x1C, 0x0E, 0xE0, 0x50, 0x1C, 0x1C, 0xAA, 0xAA, 0xAA, 0xAA, 0x10,
+                0xE0, 0x4D, 0x1C, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+                0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0x0E, 0xE0, 0x50, 0x1C, 0x1C,
+                0xAA, 0xAA, 0xAA, 0xAA, 0x10,
             ]);
             // The pointer journey, in packets the shell turns into motion. It
             // starts on the centre of icon 0 (the shell parks it there), so every
@@ -1346,8 +1362,42 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             #[cfg(not(feature = "interactive"))]
             input::arm_synthetic_mouse(&[
                 (0, 0, 0x00),
-                (0, 0, 0x00),
                 (127, 0, 0x00),
+                // Twenty no-motion packets, paired ONE FOR ONE with the 0xAA run
+                // in the scancode array above. They land while the shell sits in a
+                // view -- the only screen with no use for a pointer -- so before
+                // the fix they pile up unconsumed and overrun the reactor's
+                // 16-entry staging table.
+                //
+                // The count here MUST equal the count there. The two synthetic
+                // queues advance together, one entry each per idle pass, so an
+                // unequal insertion shifts every later pairing and silently
+                // reshuffles the journey -- which is exactly what a first attempt
+                // at this did.
+                //
+                // Zero deltas on purpose: occupying a staging slot is the whole
+                // job here.
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
+                (0, 0, 0x00),
                 (121, 0, 0x00),
                 (0, -127, 0x00),
                 (0, -41, 0x00),

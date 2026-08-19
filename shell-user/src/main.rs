@@ -524,7 +524,7 @@ fn open_icon(
     sel: usize,
     cur: &mut Cursor,
     kbd: &mut ring::EventStream,
-    mouse: &ring::EventStream,
+    mouse: &mut ring::EventStream,
     keymap: &mut Keymap,
 ) -> (Framebuffer, u64) {
     if let Some(app_id) = ICON_APPS[sel] {
@@ -535,45 +535,76 @@ fn open_icon(
     cur.hide(&fb);
     draw_view(&fb, ICON_LABELS[sel]);
     emit_hash(b"shell: view hash ", &fb, cur);
-    // Keyboard-only wait, and the K-027 instrument.
+    // Wait on BOTH subscriptions, not just the one this screen reads. That is the
+    // K-027 fix, and the reason it has to be here rather than in the reactor.
     //
-    // This comment used to claim that mouse packets arriving here "stay queued on
-    // their own cookie in the reactor rather than being dropped, so none are
-    // lost". That is false, and it served as the bug's alibi: this loop services
-    // ONE of the two subscriptions the shell holds, while the other keeps
-    // producing into a completion queue they SHARE. Corrected rather than
-    // deleted, per the 2026-08-13 ruling -- what a wrong comment got wrong is
-    // worth keeping.
+    // This comment used to claim that mouse packets arriving in a view "stay
+    // queued on their own cookie in the reactor rather than being dropped, so
+    // none are lost". That is false, it is what made the defect look accounted
+    // for, and it is corrected rather than deleted per the 2026-08-13 ruling.
+    // What actually happened: this loop serviced ONE of the two subscriptions the
+    // shell holds. The reactor drains the whole completion queue on every wake
+    // into a fixed 16-entry staging table and advances the queue head whether or
+    // not it found room, so unconsumed mouse completions accumulated there until
+    // the table was full -- and the next completion, the KEYSTROKE, was reaped and
+    // thrown away with nowhere to put it. Backspace never arrived and the shell
+    // waited forever.
     //
-    // What actually happens is the open question. The counters below are sampled
-    // on entry and re-read after every wake, so a real interactive session (a
-    // human moving the mouse in a view, which is the only thing that has ever
-    // reproduced this -- the synthetic scaffold delivers one event per idle and
-    // structurally cannot outrun the consumer) records WHICH layer lost the key.
-    // Nothing is fixed here; this only makes the mechanism observable, which is
-    // the precondition the held fix has been waiting on.
+    // So the contract a shared reactor over a bounded table implies is: a consumer
+    // holding N subscriptions must service all N, whether or not this screen has a
+    // use for them. Not draining a stream is not "ignoring" it; it is filling a
+    // shared buffer.
+    //
+    // The deltas are consumed into the pointer position but nothing is painted:
+    // the cursor is hidden in a view, and position is ACCUMULATED from relative
+    // samples, so discarding the packets outright would desync the pointer from
+    // the physical mouse and make it jump on return. `over` is deliberately not
+    // recomputed here -- a view has nothing to hit-test against, and the next
+    // packet at home reports the answer.
     let mut prev = Drops::sample(kbd, mouse);
     emit_drops(b"shell: view drops ", prev);
     loop {
-        let ev = ring::block_on(kbd.next());
+        let either = ring::block_on(ring::select2(kbd.next(), mouse.next()));
 
         // Sample after each wake, and speak only on a change, so a quiet session
-        // stays silent and the scripted tour's transcript is unchanged.
+        // stays silent and the scripted tour's transcript is unchanged. These stay
+        // in after the fix: they are what proves the table is no longer filling,
+        // and the only warning if some future screen reintroduces a starved
+        // subscription.
         let now = Drops::sample(kbd, mouse);
         if now != prev {
             if now.kbd != prev.kbd {
-                // The decisive observation. A keystroke was discarded by the
-                // kernel on the shared CQ -- K-027's leading hypothesis, holding
-                // the evidence it has always lacked.
+                // The kernel discarded a keystroke on the shared completion queue.
+                // Not the mechanism behind the 08-18 reproduction -- the reactor
+                // drains that queue empty on every wake, so it cannot fill under
+                // this workload -- but a real second site if it ever fires.
                 sys_write(b"shell: K-027 keystroke dropped by the kernel\n");
             }
             if now.undeliv != prev.undeliv {
-                // The refuted-as-trigger site, firing after all.
+                // THE confirmed K-027 mechanism. After the fix this must never
+                // fire from a view; if it does, a subscription is being starved
+                // again.
                 sys_write(b"shell: K-027 completion discarded by the reactor table\n");
             }
             emit_drops(b"shell: view drops ", now);
             prev = now;
         }
+
+        let ev = match either {
+            Either::A(k) => k,
+            Either::B(m) => {
+                if event_kind(m) == EVENT_MOUSE_MOVE {
+                    let info = fb.info();
+                    let w = info.width as i64;
+                    let h = info.height as i64;
+                    cur.x =
+                        (cur.x as i64 + mouse_dx(m) as i64).clamp(0, w - CURSOR_SIDE as i64) as u32;
+                    cur.y =
+                        (cur.y as i64 - mouse_dy(m) as i64).clamp(0, h - CURSOR_SIDE as i64) as u32;
+                }
+                continue;
+            }
+        };
 
         if event_kind(ev) != EVENT_KEY {
             continue;
@@ -582,6 +613,23 @@ fn open_icon(
             Key::Backspace => {
                 draw_home(&fb, sel);
                 cur.show(&fb);
+                // Report the pointer's net position on the way out.
+                //
+                // Servicing the mouse inside a view moves the pointer without
+                // hit-testing it -- a view has no icons to be over -- so without
+                // this, a visit to a view would swallow the `over` change it
+                // caused and the next line would be reported against a stale
+                // answer. Announcing the net result once keeps the invariant that
+                // every change of answer is reported, and it costs one line where
+                // crossing the same distance at home would cost several.
+                let info = fb.info();
+                let over = hit_test(info.width, info.height, cur.x, cur.y);
+                if over != cur.over {
+                    cur.over = over;
+                    sys_write(b"shell: cursor over ");
+                    write_icon(over);
+                    sys_write(b"\n");
+                }
                 break;
             }
             // Quit works from a view, not just from home.
@@ -722,7 +770,7 @@ pub extern "C" fn _start(_idx: u64) -> ! {
                     Key::Enter => {
                         let prev_slot = fb_slot;
                         let (nfb, nslot) =
-                            open_icon(fb, fb_slot, sel, &mut cur, &mut kbd, &mouse, &mut keymap);
+                            open_icon(fb, fb_slot, sel, &mut cur, &mut kbd, &mut mouse, &mut keymap);
                         fb = nfb;
                         fb_slot = nslot;
                         // The homecoming guarantee, guarded where it is relied
@@ -796,7 +844,7 @@ pub extern "C" fn _start(_idx: u64) -> ! {
                         move_selection(&fb, &mut cur, prev, sel);
                         let prev_slot = fb_slot;
                         let (nfb, nslot) =
-                            open_icon(fb, fb_slot, sel, &mut cur, &mut kbd, &mouse, &mut keymap);
+                            open_icon(fb, fb_slot, sel, &mut cur, &mut kbd, &mut mouse, &mut keymap);
                         fb = nfb;
                         fb_slot = nslot;
                         // The homecoming guarantee, guarded where it is relied

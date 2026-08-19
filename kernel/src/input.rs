@@ -122,7 +122,15 @@ pub(crate) fn source_for(slot: u64) -> Option<usize> {
 // during the same idle. The sequence is the stimulus a scripted `sendkey` smoke
 // would otherwise provide.
 
-const MAX_SYNTHETIC: usize = 16;
+/// Raised from 16 to 48 on 2026-08-18. The old value was not a neutral choice:
+/// it matched the libOS reactor's staging table exactly, so a scripted sequence
+/// could reach that table's capacity and never exceed it. K-027's 08-13
+/// "refutation" armed twenty packets, was silently truncated to sixteen, and
+/// concluded the bug did not reproduce -- when overrunning the table needs a
+/// SEVENTEENTH completion. A scaffold bounded at exactly the limit it is meant
+/// to push past can only ever report "not reproduced". Keep this comfortably
+/// above any consumer-side bound a test needs to cross.
+const MAX_SYNTHETIC: usize = 48;
 
 struct Synthetic {
     codes: [u8; MAX_SYNTHETIC],
@@ -176,7 +184,10 @@ pub fn deliver_synthetic() {
 // script into the permanent smoke, so a scripted packet sequence drives the
 // exact record -> route -> wake path a real IRQ12 packet would.
 
-const MAX_SYNTHETIC_MOUSE: usize = 16;
+/// Raised from 16 to 48 with `MAX_SYNTHETIC`, and for the same reason -- this is
+/// the one that mattered for K-027, since the packets that fill the reactor's
+/// table are mouse packets.
+const MAX_SYNTHETIC_MOUSE: usize = 48;
 
 struct SyntheticMouse {
     packets: [(i8, i8, u8); MAX_SYNTHETIC_MOUSE],
