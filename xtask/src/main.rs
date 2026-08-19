@@ -34,6 +34,7 @@ fn main() {
 
     match subcmd {
         "build"   => { build_all(); }
+        "image"   => { let img = build_all(); stage_usb_image(&img); }
         // `run`/`run-gdb` build the kernel with the `interactive` feature, so the
         // shell waits for real keyboard input (drive the cursor yourself) instead
         // of auto-playing its scripted tour. smoke/test/bench stay scripted.
@@ -44,7 +45,13 @@ fn main() {
         "bench"   => { let img = build_bench(); bench(&img); }
         "test"    => { let img = build_test(); run_tests(&img); }
         "check"   => { check_clobbers(); }
-        other     => { eprintln!("unknown subcommand: {other}"); std::process::exit(1); }
+        other     => {
+            eprintln!("unknown subcommand: {other}");
+            eprintln!(
+                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, bench, test, check"
+            );
+            std::process::exit(1);
+        }
     }
 }
 
@@ -463,6 +470,57 @@ fn build_interactive() -> PathBuf {
 
     println!("interactive disk image: {}", uefi_path.display());
     uefi_path
+}
+
+/// Copy the built image to a clearly named artifact for writing to a USB stick,
+/// and print what to do with it.
+///
+/// The image `build` already produces is UEFI-bootable as it stands -- the
+/// bootloader crate writes a FAT32 filesystem with the kernel at
+/// `\EFI\BOOT\BOOTX64.EFI`, which is the removable-media path firmware looks for
+/// with no NVRAM boot entry involved. So this adds no new image format; it gives
+/// the artifact a name that says what it is for, and states the things that are
+/// easy to get wrong.
+///
+/// **This deliberately does not write to any device.** Writing a raw image to
+/// the wrong disk destroys it irrecoverably, and picking the right one needs a
+/// human looking at the machine. The command prints what to run and stops.
+///
+/// The SCRIPTED build is staged, not the `interactive` one, and on a machine
+/// without PS/2 that is not a preference. The interactive shell waits for real
+/// arrow keys; Plinth has no USB HID driver, so on a target whose only input is
+/// USB that key can never arrive and the shell waits forever. The scripted build
+/// drives itself from the kernel's synthetic injection and then exits, which on
+/// hardware means ACPI soft-off -- so the machine powering itself down is the
+/// signal that it reached the end.
+fn stage_usb_image(built: &Path) {
+    let out = built.with_file_name("plinth-usb.img");
+    std::fs::copy(built, &out).expect("failed to stage USB image");
+    let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+
+    println!();
+    println!("USB image: {}", out.display());
+    println!("  size: {} bytes ({:.1} MiB)", bytes, bytes as f64 / (1024.0 * 1024.0));
+    println!("  contents: FAT32, UEFI removable-media path \\EFI\\BOOT\\BOOTX64.EFI");
+    println!("  build: scripted (self-driving). The `interactive` build needs a");
+    println!("         keyboard Plinth can read, which means PS/2 -- there is no");
+    println!("         USB HID driver, so do not put that build on a stick unless");
+    println!("         the target has a PS/2 port.");
+    println!();
+    println!("To write it, identify the device FIRST and check it twice:");
+    println!("  Windows : use Rufus in DD mode, or `wmic diskdrive list brief`");
+    println!("            to find the disk number, then a raw writer of choice.");
+    println!("  Linux   : lsblk, then");
+    println!("            sudo dd if={} of=/dev/sdX bs=4M status=progress conv=fsync", out.display());
+    println!();
+    println!("  Writing to the wrong device destroys it. This command will not do");
+    println!("  it for you on purpose.");
+    println!();
+    println!("The target must boot UEFI (not CSM/legacy), and Secure Boot must be");
+    println!("off -- the kernel is unsigned.");
+    println!();
+    println!("Not yet booted on physical hardware. There is no claim here that it");
+    println!("works on any given machine; that is what the first run finds out.");
 }
 
 /// Build the kernel and produce a UEFI-bootable disk image.
