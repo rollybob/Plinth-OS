@@ -41,6 +41,27 @@ plinth: framebuffer present
 # lines (LAPIC base, I/O APIC base/GSI, source overrides) carry addresses that
 # can shift across QEMU versions, so they are skipped like the PCI BAR lines.
 # Counts are stable under the -smp 1 q35 smoke config: 1 CPU, 1 I/O APIC.
+# The S5 soft-off path, discovered while the ACPI tables are already open and
+# reported at boot rather than at shutdown -- a machine that cannot power itself
+# off is a fact the real-hardware port wants early, not at the moment it tries.
+#
+# Both values are asserted because both are load-bearing and neither is obvious.
+# pm1a 0x604 is the PM1a control port from the FADT; slp_typ 0 is the S5 sleep
+# type read out of the DSDT's _S5_ package, so poweroff is outw(0x604, 0x2000)
+# once SLP_EN (bit 13) is added. If either moves, the write goes somewhere else
+# or means something else, and that should fail loudly rather than be discovered
+# on hardware.
+#
+# Reading _S5_ means reading AML, which is the one place Plinth does so and a
+# deliberate bounded exception to the no-interpreter non-goal (real_hardware.md
+# D5): the FADT gives the port as static data, but the VALUE lives only in the
+# DSDT, so there is no AML-free route to S5 and the alternative is no poweroff
+# at all. Three opcodes, one named object, no evaluation.
+#
+# Under QEMU the isa-debug-exit device answers first, so the poweroff path
+# itself never runs here -- only its discovery is exercised. That is why this
+# line asserts what was FOUND rather than what happened.
+plinth: acpi: S5 poweroff available (pm1a 0x604, slp_typ 0)
 plinth: acpi: 1 cpu(s), 1 ioapic(s)
 
 plinth: timer armed

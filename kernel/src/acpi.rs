@@ -24,6 +24,24 @@
 
 use core::fmt::Write;
 
+use spin::Mutex;
+
+// The only AML opcodes this module knows, and the list is not meant to grow --
+// see `find_poweroff` for why three is the whole budget.
+/// `PackageOp`: introduces the `_S5_` package. Also the guard that a chance
+/// occurrence of the bytes `_S5_` is not mistaken for the real object.
+const AML_PACKAGE_OP: u8 = 0x12;
+/// `ZeroOp` -- the constant 0. QEMU's `_S5_` uses this for both sleep types.
+const AML_ZERO_OP: u8 = 0x00;
+/// `OneOp` -- the constant 1.
+const AML_ONE_OP: u8 = 0x01;
+/// `BytePrefix` -- a one-byte constant follows.
+const AML_BYTE_PREFIX: u8 = 0x0A;
+
+/// Bound on how much DSDT is scanned for `_S5_`. Real DSDTs are tens of KiB;
+/// this is a guard against a corrupt length, not a real limit.
+const MAX_DSDT_SCAN: usize = 1 << 20;
+
 /// A raw read pointer to physical address `phys`, via the bootloader's
 /// physical-memory window (`phys_offset + phys`).
 ///
@@ -142,11 +160,30 @@ pub fn init<W: Write>(out: &mut W, rsdp: Option<u64>, phys_offset: u64) -> Optio
         // Revision >= 2 means an ACPI 2.0+ RSDP carrying a 64-bit XSDT; older
         // RSDPs only have the 32-bit RSDT. QEMU q35 provides the XSDT.
         let revision = rd_u8(rsdp_p, 15);
-        let madt = if revision >= 2 {
-            find_madt(phys_offset, rd_u64(rsdp_p, 24), 8)
+        let (sdt, entry_size) = if revision >= 2 {
+            (rd_u64(rsdp_p, 24), 8)
         } else {
-            find_madt(phys_offset, rd_u32(rsdp_p, 16) as u64, 4)
+            (rd_u32(rsdp_p, 16) as u64, 4)
         };
+        let madt = find_madt(phys_offset, sdt, entry_size);
+
+        // Discover the S5 soft-off path while the tables are already in hand.
+        // Reported either way: a machine that cannot be powered off is a fact the
+        // real-hardware port needs to know at boot, not at shutdown.
+        let po = find_poweroff(phys_offset, sdt, entry_size);
+        match po {
+            Some(p) => {
+                let _ = writeln!(
+                    out,
+                    "plinth: acpi: S5 poweroff available (pm1a {:#x}, slp_typ {})",
+                    p.pm1a_cnt, p.slp_typ_a
+                );
+            }
+            None => {
+                let _ = writeln!(out, "plinth: acpi: no S5 poweroff path (will halt instead)");
+            }
+        }
+        *POWEROFF.lock() = po;
 
         match madt {
             Some(madt_phys) => Some(parse_madt(out, phys_offset, madt_phys)),
@@ -156,6 +193,171 @@ pub fn init<W: Write>(out: &mut W, rsdp: Option<u64>, phys_offset: u64) -> Optio
             }
         }
     }
+}
+
+/// What `poweroff` needs to turn the machine off: the PM1 control ports from the
+/// FADT, and the S5 sleep-type values from the DSDT.
+#[derive(Clone, Copy)]
+pub struct PowerOff {
+    pm1a_cnt: u16,
+    pm1b_cnt: u16,
+    slp_typ_a: u8,
+    slp_typ_b: u8,
+}
+
+/// Discovered once at `init`. `None` means this machine cannot be powered off by
+/// this path, and callers must fall back to halting.
+static POWEROFF: Mutex<Option<PowerOff>> = Mutex::new(None);
+
+/// Turn the machine off via ACPI soft-off (S5). Returns `false` if the tables did
+/// not yield what it needs, in which case nothing was written and the caller
+/// should halt.
+///
+/// The sequence is one 16-bit write per PM1 control block: the S5 sleep type in
+/// bits 10-12, and SLP_EN (bit 13) to commit it. On the QEMU q35 config that is
+/// `outw(0x604, 0x2000)`, SLP_TYPa being 0 there.
+///
+/// Under QEMU the isa-debug-exit device answers first and this is never reached;
+/// it exists for real hardware, which has no such device (`real_hardware.md` D5).
+pub fn poweroff() -> bool {
+    let Some(p) = *POWEROFF.lock() else {
+        return false;
+    };
+    use x86_64::instructions::port::Port;
+    // SAFETY: the PM1 control ports come from the firmware's own FADT, and the
+    // only value written is the sleep type the firmware's own _S5_ names, with
+    // SLP_EN. This does not return on a machine that honours it.
+    unsafe {
+        let mut a: Port<u16> = Port::new(p.pm1a_cnt);
+        a.write(((p.slp_typ_a as u16) << 10) | (1 << 13));
+        if p.pm1b_cnt != 0 {
+            let mut b: Port<u16> = Port::new(p.pm1b_cnt);
+            b.write(((p.slp_typ_b as u16) << 10) | (1 << 13));
+        }
+    }
+    true
+}
+
+/// Find the FADT, then the `_S5_` sleep-type values in the DSDT it points at.
+///
+/// **This is the one place Plinth reads AML, and it is a deliberate, bounded
+/// exception to the "no AML interpreter" non-goal -- flagged for ruling, not
+/// smuggled in.** It is worth stating exactly how far it goes, because the
+/// distinction is the whole justification:
+///
+/// ACPI splits soft-off across two tables. The FADT gives the PM1 control
+/// *ports*, as ordinary static data. The *value* to write -- SLP_TYPa -- lives
+/// only in the DSDT's `\_S5_` object, which is AML bytecode. That is true on
+/// hardware-reduced platforms too, so there is no AML-free route to S5; the
+/// alternative is not a cleaner implementation, it is no poweroff at all.
+///
+/// What this does: scan the DSDT for the four bytes `_S5_`, require the next byte
+/// to be `PackageOp`, then decode the first two package elements, which may only
+/// be `ZeroOp`, `OneOp`, or a one-byte constant. Three opcodes, one named object,
+/// no control flow, no name resolution, no evaluation. What it is not is an
+/// interpreter, and it must not be allowed to grow into one: if a future need
+/// wants a second object, that is the moment to reopen the non-goal rather than
+/// extend this.
+///
+/// The `PackageOp` check is not decoration -- it is what stops a chance
+/// occurrence of those four bytes elsewhere in the DSDT from being read as a
+/// sleep type.
+///
+/// # Safety
+/// `sdt_phys` must name a system description table in mapped physical memory.
+unsafe fn find_poweroff(phys_offset: u64, sdt_phys: u64, entry_size: usize) -> Option<PowerOff> {
+    let fadt = find_table(phys_offset, sdt_phys, entry_size, b"FACP")?;
+    let f = ptr_at(phys_offset, fadt);
+    let flen = rd_u32(f, 4) as usize;
+    if flen < 116 {
+        return None;
+    }
+    let pm1a_cnt = rd_u32(f, 64) as u16;
+    let pm1b_cnt = rd_u32(f, 68) as u16;
+    if pm1a_cnt == 0 {
+        return None;
+    }
+    // X_Dsdt (64-bit, offset 140) when the FADT is long enough and non-zero,
+    // else the 32-bit Dsdt at offset 40.
+    let dsdt = if flen >= 148 && rd_u64(f, 140) != 0 { rd_u64(f, 140) } else { rd_u32(f, 40) as u64 };
+    if dsdt == 0 {
+        return None;
+    }
+
+    let d = ptr_at(phys_offset, dsdt);
+    let dlen = (rd_u32(d, 4) as usize).min(MAX_DSDT_SCAN);
+    if dlen < 36 {
+        return None;
+    }
+    let mut i = 36;
+    while i + 8 < dlen {
+        if rd_u8(d, i) == b'_'
+            && rd_u8(d, i + 1) == b'S'
+            && rd_u8(d, i + 2) == b'5'
+            && rd_u8(d, i + 3) == b'_'
+            && rd_u8(d, i + 4) == AML_PACKAGE_OP
+        {
+            // PkgLength: the top two bits of the first byte say how many further
+            // bytes follow it. Only its size matters here -- the element count
+            // and the elements are what is wanted.
+            let lead = rd_u8(d, i + 5);
+            let pkg_len_bytes = 1 + (lead >> 6) as usize;
+            let elems_at = i + 5 + pkg_len_bytes + 1; // + NumElements byte
+            let a = read_aml_byte_const(d, elems_at, dlen)?;
+            let b = read_aml_byte_const(d, a.1, dlen).map(|x| x.0).unwrap_or(0);
+            return Some(PowerOff { pm1a_cnt, pm1b_cnt, slp_typ_a: a.0, slp_typ_b: b });
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Decode one `_S5_` package element at `off`, returning its value and the
+/// offset just past it. Only the three encodings a sleep type can legally use
+/// are accepted; anything else means this is not a package we understand, and
+/// refusing is better than guessing a value that gets written to a power
+/// register.
+unsafe fn read_aml_byte_const(d: *const u8, off: usize, len: usize) -> Option<(u8, usize)> {
+    if off >= len {
+        return None;
+    }
+    match rd_u8(d, off) {
+        AML_ZERO_OP => Some((0, off + 1)),
+        AML_ONE_OP => Some((1, off + 1)),
+        AML_BYTE_PREFIX if off + 1 < len => Some((rd_u8(d, off + 1), off + 2)),
+        _ => None,
+    }
+}
+
+/// Walk an RSDT (4-byte entries) or XSDT (8-byte entries) and return the
+/// physical address of the table with signature `sig`, if present. The entry
+/// count comes from the table's own length and is capped at `MAX_TABLES`.
+///
+/// # Safety
+/// `sdt_phys` must name a system description table in mapped physical memory.
+unsafe fn find_table(
+    phys_offset: u64,
+    sdt_phys: u64,
+    entry_size: usize,
+    sig: &[u8; 4],
+) -> Option<u64> {
+    let p = ptr_at(phys_offset, sdt_phys);
+    let length = rd_u32(p, 4) as usize;
+    if length < 36 {
+        return None;
+    }
+    let count = ((length - 36) / entry_size).min(MAX_TABLES);
+    for i in 0..count {
+        let off = 36 + i * entry_size;
+        let entry_phys =
+            if entry_size == 8 { rd_u64(p, off) } else { rd_u32(p, off) as u64 };
+        // SAFETY: entry_phys is a firmware-listed table pointer into mapped RAM;
+        // we read only its 4-byte signature.
+        if &sig4(ptr_at(phys_offset, entry_phys)) == sig {
+            return Some(entry_phys);
+        }
+    }
+    None
 }
 
 /// Walk an RSDT (4-byte entries) or XSDT (8-byte entries) and return the

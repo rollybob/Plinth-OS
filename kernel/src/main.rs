@@ -1492,7 +1492,18 @@ fn qemu_exit(code: ExitCode) -> ! {
     // device-less `run` path was misread on 2026-07-25. A fresh serial handle,
     // like the panic handler takes, since callers may hold one.
     let mut serial = serial::init();
-    let _ = writeln!(serial, "plinth: halted -- no exit device; close the QEMU window");
+
+    // Real hardware has no debug-exit device, so try ACPI soft-off before
+    // settling for a halt: a machine that powers itself down has demonstrably
+    // reached the end of boot, where a halted one is indistinguishable from a
+    // hang without someone reading the screen (real_hardware.md D5). Ordered
+    // after the port write so the QEMU exit code still reaches xtask unchanged.
+    let _ = writeln!(serial, "plinth: no exit device; attempting ACPI poweroff");
+    if acpi::poweroff() {
+        // A machine that honours S5 never gets here.
+        let _ = writeln!(serial, "plinth: ACPI poweroff did not take; halting");
+    }
+    let _ = writeln!(serial, "plinth: halted -- close the QEMU window");
     loop {
         x86_64::instructions::hlt();
     }
