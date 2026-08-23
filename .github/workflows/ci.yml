@@ -47,3 +47,6 @@ jobs:
 
       - name: Multi-core smoke test (in QEMU)
         run: cargo xtask smoke-smp
+
+      - name: No-i8042 boot test (in QEMU)
+        run: cargo xtask no-i8042

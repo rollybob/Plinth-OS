@@ -45,11 +45,12 @@ fn main() {
         "bench"   => { let img = build_bench(); bench(&img); }
         "test"    => { let img = build_test(); run_tests(&img); }
         "console" => { let img = build_force_console(); console_check(&img); }
+        "no-i8042" => { let img = build_all(); no_i8042_check(&img); }
         "check"   => { check_clobbers(); }
         other     => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, bench, test, console, check"
+                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, bench, test, console, no-i8042, check"
             );
             std::process::exit(1);
         }
@@ -563,7 +564,7 @@ fn build() -> PathBuf {
 /// kept rather than inlined because omitting the device is exactly how you get a
 /// window that survives boot, if inspecting a final frame is ever worth more than
 /// a clean exit (it was, briefly -- see `run`).
-fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool) -> Command {
+fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extra: &str) -> Command {
     let root = workspace_root();
 
     // OVMF provides separate code (read-only) and vars (read-write)
@@ -583,10 +584,14 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool) -> Command {
             .expect("failed to copy OVMF_VARS template to active location");
     }
 
+    // q35 plus any caller-supplied properties (e.g. ",i8042=off" to emulate a
+    // machine with no PS/2 controller). Built before the args array so it
+    // outlives the borrow.
+    let machine = format!("q35{machine_extra}");
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
         // q35: modern chipset, PCIe-native, publishes MCFG in ACPI.
-        "-machine", "q35",
+        "-machine", &machine,
         "-drive", &format!("if=pflash,format=raw,readonly=on,file={}", code.display()),
         "-drive", &format!("if=pflash,format=raw,file={}", vars.display()),
         "-drive", &format!("format=raw,file={}", uefi_path.display()),
@@ -709,7 +714,7 @@ fn wait_qemu(mut child: std::process::Child) -> i32 {
 ///
 /// No timeout: an interactive session lasts as long as you want it to.
 fn run(uefi_path: &Path, gdb: bool) {
-    let mut child = build_qemu_cmd(uefi_path, gdb, true)
+    let mut child = build_qemu_cmd(uefi_path, gdb, true, "")
         .spawn()
         .expect("failed to launch qemu-system-x86_64");
     eprintln!("QEMU open -- press Q in the shell to exit, or close the window.");
@@ -731,8 +736,14 @@ fn run(uefi_path: &Path, gdb: bool) {
 /// Boot with captured stdout and return the serial output. A reader thread
 /// drains the pipe so a full buffer never stalls QEMU.
 fn run_capture(uefi_path: &Path) -> String {
+    run_capture_machine(uefi_path, "")
+}
+
+/// `run_capture` with extra `-machine` properties -- e.g. ",i8042=off" to boot
+/// a machine with no PS/2 controller and exercise the absent-hardware paths.
+fn run_capture_machine(uefi_path: &Path, machine_extra: &str) -> String {
     use std::io::Read;
-    let mut cmd = build_qemu_cmd(uefi_path, false, true);
+    let mut cmd = build_qemu_cmd(uefi_path, false, true, machine_extra);
     // Headless: all output we care about arrives over serial. Without
     // this, QEMU tries to open its default (GTK) display and dies on
     // CI runners that have no display server at all.
@@ -1531,6 +1542,33 @@ fn build_test() -> PathBuf {
 fn run_tests(uefi_path: &Path) {
     let output = run_capture(uefi_path);
     parse_test_output(&output);
+}
+
+/// Boot with the i8042 removed (`-machine q35,i8042=off`) and assert the
+/// absent-hardware path (real_hardware.md D7): the kernel must detect the
+/// missing controller, report it, arm nothing, and still run the scripted tour
+/// to completion on synthetic input. QEMU always emulates a working i8042 under
+/// the normal machine, so this is the only lane that exercises the branch a
+/// serial-less, keyboard-less real machine takes.
+fn no_i8042_check(uefi_path: &Path) {
+    let output = run_capture_machine(uefi_path, ",i8042=off");
+    let reported_absent = output.contains("i8042 absent, input disabled");
+    let armed_keyboard = output.contains("keyboard ready");
+    let booted = output.contains("boot ok");
+    if reported_absent && booted && !armed_keyboard {
+        println!(
+            "no-i8042: ok (controller absence reported, IRQ1 not armed, boot ran to completion)"
+        );
+        return;
+    }
+    eprintln!("no-i8042: FAIL");
+    eprintln!("  \"i8042 absent, input disabled\" present: {reported_absent} (want true)");
+    eprintln!("  \"boot ok\" present:                      {booted} (want true)");
+    eprintln!("  \"keyboard ready\" present:               {armed_keyboard} (want false)");
+    eprintln!("--- captured output ---");
+    eprintln!("{output}");
+    eprintln!("--- end output ---");
+    std::process::exit(1);
 }
 
 /// Build the kernel with the framebuffer console forced on (D11 `force_console`
