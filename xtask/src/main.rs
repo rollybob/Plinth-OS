@@ -44,11 +44,12 @@ fn main() {
         "smoke-smp" => { let img = build_all(); smoke_smp(&img); }
         "bench"   => { let img = build_bench(); bench(&img); }
         "test"    => { let img = build_test(); run_tests(&img); }
+        "console" => { let img = build_force_console(); console_check(&img); }
         "check"   => { check_clobbers(); }
         other     => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, bench, test, check"
+                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, bench, test, console, check"
             );
             std::process::exit(1);
         }
@@ -1530,6 +1531,74 @@ fn build_test() -> PathBuf {
 fn run_tests(uefi_path: &Path) {
     let output = run_capture(uefi_path);
     parse_test_output(&output);
+}
+
+/// Build the kernel with the framebuffer console forced on (D11 `force_console`
+/// feature), so the no-serial rendering path runs under QEMU and reports a hash.
+fn build_force_console() -> PathBuf {
+    for name in USER_CRATES {
+        build_user_crate(name);
+    }
+    archive_image();
+
+    let root = workspace_root();
+    let kernel_dir = root.join("kernel");
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(&cargo)
+        .current_dir(&kernel_dir)
+        .args(["build", "--features", "force_console"])
+        .status()
+        .expect("failed to invoke cargo for force_console kernel build");
+    assert!(status.success(), "force_console kernel build failed");
+
+    let kernel_bin = root.join("target/x86_64-unknown-none/debug/kernel");
+    let out_dir = root.join("target/disk-images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let uefi_path = out_dir.join("uefi-console.img");
+    bootloader::UefiBoot::new(&kernel_bin)
+        .create_disk_image(&uefi_path)
+        .unwrap();
+
+    println!("console disk image: {}", uefi_path.display());
+    uefi_path
+}
+
+/// The frame hash the forced console produces for its fixed test string over
+/// the pinned QEMU/OVMF framebuffer. Deterministic for the same reason the gfx
+/// demo hashes are (fixed geometry + a fixed origin square); if QEMU or OVMF
+/// moves, re-derive it from the printed line, exactly as for the gfx hashes.
+const CONSOLE_EXPECT_HASH: &str = "console: framebuffer hash 0x3f7b275d1ca6a727";
+
+/// Boot the forced-console build and assert the framebuffer console rendered the
+/// expected frame. This is the D11 requirement that the no-serial path be
+/// exercised and *asserted*, not eyeballed.
+fn console_check(uefi_path: &Path) {
+    let output = run_capture(uefi_path);
+    let line = output
+        .lines()
+        .find(|l| l.contains("console: framebuffer hash "));
+    match line {
+        Some(l) => {
+            let l = l.trim();
+            println!("{l}");
+            if l != CONSOLE_EXPECT_HASH {
+                eprintln!("console: FAIL -- hash mismatch");
+                eprintln!("  expected: {CONSOLE_EXPECT_HASH}");
+                eprintln!("  actual:   {l}");
+                std::process::exit(1);
+            }
+            println!("console: ok (framebuffer diagnostic console rendered the expected frame)");
+        }
+        None => {
+            eprintln!("console: FAIL -- no framebuffer hash line in boot output");
+            eprintln!("--- captured output ---");
+            eprintln!("{output}");
+            eprintln!("--- end output ---");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Scan captured serial output for the harness tags and print a result

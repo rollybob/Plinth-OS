@@ -135,9 +135,11 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   user-chosen `va` (the exokernel placement contract, like `frame_map`) and
   writes the geometry to the `info_ptr` struct. `RIGHT_MAP` gates the map; a
   non-`Framebuffer` capability is refused on the kind check. The kernel
-  multiplexes the raw region and never touches a pixel -- fonts, layout, and
-  compositing are library-OS policy (`libgfx`), exactly as keymaps and on-disk
-  formats are. Purely additive: no existing call changed.
+  multiplexes the raw region and draws no pixel for a tenant -- fonts, layout,
+  and compositing are library-OS policy (`libgfx`), exactly as keymaps and
+  on-disk formats are. (The kernel's own diagnostic console draws only when there
+  is no serial port or on a panic; it is not an ABI surface and no tenant can
+  reach it -- D11.) Purely additive: no existing call changed.
 
 ### v2.11 (the dropped-event count becomes readable)
 

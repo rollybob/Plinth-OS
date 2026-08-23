@@ -42,7 +42,7 @@ use x86_64::VirtAddr;
 
 use crate::bkl;
 use crate::process::{self, FaultReg, USER_LAZY_BASE, USER_LAZY_END};
-use crate::serial;
+use crate::console;
 use crate::usermode;
 
 /// The faulting context, exactly as `page_fault_entry` lays it out. `gp`
@@ -261,7 +261,7 @@ extern "C" fn page_fault_dispatch(raw: *const RawTrap) -> ! {
         }
 
         // Unhandled user fault: log and terminate, identical to any fault.
-        let mut serial = serial::init();
+        let mut serial = console::writer();
         let _ = writeln!(
             serial,
             "plinth: [user fault] #PF page fault rip={:#x} err={:#x} addr={:#x}",
@@ -279,7 +279,7 @@ extern "C" fn page_fault_dispatch(raw: *const RawTrap) -> ! {
     // block above), precisely because a kernel #PF is taken with the BKL already
     // held; the console is lock-free, so the diagnostic goes out with no lock and
     // the machine goes down (K-028).
-    let mut serial = serial::init();
+    let mut serial = console::terminal_writer();
     let _ = writeln!(
         serial,
         "plinth: [KERNEL FAULT] #PF page fault rip={:#x} err={:#x} addr={:#x}",

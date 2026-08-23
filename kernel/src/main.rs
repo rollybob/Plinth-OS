@@ -19,6 +19,7 @@ mod acpi;
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod bkl;
 mod capability;
+mod console;
 // The ELF loader's parser is exercised by the test suite, but its mapping
 // helpers are only reached from the userspace boot path; silence their
 // dead-code noise in the test build.
@@ -28,6 +29,7 @@ mod elf;
 // the test build never reaches; silence its dead-code noise there.
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod fault;
+mod fbcon;
 mod frame_alloc;
 // The framebuffer bring-up (Stage 1 of the visual milestone)
 // draws + hashes the GOP framebuffer only on the userspace boot path; the test
@@ -129,7 +131,13 @@ const BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    let mut serial = serial::init();
+    // D11: choose the diagnostic backend before the first line goes out --
+    // serial when a UART is present, framebuffer otherwise. Under QEMU a UART
+    // always exists, so `serial` here is a serial-backed console and the
+    // transcript is byte-identical. The handle keeps the name `serial` because
+    // it threads through every subsystem's `<W: Write>` init below.
+    console::select();
+    let mut serial = console::writer();
     let _ = writeln!(serial, "plinth: kernel entry");
 
     let total = boot_info.memory_regions.len();
@@ -245,6 +253,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // scaffold -- Stage 2 hands the framebuffer to a graphics libOS as a
         // capability and the kernel stops drawing.
         framebuffer::init(&mut serial, boot_info.framebuffer.as_mut());
+
+        // Forced-console self-test (D11 `force_console` feature): with the
+        // framebuffer now attached, drive the diagnostic console's blitter over
+        // the real GOP framebuffer and report the hash of the drawn region. Runs
+        // only in the console-check build; serial stays the live channel, so
+        // this reports over serial and never alters the default transcript.
+        #[cfg(feature = "force_console")]
+        if let Some(h) = console::self_test_hash() {
+            let _ = writeln!(serial, "console: framebuffer hash {h:#018x}");
+        }
 
         // Discover the CPU + interrupt-controller topology from ACPI (broader
         // hardware, Stage A1): parse the MADT for the Local APIC base, the I/O
@@ -964,6 +982,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_rwfs} frames free after rwfs");
         }
 
+        // D11: from here the framebuffer becomes a tenant resource. The
+        // diagnostic console stops drawing to it (a one-way latch); only a crash
+        // may take the screen back after this point. On a serial machine this is
+        // a no-op -- the console was never drawing.
+        console::freeze_framebuffer();
+
         // Visual userspace (Stage 2): the framebuffer as a
         // capability. The kernel grants gfx-user a whole-screen Framebuffer
         // capability (at GRANT_SLOT) and nothing about pixels; the graphics
@@ -1491,7 +1515,7 @@ fn qemu_exit(code: ExitCode) -> ! {
     // unresponsive keyboard reads as a hang, which is exactly how the
     // device-less `run` path was misread on 2026-07-25. A fresh serial handle,
     // like the panic handler takes, since callers may hold one.
-    let mut serial = serial::init();
+    let mut serial = console::writer();
 
     // Real hardware has no debug-exit device, so try ACPI soft-off before
     // settling for a halt: a machine that powers itself down has demonstrably
@@ -1513,7 +1537,7 @@ fn qemu_exit(code: ExitCode) -> ! {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     // Take a fresh handle rather than sharing state with the boot path: the
     // panic may have fired at any point, including mid-write.
-    let mut serial = serial::init();
+    let mut serial = console::terminal_writer();
     let _ = writeln!(serial, "plinth: PANIC: {info}");
     qemu_exit(ExitCode::Failure)
 }

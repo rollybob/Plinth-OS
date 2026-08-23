@@ -73,6 +73,7 @@ use crate::memory;
 use crate::percpu;
 use crate::process::{self, FaultReg, USER_MAP_BASE, USER_MAP_END};
 use crate::scheduler;
+use crate::console;
 use crate::serial;
 use crate::usermode;
 
@@ -623,9 +624,9 @@ fn sys_cpu_charge(slot: u64, amount: u64) -> u64 {
     match result {
         Ok(remaining) => remaining,
         Err(CapError::Insufficient) => {
-            // serial::init() takes a fresh, lock-free handle (same as the
+            // console::writer() takes a fresh, lock-free handle (same as the
             // panic handler), so this holds nothing across kernel_resume.
-            let mut serial = serial::init();
+            let mut serial = console::writer();
             let _ = writeln!(serial, "plinth: [out of budget] terminating user process");
             // Reached from the syscall path: user code was on the CPU, no
             // locks held. exit_current never returns.

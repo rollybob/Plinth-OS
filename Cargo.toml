@@ -1,5 +1,10 @@
 [workspace]
 members = ["kernel", "xtask"]
+# libfont is a standalone crate with its own `[workspace]` (so the user-side
+# crates that also depend on it build independently). The kernel now depends on
+# it too for the diagnostic console's glyphs (D11); exclude it here so cargo
+# treats it as an external package rather than finding a second workspace root.
+exclude = ["libfont"]
 resolver = "2"
 
 # The kernel aborts on panic (no unwinding machinery), keeping panic paths

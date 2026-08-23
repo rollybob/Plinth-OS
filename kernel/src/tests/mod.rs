@@ -14,11 +14,13 @@ mod capability;
 mod elf;
 mod event_rings;
 mod fb_maps;
+mod fbcon;
 mod frame_alloc;
 mod input;
 mod ipc;
 mod mouse;
 mod scheduler;
+mod serial_probe;
 mod virtio_blk;
 
 use crate::frame_alloc::FrameAlloc;
@@ -182,6 +184,12 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "virtio_blk::inflight_complete_frees_and_refills", run: virtio_blk::inflight_complete_frees_and_refills },
     TestCase { name: "virtio_blk::inflight_complete_unissued_none", run: virtio_blk::inflight_complete_unissued_none },
     TestCase { name: "virtio_blk::inflight_complete_bad_head", run: virtio_blk::inflight_complete_bad_head },
+    TestCase { name: "fbcon::renders_known_string", run: fbcon::renders_known_string },
+    TestCase { name: "fbcon::blit_places_pixels", run: fbcon::blit_places_pixels },
+    TestCase { name: "fbcon::distinct_glyphs_distinct_hash", run: fbcon::distinct_glyphs_distinct_hash },
+    TestCase { name: "fbcon::wrap_and_scroll_stable", run: fbcon::wrap_and_scroll_stable },
+    TestCase { name: "serial::probe_detects_com1", run: serial_probe::probe_detects_com1 },
+    TestCase { name: "serial::probe_rejects_absent_port", run: serial_probe::probe_rejects_absent_port },
     TestCase { name: "scheduler::picks_next_ready", run: scheduler::picks_next_ready },
     TestCase { name: "scheduler::skips_empty", run: scheduler::skips_empty },
     TestCase { name: "scheduler::wraps_around", run: scheduler::wraps_around },

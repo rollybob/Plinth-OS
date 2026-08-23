@@ -12,6 +12,9 @@ bootloader_api = "0.11"
 uart_16550 = "0.3"
 x86_64 = "0.14"
 spin = "0.9"
+# Shared glyph table for the framebuffer diagnostic console (D11). Data only --
+# the same font libgfx renders, so a letter is defined once (real_hardware.md I7).
+libfont = { path = "../libfont" }
 
 [features]
 # Compile the in-kernel test suite; the kernel runs it and exits instead
@@ -21,6 +24,13 @@ tests = []
 # (bench-user) after the demos, then report. Driven by `cargo xtask bench`.
 # Off by default, so the production kernel is byte-identical.
 bench = []
+# Force the framebuffer diagnostic console to run under QEMU even though a UART
+# is present, then hash the drawn region -- the D11 ruling's forced-console mode,
+# so the no-serial path is exercised and asserted rather than eyeballed. Draws a
+# known string to the real GOP framebuffer and reports its hash over serial;
+# serial stays live so the harness protocol is unaffected. Driven by
+# `cargo xtask console`.
+force_console = []
 # Interactive build (`cargo xtask run`): skip arming the shell's scripted input
 # so it waits for REAL keyboard input -- you drive the home-screen cursor with
 # the arrow keys yourself. The default (smoke/test) build keeps the scripted

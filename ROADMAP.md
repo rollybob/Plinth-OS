@@ -125,10 +125,14 @@ against the cost to determinism rather than taken for granted.
   sector the deleted file held.
 - [x] **Visual userspace.** The UEFI GOP linear framebuffer the `bootloader`
   crate already maps -- no GPU driver -- multiplexed by a `Framebuffer`
-  capability and an `fb_map` syscall (ABI v2.7). The kernel only discovers the
-  framebuffer and hands it out; all drawing is library-OS policy in a clean-room
-  `libgfx` (a pixel writer, an 8x8 bitmap font + `draw_text`, a deterministic
-  frame hash), exactly as the kernel ships raw scancodes and owns no keymap. The
+  capability and an `fb_map` syscall (ABI v2.7). The kernel discovers the
+  framebuffer and hands it out, and all tenant drawing is library-OS policy in a
+  clean-room `libgfx` (a pixel writer, an 8x8 bitmap font + `draw_text`, a
+  deterministic frame hash), exactly as the kernel ships raw scancodes and owns
+  no keymap. The one exception is a diagnostic console the kernel renders itself,
+  only on a machine with no serial port (or on a panic), where it would otherwise
+  be mute and no library OS yet exists to speak for it -- diagnostics only, no
+  tenant, no syscall (D11). The
   pixel boundary stays testable by hashing a fixed sub-rectangle to serial (the
   smoke pins `-vga std` headless). The multiplexing payoff: the screen splits
   into disjoint horizontal **bands**, one granted to each of two concurrent

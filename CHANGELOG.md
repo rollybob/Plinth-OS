@@ -29,6 +29,18 @@ here on 2026-08-13.
 ## [Unreleased]
 
 ### Added
+- **Diagnostic console on serial-less machines (D11).** The kernel gains a
+  framebuffer text console, used when boot finds no 16550 (most machines built in
+  the last decade) or to report a panic -- until now such a machine booted mute,
+  a success indistinguishable from a hang. This is the first time the kernel
+  draws: *"the kernel never touches a pixel"* recorded earlier now carries one
+  narrow exception. It stays diagnostics-only -- no tenant, no syscall, no drawing
+  ABI; a tenant that wants text still uses `libgfx` -- and it never draws over a
+  live framebuffer grant except to report a crash. Glyphs come from a shared
+  `libfont` crate so the font is defined once. A UART probe (16550 scratch
+  register) makes "no serial" a fact rather than an assumption, and forced-console
+  mode (`cargo xtask console`) renders the console under QEMU and asserts a frame
+  hash.
 - **Reclamation covers block ranges and event sources, not just the screen
   (slice 4).** Until now only a lent `Framebuffer` came home when
   its borrower died; a lent `BlockRange` or `EventSource` was dropped with the

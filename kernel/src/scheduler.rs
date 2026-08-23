@@ -52,7 +52,7 @@ use crate::ipc;
 use crate::memory;
 use crate::percpu;
 use crate::process::{self, Process, MAX_BOOT_FRAMES, USER_STACK_TOP};
-use crate::serial;
+use crate::console;
 use crate::timer;
 
 /// Maximum number of processes the scheduler can hold at once. Bounded so the
@@ -762,7 +762,7 @@ pub fn run(label: &str, binaries: &[&[u8]], phys_offset: u64, extra: &[Option<Ca
             return;
         }
     }
-    let mut serial = serial::init();
+    let mut serial = console::writer();
     let count = binaries.len().min(MAX_PROCESSES);
     let _ = writeln!(serial, "plinth: {label}: {count} processes");
 

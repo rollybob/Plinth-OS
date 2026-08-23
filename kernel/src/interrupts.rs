@@ -25,7 +25,7 @@ use crate::bkl;
 use crate::fault;
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 use crate::process;
-use crate::serial;
+use crate::console;
 use crate::usermode;
 
 static mut IDT_STORAGE: Option<InterruptDescriptorTable> = None;
@@ -111,7 +111,7 @@ fn handle_fault(name: &str, frame: &InterruptStackFrame, err: Option<u64>, addr:
     // scheduler via exit_current -- and that arm is exactly where the lock is
     // provably free (CPL 3 means it was released before the return to ring 3).
     // double_fault_handler takes the same lock-free path for the same reason.
-    let mut serial = serial::init();
+    let mut serial = console::writer();
     let _ = write!(
         serial,
         "plinth: [{}] {} rip={:#x}",
@@ -157,7 +157,7 @@ extern "x86-interrupt" fn general_protection_handler(frame: InterruptStackFrame,
 }
 
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _err: u64) -> ! {
-    let mut serial = serial::init();
+    let mut serial = console::terminal_writer();
     let _ = writeln!(
         serial,
         "plinth: [KERNEL FAULT] #DF double fault rip={:#x}",

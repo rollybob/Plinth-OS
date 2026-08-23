@@ -13,18 +13,18 @@
 use bootloader_api::info::{FrameBuffer, PixelFormat};
 use core::fmt::Write;
 use spin::Mutex;
-use uart_16550::SerialPort;
 
 use crate::capability::CapObject;
+use crate::console;
 use crate::memory;
 
 /// Pixel-format codes shared with userspace (mirrored in libplinth as
 /// FB_FMT_*). The kernel ships the raw format; the graphics libOS does the
 /// channel-order arithmetic, exactly as it decodes raw scancodes.
-const FMT_RGB: u8 = 0;
-const FMT_BGR: u8 = 1;
-const FMT_U8: u8 = 2;
-const FMT_OTHER: u8 = 3;
+pub(crate) const FMT_RGB: u8 = 0;
+pub(crate) const FMT_BGR: u8 = 1;
+pub(crate) const FMT_U8: u8 = 2;
+pub(crate) const FMT_OTHER: u8 = 3;
 
 /// The discovered framebuffer: physical base plus the geometry a holder needs to
 /// draw. Captured once at boot; `None` if the bootloader gave us no framebuffer.
@@ -43,7 +43,7 @@ static REGION: Mutex<Option<FbRegion>> = Mutex::new(None);
 
 /// Discover the framebuffer: capture its physical base + geometry and report it.
 /// Draws nothing -- the graphics libOS owns pixels.
-pub fn init(serial: &mut SerialPort, fb: Option<&mut FrameBuffer>) {
+pub fn init<W: Write>(serial: &mut W, fb: Option<&mut FrameBuffer>) {
     let Some(fb) = fb else {
         // No display adapter / GOP. The smoke asserts "framebuffer present", so
         // this turns a missing framebuffer into a visible failure rather than a
@@ -72,6 +72,20 @@ pub fn init(serial: &mut SerialPort, fb: Option<&mut FrameBuffer>) {
         format: fmt_code(info.pixel_format),
     };
     *REGION.lock() = Some(region);
+
+    // Hand the console the kernel-mapped framebuffer so it can draw diagnostics
+    // on a machine with no serial port (D11). `va` is the kernel-virtual base
+    // the bootloader mapped -- the writable side, as opposed to the physical
+    // base a tenant grant carries. On a serial machine the console records this
+    // and never draws, leaving the screen untouched for tenants.
+    console::attach_framebuffer(crate::fbcon::Surface {
+        base: va as *mut u8,
+        width: region.width,
+        height: region.height,
+        stride: region.stride,
+        bytes_per_pixel: region.bytes_per_pixel,
+        format: region.format,
+    });
 
     let _ = writeln!(serial, "plinth: framebuffer present");
     // Geometry detail, deliberately NOT asserted by the smoke: the resolution
