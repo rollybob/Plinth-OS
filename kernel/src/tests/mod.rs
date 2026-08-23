@@ -227,6 +227,10 @@ const TESTS: &[TestCase] = &[
         name: "scheduler::per_core_state_restored",
         run: scheduler::per_core_state_restored,
     },
+    TestCase {
+        name: "scheduler::work_steal_skips_donor_current",
+        run: scheduler::work_steal_skips_donor_current,
+    },
 ];
 
 /// Run every registered test. Returns true if all passed.

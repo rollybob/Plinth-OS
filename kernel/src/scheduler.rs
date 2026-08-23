@@ -1613,6 +1613,58 @@ pub fn swap_current_slot(core: usize, slot: usize) -> usize {
     }
 }
 
+// ---- K-007: staging a work-stealing interleaving ------------------------
+//
+// The primitives an interleaving test needs to reconstruct the *exact shared
+// state* a dangerous ordering produces, then run the contending operation
+// against it. A single-threaded harness cannot run two cores at once, so it
+// stages the configuration the race would reach -- a donor core blocked on a
+// momentarily-Ready slot still in its own queue -- and drives `try_steal`, the
+// mutation that would corrupt it. See `tests::scheduler::work_steal_*`.
+
+/// Force a TABLE slot's scheduler state and return the previous one, so a test
+/// can present a slot as Ready (the wake window Bug C turns on) and restore it.
+#[cfg(feature = "tests")]
+pub fn test_set_slot_state(slot: usize, state: State) -> State {
+    // SAFETY: test harness, single core running, IF=0.
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        core::mem::replace(&mut table[slot].state, state)
+    }
+}
+
+/// Seed a core's ready queue with a TABLE slot (as `setup_process` would).
+#[cfg(feature = "tests")]
+pub fn test_push_core_queue(core: usize, table_slot: usize) {
+    push_to_core_queue(core as u32, table_slot);
+}
+
+/// Number of occupied positions in a core's queue -- for a test to assert the
+/// queue is empty before staging (so its teardown cannot wipe real entries).
+#[cfg(feature = "tests")]
+pub fn test_core_queue_len(core: usize) -> usize {
+    // SAFETY: test harness, single core running, IF=0.
+    unsafe { (*addr_of!(CORE_QUEUE))[core].iter().filter(|s| s.is_some()).count() }
+}
+
+/// Empty a core's queue -- teardown for a staged interleaving. Safe only once
+/// the test has confirmed the queue started empty (the scheduler is not live in
+/// the harness, so every core's queue is empty until a test stages it).
+#[cfg(feature = "tests")]
+pub fn test_clear_core_queue(core: usize) {
+    // SAFETY: test harness, single core running, IF=0.
+    unsafe {
+        (*addr_of_mut!(CORE_QUEUE))[core] = [None; MAX_PROCESSES];
+    }
+}
+
+/// Run the real `try_steal` from `me`'s perspective. This is the contending
+/// mutation whose Bug C guard the interleaving test exercises.
+#[cfg(feature = "tests")]
+pub fn test_try_steal(me: usize) -> Option<usize> {
+    try_steal(me as u32)
+}
+
 /// The lender's capability table, wherever the lender currently lives: suspended
 /// in its `TABLE` slot, or running on some core and therefore parked in
 /// `process::CURRENT`. `None` if no live process occupies that slot.

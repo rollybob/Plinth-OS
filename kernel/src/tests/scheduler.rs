@@ -275,3 +275,95 @@ pub fn reclaim_landing_first_write_wins(_ctx: &mut TestCtx) -> Result<(), &'stat
     let _ = scheduler::take_reclaim_landing(SCRATCH);
     Ok(())
 }
+
+// ---- K-007: the work-stealing interleaving, staged deterministically ----
+//
+// `smoke-smp` boots real cores but cannot force the window Bug C lives in, and
+// the other "SMP" tests above stage per-core state then run a read-only sweep.
+// This stages the exact contended configuration the Bug C interleaving reaches
+// -- a donor core blocked on a momentarily-Ready slot still in its own queue --
+// and runs the *mutation* that would corrupt it, `try_steal`. A single-threaded
+// harness cannot run two cores at once, so this is not two threads racing; it
+// is the closest deterministic reproduction, and unlike a snapshot it exercises
+// the operation that does the damage. The `StagedSteal` guard is the reusable
+// core: the next interleaving test stages its scenario the same way.
+
+/// The two scratch cores. Both are past any core the (not-yet-live) scheduler
+/// runs on in the harness, so their queues start empty.
+const DONOR_CORE: usize = PARKED_CORE; // blocks a process; keeps it as CURRENT_SLOT
+const THIEF_CORE: usize = PARKED_CORE + 1; // runs try_steal
+
+/// A slot the donor is blocked on: in the donor's queue, named by its
+/// CURRENT_SLOT, and momentarily Ready (the `wake_with` window). Bug C is
+/// `try_steal` grabbing exactly this.
+const BLOCKED_SLOT: usize = MAX_PROCESSES - 1;
+/// A slot that is fair game: Ready in the donor's queue but not its current.
+const STEALABLE_SLOT: usize = MAX_PROCESSES - 2;
+
+/// Restores the staged interleaving on drop -- including when an assertion
+/// returns early. Wiping both queues (empty before staging) undoes whatever
+/// `try_steal` moved, in either the guard-holds or guard-broken outcome.
+struct StagedSteal {
+    donor: usize,
+    thief: usize,
+    prev_current_slot: usize,
+    slots: [(usize, State); 2],
+}
+
+impl Drop for StagedSteal {
+    fn drop(&mut self) {
+        scheduler::test_clear_core_queue(self.donor);
+        scheduler::test_clear_core_queue(self.thief);
+        scheduler::swap_current_slot(self.donor, self.prev_current_slot);
+        for (slot, was) in self.slots {
+            scheduler::test_set_slot_state(slot, was);
+        }
+    }
+}
+
+pub fn work_steal_skips_donor_current(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    // Precondition: both scratch queues empty, so teardown wipes only our staging.
+    test_assert!(
+        scheduler::test_core_queue_len(DONOR_CORE) == 0
+            && scheduler::test_core_queue_len(THIEF_CORE) == 0,
+        "precondition: the scratch cores' queues must be empty before staging"
+    );
+
+    // Stage the contended state the interleaving produces: the donor is blocked
+    // on BLOCKED_SLOT (its CURRENT_SLOT, still in its queue) and that slot is
+    // momentarily Ready; STEALABLE_SLOT is Ready and genuinely up for grabs.
+    let prev_slot = scheduler::swap_current_slot(DONOR_CORE, BLOCKED_SLOT);
+    let prev_blocked = scheduler::test_set_slot_state(BLOCKED_SLOT, State::Ready);
+    let prev_stealable = scheduler::test_set_slot_state(STEALABLE_SLOT, State::Ready);
+    scheduler::test_push_core_queue(DONOR_CORE, BLOCKED_SLOT);
+    scheduler::test_push_core_queue(DONOR_CORE, STEALABLE_SLOT);
+    let _staged = StagedSteal {
+        donor: DONOR_CORE,
+        thief: THIEF_CORE,
+        prev_current_slot: prev_slot,
+        slots: [(BLOCKED_SLOT, prev_blocked), (STEALABLE_SLOT, prev_stealable)],
+    };
+
+    // The contending mutation, from the thief's perspective.
+    let before = scheduler::steals();
+    let stolen = scheduler::test_try_steal(THIEF_CORE);
+    let after = scheduler::steals();
+
+    // The guard must skip the donor's current...
+    test_assert!(
+        stolen != Some(BLOCKED_SLOT),
+        "try_steal took the donor's CURRENT_SLOT -- the Bug C guard is gone; the \
+         donor's current now dangles outside its own queue and smoke-smp hangs"
+    );
+    // ...and take the slot that is genuinely stealable, not over-block.
+    test_assert!(
+        stolen == Some(STEALABLE_SLOT),
+        "try_steal skipped the legitimately stealable slot -- the guard over-blocks \
+         and the imbalance the S4 demo creates would never resolve"
+    );
+    test_assert!(
+        after == before + 1,
+        "a successful steal must increment STEAL_COUNT"
+    );
+    Ok(())
+}
