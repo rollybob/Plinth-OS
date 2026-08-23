@@ -388,6 +388,82 @@ fn report<W: Write>(out: &mut W, info: &VirtioBlkInfo) {
     }
 }
 
+/// PCI class code for a mass-storage controller (config register 0x08, high byte).
+const CLASS_MASS_STORAGE: u8 = 0x01;
+
+/// Human name for a mass-storage subclass, for the "unsupported" report. `prog_if`
+/// distinguishes an AHCI SATA controller (1) from a plain SATA one. Not
+/// exhaustive -- enough to name what a real machine's disk controller is.
+pub(crate) fn mass_storage_name(subclass: u8, prog_if: u8) -> &'static str {
+    match subclass {
+        0x00 => "SCSI",
+        0x01 => "IDE",
+        0x05 => "ATA",
+        0x06 => {
+            if prog_if == 0x01 {
+                "SATA (AHCI)"
+            } else {
+                "SATA"
+            }
+        }
+        0x08 => "NVMe",
+        _ => "mass storage",
+    }
+}
+
+/// Report one function if it is a mass-storage controller Plinth does not drive.
+/// virtio-blk is excluded -- it is driven, and `init` reports it separately.
+fn report_storage_func<W: Write>(out: &mut W, bus: u8, slot: u8, func: u8) {
+    let vendor = read16(bus, slot, func, 0x00);
+    if vendor == 0xFFFF || vendor == VIRTIO_VENDOR {
+        return;
+    }
+    let class = read32(bus, slot, func, 0x08);
+    if (class >> 24) as u8 != CLASS_MASS_STORAGE {
+        return;
+    }
+    let subclass = (class >> 16) as u8;
+    let prog_if = (class >> 8) as u8;
+    let _ = writeln!(
+        out,
+        "plinth: storage controller {} at {:02x}:{:02x}.{} vendor {:04x}, unsupported (no driver)",
+        mass_storage_name(subclass, prog_if),
+        bus,
+        slot,
+        func,
+        vendor
+    );
+}
+
+/// Report every mass-storage controller Plinth cannot drive. A real machine's
+/// disk is AHCI or NVMe, and Plinth drives neither -- only virtio-blk -- so
+/// without this a physical boot enumerates nothing it recognises and says only
+/// "virtio-blk not found", which reads like a failure. Naming the controller it
+/// found but cannot use is what makes PCI enumeration a *successful* boot step on
+/// real hardware (real_hardware.md S6/F4) rather than a silent dead end. Pure
+/// config-space reads.
+fn report_unsupported_storage<W: Write>(out: &mut W) {
+    for bus in 0u16..256 {
+        let bus = bus as u8;
+        for slot in 0u8..32 {
+            if read16(bus, slot, 0, 0x00) == 0xFFFF {
+                continue; // no function 0 -> the slot is empty
+            }
+            report_storage_func(out, bus, slot, 0);
+            // A multi-function device advertises it in bit 7 of the header type.
+            // The q35 SATA/AHCI controller sits at function 2 of device 0x1f, so
+            // a function-0-only scan would miss exactly the device that matters.
+            if read8(bus, slot, 0, 0x0E) & 0x80 != 0 {
+                for func in 1u8..8 {
+                    if read16(bus, slot, func, 0x00) != 0xFFFF {
+                        report_storage_func(out, bus, slot, func);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Storage discovery entry point: find every virtio-blk device and report what
 /// was found. Returns the dense device map and the count. Pure config-space
 /// reads; call once at boot. Each device's index in the returned array is the
@@ -395,6 +471,10 @@ fn report<W: Write>(out: &mut W, info: &VirtioBlkInfo) {
 /// capabilities against it.
 pub fn init<W: Write>(out: &mut W) -> ([Option<VirtioBlkInfo>; MAX_DEVICES], usize) {
     let _ = writeln!(out, "plinth: scanning PCI bus");
+    // Name any disk controller Plinth cannot drive before reporting the one it
+    // can, so a real-hardware boot (AHCI/NVMe, no virtio) still enumerates its
+    // storage rather than falling straight through to "virtio-blk not found".
+    report_unsupported_storage(out);
     let (infos, n) = discover_all();
     if n == 0 {
         let _ = writeln!(out, "plinth: virtio-blk not found");

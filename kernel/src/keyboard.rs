@@ -37,6 +37,8 @@ const CMD_WRITE_CONFIG: u8 = 0x60;
 const CMD_DISABLE_PORT2: u8 = 0xA7;
 const CMD_DISABLE_PORT1: u8 = 0xAD;
 const CMD_ENABLE_PORT1: u8 = 0xAE;
+const CMD_SELF_TEST: u8 = 0xAA; // controller self-test; a present i8042 answers 0x55
+const SELF_TEST_PASS: u8 = 0x55;
 
 // Config-byte bits.
 const CFG_PORT1_IRQ: u8 = 1 << 0; // generate IRQ1 on port-1 data
@@ -57,7 +59,11 @@ pub fn register(idt: &mut InterruptDescriptorTable) {
 /// after `irq::init`. Does a minimal-but-honest init rather than trusting
 /// firmware: disable the ports, flush stale data, set the config byte to enable
 /// the port-1 clock + IRQ1 + Set-1 translation, then enable the port.
-pub fn init() {
+/// Bring up the i8042 keyboard, returning whether a controller actually
+/// answered. On a machine with no i8042 -- most built in the last decade, and
+/// the D1 reference box -- it reports `false` and arms nothing, rather than
+/// unmasking IRQ1 for a device that will never fire (real_hardware.md D7).
+pub fn init() -> bool {
     // SAFETY: the fixed i8042 ports, programmed once at boot with IF off. Each
     // command/data write waits for the input buffer to drain first; reads wait
     // for the output buffer to fill, both bounded.
@@ -65,6 +71,16 @@ pub fn init() {
         write_command(CMD_DISABLE_PORT1);
         write_command(CMD_DISABLE_PORT2); // harmless if there is no second port
         flush_output();
+
+        // Probe before trusting the controller: a present i8042 answers the
+        // self-test with 0x55; an absent one returns open-bus garbage (or the
+        // bounded read times out). Detect and skip -- synthetic input injection
+        // is independent of this, so the scripted tour still runs with no
+        // keyboard hardware.
+        write_command(CMD_SELF_TEST);
+        if read_data_blocking() != SELF_TEST_PASS {
+            return false;
+        }
 
         write_command(CMD_READ_CONFIG);
         let mut cfg = read_data_blocking();
@@ -76,6 +92,7 @@ pub fn init() {
         write_command(CMD_ENABLE_PORT1);
     }
     irq::unmask(1); // IRQ1 (the keyboard line)
+    true
 }
 
 /// IRQ1 handler: read the scancode and record it. An interrupt gate clears IF,

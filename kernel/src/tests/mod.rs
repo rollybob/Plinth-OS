@@ -19,6 +19,7 @@ mod frame_alloc;
 mod input;
 mod ipc;
 mod mouse;
+mod pci;
 mod scheduler;
 mod serial_probe;
 mod virtio_blk;
@@ -188,6 +189,8 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "fbcon::blit_places_pixels", run: fbcon::blit_places_pixels },
     TestCase { name: "fbcon::distinct_glyphs_distinct_hash", run: fbcon::distinct_glyphs_distinct_hash },
     TestCase { name: "fbcon::wrap_and_scroll_stable", run: fbcon::wrap_and_scroll_stable },
+    TestCase { name: "pci::classifies_storage_subclasses", run: pci::classifies_storage_subclasses },
+    TestCase { name: "pci::ahci_prog_if_distinguished", run: pci::ahci_prog_if_distinguished },
     TestCase { name: "serial::probe_detects_com1", run: serial_probe::probe_detects_com1 },
     TestCase { name: "serial::probe_rejects_absent_port", run: serial_probe::probe_rejects_absent_port },
     TestCase { name: "scheduler::picks_next_ready", run: scheduler::picks_next_ready },

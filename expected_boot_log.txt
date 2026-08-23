@@ -98,6 +98,11 @@ plinth: mouse ready (i8042 port 2, IRQ12)
 # tracks the size of the user ELFs packed into it, so the tail of that line
 # moves whenever diskhello or hello does. Device 0's capacity is a fixed 2048.
 plinth: scanning PCI bus
+# S6/F4 (real_hardware.md): name any disk controller Plinth cannot drive before
+# the virtio-blk it can, so a physical AHCI/NVMe machine enumerates its storage
+# instead of falling through to "not found". Under q35 the built-in ICH9 SATA
+# controller sits at the chipset-fixed 00:1f.2, so the line is deterministic.
+plinth: storage controller SATA (AHCI) at 00:1f.2 vendor 8086, unsupported (no driver)
 plinth: virtio-blk found at 00:03.0
 plinth: virtio-blk found at 00:04.0
 plinth: virtio-blk[0] ready (queue 0, size 64, capacity 2048 sectors)

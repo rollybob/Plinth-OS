@@ -300,8 +300,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // below prove that producer -> subscription -> reader path end to end.
         // Input is raw scancodes -- the keymap is libOS policy, so nothing here
         // turns a scancode into a character.
-        keyboard::init();
-        let _ = writeln!(serial, "plinth: keyboard ready (i8042, IRQ1)");
+        if keyboard::init() {
+            let _ = writeln!(serial, "plinth: keyboard ready (i8042, IRQ1)");
+        } else {
+            let _ = writeln!(serial, "plinth: i8042 absent, input disabled");
+        }
 
         // Bring up the i8042's second port (the mouse, source 1) and unmask
         // IRQ12, if a device answers. A
