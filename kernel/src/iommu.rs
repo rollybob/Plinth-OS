@@ -363,3 +363,118 @@ fn free_subtree(frames: &mut FrameAlloc, table_phys: u64, level: u8) {
     }
     let _ = frames.dealloc(table_phys);
 }
+
+// ---------------------------------------------------------------------------
+// TranslationTables: the per-unit root/context tables -- slice 3a.
+//
+// VT-d resolves a device to its second-level page table through two more tables,
+// indexed by the device's PCI source-id (bus:dev.func):
+//
+//   root[bus] --present--> context table
+//   context[(dev<<3)|func] --present--> SL page table (a `Domain`), + AW + DID
+//
+// Each table is one 4-KiB frame of 256 128-bit entries (two u64 per entry). This
+// builds and unit-tests those two tables as a pure structure -- the fiddly VT-d
+// entry bit-packing, isolated and checked before any register is touched. The
+// register block that points the unit's RTADDR at `root_phys()` and flips
+// translation on is slice 3b, so this is test-only in the shipping build. Single
+// bus (bus 0) for now, which is all QEMU's q35 root complex needs; a second bus
+// is another context frame hung off another root entry.
+// ---------------------------------------------------------------------------
+
+/// Root/context entry present bit (bit 0 of the low u64).
+const VT_PRESENT: u64 = 1 << 0;
+/// Context-entry translation type: legacy / second-level (TT = 00, bits 3:2).
+/// Named to document the choice even though the value is zero.
+const CTX_TT_SECOND_LEVEL: u64 = 0b00 << 2;
+
+/// The per-unit root table plus one bus's context table. Owns exactly those two
+/// frames; `teardown` frees them (never a `Domain`'s page-table frames -- those
+/// belong to the domain).
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+pub struct TranslationTables {
+    /// Physical address of the root table (the value RTADDR takes in slice 3b).
+    root_phys: u64,
+    /// Physical address of the bus-0 context table (root[0] points here).
+    ctx_phys: u64,
+}
+
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+impl TranslationTables {
+    /// Allocate a zeroed root table and one context table (bus 0), and link
+    /// root[0] -> the context table. No device is present until `set_device`.
+    pub fn new(frames: &mut FrameAlloc) -> Result<TranslationTables, DomainError> {
+        let root_phys = alloc_table(frames)?;
+        let ctx_phys = match alloc_table(frames) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = frames.dealloc(root_phys);
+                return Err(e);
+            }
+        };
+        // root[0].low = present | context-table pointer; high stays 0.
+        // SAFETY: root_phys is our freshly allocated, zeroed table frame.
+        unsafe {
+            let root = &mut *table_at(root_phys);
+            root[0] = (ctx_phys & SL_ADDR_MASK) | VT_PRESENT;
+        }
+        Ok(TranslationTables { root_phys, ctx_phys })
+    }
+
+    /// Point the device `dev:func` (on bus 0) at the second-level page table
+    /// rooted at `slptptr`, with a page-table depth of `levels` (3/4/5) and
+    /// domain id `did`. Overwrites any prior entry for that source-id.
+    ///
+    /// The context entry's Address Width field encodes the AGAW as `levels - 2`
+    /// (3-level=1/39-bit, 4-level=2/48-bit, 5-level=3/57-bit).
+    pub fn set_device(&mut self, dev: u8, func: u8, slptptr: u64, levels: u8, did: u16) {
+        // PCI device is 5 bits, function 3 bits -> an 8-bit source-id, so the
+        // entry index is always < 256. Masking keeps a stray high bit from
+        // running the write off the end of the context frame.
+        let devfn = ((dev as usize & 0x1f) << 3) | (func as usize & 0x7);
+        let aw = (levels as u64).saturating_sub(2) & 0x7;
+        // SAFETY: ctx_phys is our zeroed context table frame; devfn < 256 so the
+        // two-u64 entry at [2*devfn, 2*devfn+1] is in the 512-u64 frame.
+        unsafe {
+            let ctx = &mut *table_at(self.ctx_phys);
+            ctx[2 * devfn] = (slptptr & SL_ADDR_MASK) | CTX_TT_SECOND_LEVEL | VT_PRESENT;
+            ctx[2 * devfn + 1] = aw | ((did as u64) << 8);
+        }
+    }
+
+    /// The root-table physical address, for slice 3b to program into RTADDR.
+    pub fn root_phys(&self) -> u64 {
+        self.root_phys
+    }
+
+    /// The raw (low, high) u64 pair of the root entry for `bus`. Test-only
+    /// introspection: the tables are consumed by hardware, so reading back the
+    /// encoded bits is the only way to check the packing before slice 3b.
+    #[cfg(feature = "tests")]
+    pub fn root_entry(&self, bus: u8) -> (u64, u64) {
+        // SAFETY: root_phys is our table frame; bus < 256 so the entry is in it.
+        let root = unsafe { &*table_at(self.root_phys) };
+        (root[2 * bus as usize], root[2 * bus as usize + 1])
+    }
+
+    /// The raw (low, high) u64 pair of the context entry for `dev:func` on bus 0.
+    #[cfg(feature = "tests")]
+    pub fn context_entry(&self, dev: u8, func: u8) -> (u64, u64) {
+        let devfn = ((dev as usize & 0x1f) << 3) | (func as usize & 0x7);
+        // SAFETY: ctx_phys is our table frame; devfn < 256 so the entry is in it.
+        let ctx = unsafe { &*table_at(self.ctx_phys) };
+        (ctx[2 * devfn], ctx[2 * devfn + 1])
+    }
+
+    /// Free the root and context table frames.
+    pub fn teardown(&mut self, frames: &mut FrameAlloc) {
+        if self.ctx_phys != 0 {
+            let _ = frames.dealloc(self.ctx_phys);
+            self.ctx_phys = 0;
+        }
+        if self.root_phys != 0 {
+            let _ = frames.dealloc(self.root_phys);
+            self.root_phys = 0;
+        }
+    }
+}

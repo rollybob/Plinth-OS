@@ -13,7 +13,7 @@
 //! that teardown returns every table frame and not one data frame.
 
 use super::TestCtx;
-use crate::iommu::{Domain, DomainError, IOMMU_READ, IOMMU_WRITE};
+use crate::iommu::{Domain, DomainError, TranslationTables, IOMMU_READ, IOMMU_WRITE};
 use crate::test_assert;
 
 /// QEMU's remapping unit is 48-bit -> a 4-level table. The tests use that width.
@@ -127,5 +127,65 @@ pub fn rejects_unsupported_width(ctx: &mut TestCtx) -> Result<(), &'static str> 
     // 48-bit (the real unit) is accepted; clean up so the check leaves no frame held.
     let mut d = Domain::new(ctx.frames, AW).map_err(|_| "48-bit width should be accepted")?;
     d.teardown(ctx.frames);
+    Ok(())
+}
+
+// --- Root / context translation tables (slice 3a) ---
+
+// Bit layout of the VT-d root/context entries under test (Intel VT-d spec). Kept
+// as local literals so the test states the format independently of the module.
+const PRESENT: u64 = 1 << 0;
+const TT_MASK: u64 = 0b11 << 2; // context translation-type field (00 = second-level)
+const AW_MASK: u64 = 0x7; // context high-word address-width field
+const PTR_MASK: u64 = 0x000f_ffff_ffff_f000; // [51:12] next-table / SLPTPTR pointer
+
+/// `set_device` encodes a context entry the way the VT-d spec lays it out: a
+/// present, second-level entry whose SLPTPTR is the domain root, with the right
+/// address width and domain id -- and it points the root entry at the context
+/// table. Also ties the two structures together: the SLPTPTR is a real
+/// `Domain::root()`.
+pub fn context_entry_encoding(ctx: &mut TestCtx) -> Result<(), &'static str> {
+    // A real domain to point at, so the SLPTPTR under test is a live root.
+    let mut dom = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let slptptr = dom.root();
+
+    let mut tt = TranslationTables::new(ctx.frames).map_err(|_| "tables new failed")?;
+    tt.set_device(3, 0, slptptr, 4, 7);
+
+    // Root entry for bus 0: present, and its pointer is 4-KiB aligned and nonzero
+    // (it names the context table).
+    let (root_lo, _root_hi) = tt.root_entry(0);
+    test_assert!(root_lo & PRESENT != 0, "root[0] must be present");
+    test_assert!(root_lo & PTR_MASK != 0, "root[0] must name a context table");
+
+    // Context entry for 3:0.
+    let (lo, hi) = tt.context_entry(3, 0);
+    test_assert!(lo & PRESENT != 0, "context 3:0 must be present");
+    test_assert!(lo & TT_MASK == 0, "translation type must be second-level (00)");
+    test_assert!(lo & PTR_MASK == slptptr, "SLPTPTR must be the domain root");
+    test_assert!(hi & AW_MASK == 2, "4-level table encodes AW = 2 (48-bit)");
+    test_assert!((hi >> 8) & 0xffff == 7, "domain id must be recorded");
+
+    // An untouched source-id stays absent -- set_device wrote only 3:0.
+    let (other_lo, _) = tt.context_entry(4, 0);
+    test_assert!(other_lo & PRESENT == 0, "an unset device must not be present");
+
+    tt.teardown(ctx.frames);
+    dom.teardown(ctx.frames);
+    Ok(())
+}
+
+/// Tearing down the tables returns both frames (root + context); non-vacuous
+/// (asserts they were taken first).
+pub fn translation_tables_teardown_frees(ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let before = ctx.frames.free_frames();
+    let mut tt = TranslationTables::new(ctx.frames).map_err(|_| "tables new failed")?;
+    tt.set_device(3, 0, 0x1000, 4, 1);
+    test_assert!(ctx.frames.free_frames() < before, "tables must consume frames");
+    tt.teardown(ctx.frames);
+    test_assert!(
+        ctx.frames.free_frames() == before,
+        "teardown must return the root and context frames"
+    );
     Ok(())
 }

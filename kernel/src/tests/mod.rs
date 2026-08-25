@@ -237,6 +237,8 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "iommu::rejects_bad_requests", run: iommu::rejects_bad_requests },
     TestCase { name: "iommu::teardown_frees_every_table", run: iommu::teardown_frees_every_table },
     TestCase { name: "iommu::rejects_unsupported_width", run: iommu::rejects_unsupported_width },
+    TestCase { name: "iommu::context_entry_encoding", run: iommu::context_entry_encoding },
+    TestCase { name: "iommu::translation_tables_teardown_frees", run: iommu::translation_tables_teardown_frees },
 ];
 
 /// Run every registered test. Returns true if all passed.
