@@ -135,7 +135,7 @@ pub fn mmio_stats() -> (u64, u64) {
     )
 }
 
-fn phys_offset() -> u64 {
+pub(crate) fn phys_offset() -> u64 {
     PHYS_OFFSET.load(Ordering::Relaxed)
 }
 

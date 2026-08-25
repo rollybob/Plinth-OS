@@ -17,6 +17,7 @@ mod fb_maps;
 mod fbcon;
 mod frame_alloc;
 mod input;
+mod iommu;
 mod ipc;
 mod mouse;
 mod pci;
@@ -231,6 +232,11 @@ const TESTS: &[TestCase] = &[
         name: "scheduler::work_steal_skips_donor_current",
         run: scheduler::work_steal_skips_donor_current,
     },
+    TestCase { name: "iommu::map_translate_roundtrip", run: iommu::map_translate_roundtrip },
+    TestCase { name: "iommu::empty_domain_translates_none", run: iommu::empty_domain_translates_none },
+    TestCase { name: "iommu::rejects_bad_requests", run: iommu::rejects_bad_requests },
+    TestCase { name: "iommu::teardown_frees_every_table", run: iommu::teardown_frees_every_table },
+    TestCase { name: "iommu::rejects_unsupported_width", run: iommu::rejects_unsupported_width },
 ];
 
 /// Run every registered test. Returns true if all passed.

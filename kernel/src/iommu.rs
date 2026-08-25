@@ -30,6 +30,8 @@ use core::fmt::Write;
 use spin::Mutex;
 
 use crate::acpi;
+use crate::frame_alloc::FrameAlloc;
+use crate::memory;
 
 /// The largest number of remapping units we retain. Each DRHD in the DMAR
 /// becomes one unit, so this matches `acpi::MAX_DRHD`.
@@ -129,4 +131,235 @@ pub fn discover<W: Write>(out: &mut W, rsdp: Option<u64>, phys_offset: u64) -> u
 #[allow(dead_code)]
 pub fn units() -> ([RemappingUnit; MAX_UNITS], usize) {
     (*UNITS.lock(), *UNIT_COUNT.lock())
+}
+
+// ---------------------------------------------------------------------------
+// Domain: the second-level (device) DMA page table -- slice 2.
+//
+// A domain is the per-device address space an IOMMU enforces: "which physical
+// frames may this device touch." It is a page-table tree over the existing
+// frame allocator, structurally like the CPU's page tables but in the VT-d
+// **second-level** format, which is deliberately NOT `x86_64::PageTable`:
+//   - an entry is "present" iff Read or Write is set (bits 0/1); there is no
+//     separate present bit, and no NX/user/global bits,
+//   - the next-level / page physical address sits in bits [51:12].
+// Slice 2 builds and unit-tests this as a pure structure over the real frame
+// allocator (the in-kernel harness, the `WaitQueue` pattern): create a domain,
+// map/unmap a 4-KiB frame, translate, tear down. No VT-d register is touched and
+// translation is not enabled -- that is slice 3, which points a device's context
+// entry at `Domain::root` and turns the unit on. Everything below is test-only
+// until then, so it is dead in the shipping build (the `frame_alloc` precedent).
+// ---------------------------------------------------------------------------
+
+/// Second-level PTE: readable. Present == (READ | WRITE) != 0.
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+pub const IOMMU_READ: u64 = 1 << 0;
+/// Second-level PTE: writable.
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+pub const IOMMU_WRITE: u64 = 1 << 1;
+
+/// The next-level-table / page physical address field of a second-level entry,
+/// bits [51:12]. Both the intermediate links and the leaf mapping use it.
+const SL_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+/// Present iff either permission bit is set (VT-d has no separate present bit).
+const SL_PRESENT: u64 = IOMMU_READ | IOMMU_WRITE;
+/// 512 u64 entries per 4-KiB table; 9 IOVA bits index each level.
+const ENTRIES: usize = 512;
+const INDEX_BITS: usize = 9;
+const PAGE_SHIFT: usize = 12;
+
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainError {
+    /// The frame allocator is out of frames for a table.
+    Exhausted,
+    /// An IOVA or physical address was not 4-KiB aligned.
+    Misaligned,
+    /// `map` found the leaf entry already present (a conflicting mapping).
+    AlreadyMapped,
+    /// `unmap` found no mapping at the IOVA.
+    NotMapped,
+    /// The remapping unit's address width is not a VT-d page-table depth
+    /// (39/48/57-bit -> 3/4/5 levels).
+    UnsupportedWidth,
+}
+
+/// A device DMA domain: a second-level page-table tree rooted at `root`. The
+/// mapped data frames belong to the caller (a library OS's held capabilities,
+/// per D2); the domain owns only the table frames, and `teardown` frees exactly
+/// those -- never a mapped page.
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+pub struct Domain {
+    /// Physical address of the top-level table (the SL page-table root a context
+    /// entry will point at in slice 3).
+    root: u64,
+    /// Walk depth: 3, 4, or 5, derived from the unit's DMA address width.
+    levels: u8,
+}
+
+/// The 512-entry table at physical address `phys`, via the phys-offset window.
+///
+/// # Safety
+/// `phys` must be a 4-KiB table frame this domain allocated (so it is mapped at
+/// `phys_offset` and no other reference aliases it for the call's duration).
+unsafe fn table_at(phys: u64) -> *mut [u64; ENTRIES] {
+    (memory::phys_offset() + phys) as *mut [u64; ENTRIES]
+}
+
+/// Allocate a frame and zero it (every entry not-present) for use as a table.
+fn alloc_table(frames: &mut FrameAlloc) -> Result<u64, DomainError> {
+    let phys = frames.alloc().map_err(|_| DomainError::Exhausted)?;
+    // SAFETY: `alloc` handed us a fresh frame we exclusively own, mapped at
+    // phys_offset; zeroing it makes every entry not-present.
+    unsafe { (*table_at(phys)).fill(0) };
+    Ok(phys)
+}
+
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+impl Domain {
+    /// Create an empty domain sized for a remapping unit of `addr_width_bits`
+    /// (the DMAR host address width). QEMU's unit is 48-bit -> a 4-level table.
+    pub fn new(frames: &mut FrameAlloc, addr_width_bits: u8) -> Result<Domain, DomainError> {
+        // VT-d AGAWs are 39/48/57-bit == 3/4/5 levels; each level adds 9 bits
+        // above the 12-bit page offset.
+        let span = (addr_width_bits as usize).checked_sub(PAGE_SHIFT).ok_or(DomainError::UnsupportedWidth)?;
+        if span == 0 || span % INDEX_BITS != 0 {
+            return Err(DomainError::UnsupportedWidth);
+        }
+        let levels = span / INDEX_BITS;
+        if !(3..=5).contains(&levels) {
+            return Err(DomainError::UnsupportedWidth);
+        }
+        let root = alloc_table(frames)?;
+        Ok(Domain { root, levels: levels as u8 })
+    }
+
+    /// The table index for `iova` at walk depth `depth` (0 = top level).
+    fn index(&self, iova: u64, depth: usize) -> usize {
+        let shift = PAGE_SHIFT + (self.levels as usize - 1 - depth) * INDEX_BITS;
+        ((iova >> shift) as usize) & (ENTRIES - 1)
+    }
+
+    /// Map one 4-KiB page: device address `iova` -> physical frame `phys`, with
+    /// `perms` (`IOMMU_READ`/`IOMMU_WRITE`). Allocates intermediate tables as
+    /// needed. `AlreadyMapped` if the leaf is already present, so a double-map is
+    /// a caught error rather than a silent overwrite.
+    pub fn map(
+        &mut self,
+        frames: &mut FrameAlloc,
+        iova: u64,
+        phys: u64,
+        perms: u64,
+    ) -> Result<(), DomainError> {
+        if iova % (1 << PAGE_SHIFT) != 0 || phys % (1 << PAGE_SHIFT) != 0 {
+            return Err(DomainError::Misaligned);
+        }
+        let mut table_phys = self.root;
+        let last = self.levels as usize - 1;
+        for depth in 0..self.levels as usize {
+            let idx = self.index(iova, depth);
+            // SAFETY: table_phys is the root or an intermediate frame this domain
+            // allocated; we hold `&mut self`, so no other walk aliases it.
+            let table = unsafe { &mut *table_at(table_phys) };
+            if depth == last {
+                if table[idx] & SL_PRESENT != 0 {
+                    return Err(DomainError::AlreadyMapped);
+                }
+                table[idx] = (phys & SL_ADDR_MASK) | (perms & SL_PRESENT);
+                return Ok(());
+            }
+            if table[idx] & SL_PRESENT == 0 {
+                let child = alloc_table(frames)?;
+                // Intermediate links carry R+W; leaf perms gate the actual access.
+                table[idx] = (child & SL_ADDR_MASK) | SL_PRESENT;
+                table_phys = child;
+            } else {
+                table_phys = table[idx] & SL_ADDR_MASK;
+            }
+        }
+        unreachable!("the leaf level returns inside the loop")
+    }
+
+    /// Remove the mapping for `iova`. `NotMapped` if none exists. Intermediate
+    /// tables are left in place (freed wholesale by `teardown`); the mapped data
+    /// frame is the caller's and is never touched here.
+    pub fn unmap(&mut self, iova: u64) -> Result<(), DomainError> {
+        if iova % (1 << PAGE_SHIFT) != 0 {
+            return Err(DomainError::Misaligned);
+        }
+        let mut table_phys = self.root;
+        let last = self.levels as usize - 1;
+        for depth in 0..self.levels as usize {
+            let idx = self.index(iova, depth);
+            // SAFETY: as in `map`.
+            let table = unsafe { &mut *table_at(table_phys) };
+            if table[idx] & SL_PRESENT == 0 {
+                return Err(DomainError::NotMapped);
+            }
+            if depth == last {
+                table[idx] = 0;
+                return Ok(());
+            }
+            table_phys = table[idx] & SL_ADDR_MASK;
+        }
+        unreachable!("the leaf level returns inside the loop")
+    }
+
+    /// Resolve `iova` to a physical address the way the hardware would, or `None`
+    /// if unmapped. The unit-test oracle for `map`/`unmap`; also the shape a
+    /// fault check reasons about in slice 4.
+    pub fn translate(&self, iova: u64) -> Option<u64> {
+        let mut table_phys = self.root;
+        let last = self.levels as usize - 1;
+        for depth in 0..self.levels as usize {
+            let idx = self.index(iova, depth);
+            // SAFETY: read-only walk over this domain's own table frames.
+            let table = unsafe { &*table_at(table_phys) };
+            let entry = table[idx];
+            if entry & SL_PRESENT == 0 {
+                return None;
+            }
+            if depth == last {
+                return Some((entry & SL_ADDR_MASK) | (iova & ((1 << PAGE_SHIFT) - 1)));
+            }
+            table_phys = entry & SL_ADDR_MASK;
+        }
+        None
+    }
+
+    /// Free every table frame this domain owns (root + all intermediate tables),
+    /// leaving it unusable. Mapped data frames are the caller's and are NOT freed.
+    /// After this the domain's `root` is 0.
+    pub fn teardown(&mut self, frames: &mut FrameAlloc) {
+        if self.root != 0 {
+            free_subtree(frames, self.root, self.levels);
+            self.root = 0;
+        }
+    }
+
+    /// The SL page-table root physical address, for slice 3 to program into a
+    /// device's context entry.
+    pub fn root(&self) -> u64 {
+        self.root
+    }
+}
+
+/// Recursively free a table at `table_phys` and, if it is not a leaf table, the
+/// subtree beneath it. `level` is the number of levels from this table down to
+/// the leaf inclusive (root == `Domain::levels`, leaf table == 1). Leaf-table
+/// entries point at caller-owned data frames, so they are never freed -- only the
+/// table frames are.
+fn free_subtree(frames: &mut FrameAlloc, table_phys: u64, level: u8) {
+    if level > 1 {
+        // SAFETY: `table_phys` is a table frame this domain allocated; the walk
+        // is read-only and dealloc only flips allocator bitmap bits, not table
+        // memory, so the reference stays valid across the recursion.
+        let table = unsafe { &*table_at(table_phys) };
+        for &entry in table.iter() {
+            if entry & SL_PRESENT != 0 {
+                free_subtree(frames, entry & SL_ADDR_MASK, level - 1);
+            }
+        }
+    }
+    let _ = frames.dealloc(table_phys);
 }
