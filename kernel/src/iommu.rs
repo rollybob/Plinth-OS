@@ -26,12 +26,14 @@
 //! references, not from any other kernel's IOMMU code.
 
 use core::fmt::Write;
+use core::ptr::{read_volatile, write_volatile};
 
 use spin::Mutex;
 
 use crate::acpi;
-use crate::frame_alloc::FrameAlloc;
+use crate::frame_alloc::{FrameAlloc, FRAME_ALLOC};
 use crate::memory;
+use crate::pci;
 
 /// The largest number of remapping units we retain. Each DRHD in the DMAR
 /// becomes one unit, so this matches `acpi::MAX_DRHD`.
@@ -58,11 +60,14 @@ pub struct RemappingUnit {
     /// (VT-d INCLUDE_PCI_ALL). When false, it covers only the devices its DMAR
     /// device-scope names -- which is what QEMU's `intel-iommu` reports.
     pub covers_all: bool,
+    /// Host DMA address width in bits (from the DMAR), the page-table depth is
+    /// derived from it when a domain is built for this unit.
+    pub addr_width: u8,
 }
 
 impl RemappingUnit {
     const EMPTY: RemappingUnit =
-        RemappingUnit { register_base: 0, segment: 0, covers_all: false };
+        RemappingUnit { register_base: 0, segment: 0, covers_all: false, addr_width: 0 };
 }
 
 /// The remapping units discovered at boot. Filled once by `discover`; read by the
@@ -100,6 +105,7 @@ pub fn discover<W: Write>(out: &mut W, rsdp: Option<u64>, phys_offset: u64) -> u
             register_base: d.register_base,
             segment: d.segment,
             covers_all: d.include_pci_all,
+            addr_width: dmar.host_addr_width,
         };
         count += 1;
         // Detail line -- the register base is not asserted (allow-listed).
@@ -477,4 +483,232 @@ impl TranslationTables {
             self.root_phys = 0;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// VT-d register interface + block-device translation enable -- slice 3b.
+//
+// The first code that touches the remapping unit's MMIO registers and the first
+// shipping caller of Domain/TranslationTables. It gives the kernel's own block
+// DMA a real IOMMU domain and turns translation on, while the block smoke must
+// still pass byte-identically (the positive; the forced out-of-domain fault is
+// slice 4).
+//
+// Model: one shared identity domain for block DMA (the driver is trusted and
+// kernel-bridged, so per-device isolation between the two disks is not the point
+// yet -- protecting the kernel's own DMA is). Both virtio-blk devices get a
+// context entry pointing at that domain. The domain maps each device's fixed ring
+// frames at prepare time and each request's data frame on demand (add-only: with
+// QEMU caching-mode off, a not-present->present change needs no invalidation).
+//
+// Lock order (boot is single-threaded, but stated so it stays correct under SMP):
+// a device lock (held across post_request) -> BLOCK_IOMMU -> FRAME_ALLOC. Nothing
+// takes them in reverse. map_kernel_mmio locks FRAME_ALLOC itself, so it is
+// always called before FRAME_ALLOC is taken here.
+// ---------------------------------------------------------------------------
+
+/// VT-d register offsets (from the unit's register base).
+const VTD_CAP: usize = 0x08; // capabilities (u64): SAGAW, MGAW, caching mode
+const VTD_ECAP: usize = 0x10; // extended capabilities (u64)
+const VTD_GCMD: usize = 0x18; // global command (u32, write to act)
+const VTD_GSTS: usize = 0x1c; // global status (u32, read back)
+const VTD_RTADDR: usize = 0x20; // root table address (u64)
+
+/// GCMD/GSTS bits.
+const GCMD_SRTP: u32 = 1 << 30; // set root table pointer (one-shot)
+const GCMD_TE: u32 = 1 << 31; // translation enable (sticky)
+const GSTS_RTPS: u32 = 1 << 30; // root table pointer set
+const GSTS_TES: u32 = 1 << 31; // translation enable status
+
+/// Domain id for the shared block domain. Any nonzero id distinct from the
+/// reserved domain 0 works; both block devices share it.
+const BLOCK_DID: u16 = 1;
+
+/// Bound on a status-register poll, so a unit that never sets a status bit fails
+/// loudly instead of hanging the boot.
+const GSTS_POLL_LIMIT: u32 = 1_000_000;
+
+/// # Safety
+/// `va + off` must be inside the mapped, uncached VT-d register window.
+unsafe fn reg_r32(va: u64, off: usize) -> u32 {
+    read_volatile((va + off as u64) as *const u32)
+}
+unsafe fn reg_w32(va: u64, off: usize, val: u32) {
+    write_volatile((va + off as u64) as *mut u32, val)
+}
+unsafe fn reg_r64(va: u64, off: usize) -> u64 {
+    read_volatile((va + off as u64) as *const u64)
+}
+unsafe fn reg_w64(va: u64, off: usize, val: u64) {
+    write_volatile((va + off as u64) as *mut u64, val)
+}
+
+/// The shared block-DMA IOMMU state: the mapped register window, the per-unit
+/// root/context tables, and the one identity domain both block devices use.
+struct BlockIommu {
+    regs_va: u64,
+    tables: TranslationTables,
+    domain: Domain,
+    levels: u8,
+    prepared: usize,
+    enabled: bool,
+}
+
+static BLOCK_IOMMU: Mutex<Option<BlockIommu>> = Mutex::new(None);
+
+/// Page-table depth for `width` bits (48 -> 4), matching `Domain::new`.
+fn levels_for(width: u8) -> Result<u8, &'static str> {
+    let span = (width as usize).checked_sub(PAGE_SHIFT).ok_or("bad addr width")?;
+    if span == 0 || span % INDEX_BITS != 0 {
+        return Err("addr width not a VT-d AGAW");
+    }
+    let levels = span / INDEX_BITS;
+    if !(3..=5).contains(&levels) {
+        return Err("addr width not a VT-d AGAW");
+    }
+    Ok(levels as u8)
+}
+
+/// Give a block device a context entry pointing at the shared identity domain,
+/// and map its fixed DMA frames (the virtqueue rings + the header/status buffer)
+/// into that domain. Lazily builds the shared domain, root/context tables, and
+/// maps the unit's register window on the first call. Does NOT enable translation
+/// (that is `block_enable`, once every device is prepared). Idempotent per frame.
+pub fn block_prepare_device(loc: pci::Location, fixed_frames: &[u64]) -> Result<(), &'static str> {
+    // First call: map registers (this locks FRAME_ALLOC internally, so it must
+    // happen before we take that lock below) and validate the unit.
+    let need_init = BLOCK_IOMMU.lock().is_none();
+    if need_init {
+        let (units, n) = units();
+        if n == 0 {
+            return Err("no remapping unit to bind block DMA to");
+        }
+        let unit = units[0];
+        let regs_va = memory::map_kernel_mmio(unit.register_base, 0x1000)?;
+        // Validate the unit supports the AGAW we will program. SAGAW bit
+        // (levels-1) is set for a supported depth (bit1=39/3lvl, bit2=48/4lvl,
+        // bit3=57/5lvl).
+        let cap = unsafe { reg_r64(regs_va, VTD_CAP) };
+        let sagaw = ((cap >> 8) & 0x1f) as u32;
+        let levels = levels_for(unit.addr_width)?;
+        // SAGAW bit index is the AGAW value (levels - 2): bit0=30/2lvl,
+        // bit1=39/3lvl, bit2=48/4lvl, bit3=57/5lvl -- the same encoding the
+        // context entry's AW field uses.
+        if sagaw & (1 << (levels - 2)) == 0 {
+            return Err("unit does not support the required address width");
+        }
+        // Build the shared domain + per-unit tables.
+        let (domain, tables) = {
+            let mut fg = FRAME_ALLOC.lock();
+            let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
+            let domain =
+                Domain::new(fa, unit.addr_width).map_err(|_| "iommu domain alloc failed")?;
+            let tables = TranslationTables::new(fa).map_err(|_| "iommu tables alloc failed")?;
+            (domain, tables)
+        };
+        *BLOCK_IOMMU.lock() = Some(BlockIommu {
+            regs_va,
+            tables,
+            domain,
+            levels,
+            prepared: 0,
+            enabled: false,
+        });
+    }
+
+    let mut g = BLOCK_IOMMU.lock();
+    let bi = g.as_mut().ok_or("block iommu vanished")?;
+    {
+        let mut fg = FRAME_ALLOC.lock();
+        let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
+        for &frame in fixed_frames {
+            let page = frame & !((1 << PAGE_SHIFT) - 1);
+            match bi.domain.map(fa, page, page, IOMMU_READ | IOMMU_WRITE) {
+                Ok(()) | Err(DomainError::AlreadyMapped) => {}
+                Err(_) => return Err("mapping a fixed block DMA frame failed"),
+            }
+        }
+    }
+    bi.tables.set_device(loc.slot, loc.func, bi.domain.root(), bi.levels, BLOCK_DID);
+    bi.prepared += 1;
+    Ok(())
+}
+
+/// Identity-map one request's data frame into the shared block domain before the
+/// device DMAs to it. Add-only and idempotent (frames are reused across
+/// requests); with caching-mode off a not-present->present change needs no
+/// invalidation. A no-op if block translation was never set up. Called from the
+/// request path under the device lock.
+pub fn block_map_dma(data_phys: u64) -> Result<(), &'static str> {
+    let mut g = BLOCK_IOMMU.lock();
+    let Some(bi) = g.as_mut() else { return Ok(()) };
+    if !bi.enabled {
+        return Ok(());
+    }
+    let page = data_phys & !((1 << PAGE_SHIFT) - 1);
+    let mut fg = FRAME_ALLOC.lock();
+    let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
+    match bi.domain.map(fa, page, page, IOMMU_READ | IOMMU_WRITE) {
+        Ok(()) | Err(DomainError::AlreadyMapped) => Ok(()),
+        Err(_) => Err("mapping a block DMA data frame failed"),
+    }
+}
+
+/// Point the unit at the root table and enable DMA translation. Call once, after
+/// every block device has been prepared (both context entries must be present
+/// before translation is turned on, or a device without one faults). Reports the
+/// unit capabilities and the enable. No-op if already enabled.
+pub fn block_enable<W: Write>(out: &mut W) -> Result<(), &'static str> {
+    let mut g = BLOCK_IOMMU.lock();
+    let Some(bi) = g.as_mut() else {
+        return Err("block iommu not prepared");
+    };
+    if bi.enabled {
+        return Ok(());
+    }
+    let regs = bi.regs_va;
+    let root = bi.tables.root_phys();
+
+    // SAFETY: `regs` is the mapped, uncached VT-d register window; the writes
+    // below are the spec's root-table-pointer + translation-enable sequence, and
+    // each is confirmed by polling its status bit before proceeding.
+    unsafe {
+        let cap = reg_r64(regs, VTD_CAP);
+        let ecap = reg_r64(regs, VTD_ECAP);
+        let caching_mode = (cap >> 7) & 1;
+        let _ = writeln!(
+            out,
+            "plinth:   iommu cap {cap:#018x} ecap {ecap:#018x} caching_mode {caching_mode}"
+        );
+
+        // Root table pointer, TTM=00 (legacy) since root is 4-KiB aligned.
+        reg_w64(regs, VTD_RTADDR, root);
+        reg_w32(regs, VTD_GCMD, GCMD_SRTP);
+        let mut spun = 0;
+        while reg_r32(regs, VTD_GSTS) & GSTS_RTPS == 0 {
+            spun += 1;
+            if spun >= GSTS_POLL_LIMIT {
+                return Err("iommu: root table pointer never acknowledged");
+            }
+            core::hint::spin_loop();
+        }
+
+        reg_w32(regs, VTD_GCMD, GCMD_TE);
+        let mut spun = 0;
+        while reg_r32(regs, VTD_GSTS) & GSTS_TES == 0 {
+            spun += 1;
+            if spun >= GSTS_POLL_LIMIT {
+                return Err("iommu: translation enable never acknowledged");
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    bi.enabled = true;
+    let _ = writeln!(
+        out,
+        "plinth: iommu: translation enabled ({} block device(s))",
+        bi.prepared
+    );
+    Ok(())
 }

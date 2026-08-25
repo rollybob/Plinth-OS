@@ -344,6 +344,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let _ = writeln!(serial, "plinth: virtio-blk[{i}] init failed: {e}");
             }
         }
+        // Every DMA-capable device is now prepared with an IOMMU context entry, so
+        // turn DMA translation on (protected-DMA milestone, slice 3). This must
+        // happen after the bring-up loop -- translation is per-unit and global, so
+        // a device without a context entry would fault -- and before the first
+        // block DMA (the selftest reads below). On a machine with no remapping
+        // unit this is a no-op and block DMA stays untranslated.
+        if let Err(e) = iommu::block_enable(&mut serial) {
+            let _ = writeln!(serial, "plinth: iommu: translation enable skipped: {e}");
+        }
         // Prove each device reads back. Device 0 is the ramp/test disk (the
         // 1 MiB byte-ramp image -- verify the ramp); device 1, if present, is
         // the boot archive (verify it reads and is a distinct disk, without the

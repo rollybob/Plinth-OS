@@ -381,6 +381,10 @@ impl VirtioBlk {
             // out to the disk, so it must not also be marked device-writable.
             Direction::Write => (VIRTIO_BLK_T_OUT, VIRTQ_DESC_F_NEXT),
         };
+        // With DMA translation on, the device can only reach frames its domain
+        // maps. Identity-map this request's data frame before the device sees the
+        // descriptor (add-only, idempotent; a no-op when translation is off).
+        let _ = crate::iommu::block_map_dma(data_phys);
         // SAFETY: all addresses below are kernel-mapped ring/MMIO/buffer
         // addresses set up in `init`; data_phys is a caller-owned frame. The
         // descriptor chain [head, head+1, head+2] is within the queue (head <=
@@ -723,6 +727,18 @@ pub fn init<W: Write>(
         intr_line: info.intr_line,
         msix_vector,
     });
+
+    // Give this device's DMA an IOMMU domain: map its fixed ring + header/status
+    // frames identity and add a context entry for its source-id. Translation is
+    // turned on once (in kernel_main) after every device is prepared. On a
+    // machine with no remapping unit this reports and the block path stays
+    // untranslated (still safe -- the ring is kernel-bridged).
+    if let Err(e) = crate::iommu::block_prepare_device(
+        info.loc,
+        &[desc_phys, avail_phys, used_phys, buf_phys],
+    ) {
+        let _ = writeln!(out, "plinth: virtio-blk[{dev}] iommu prepare skipped: {e}");
+    }
 
     let _ = writeln!(
         out,

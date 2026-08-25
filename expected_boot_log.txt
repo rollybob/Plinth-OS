@@ -129,6 +129,20 @@ plinth: virtio-blk[0] ready (queue 0, size 64, capacity 2048 sectors)
 plinth: virtio-blk[0] msix vector 0x30
 plinth: virtio-blk[1] ready (queue 0, size 64,
 plinth: virtio-blk[1] msix vector 0x31
+
+# Protected DMA (IOMMU milestone, slice 3): every DMA-capable device now has an
+# IOMMU context entry pointing at a domain that maps exactly the frames its DMA
+# touches, and translation is turned on here -- after both devices are prepared
+# (translation is per-unit and global, so a device with no context entry would
+# fault) and before the first block DMA (the sector-0 reads below). The domain
+# maps each device's ring/header frames at bring-up and each request's data frame
+# on demand; with QEMU caching-mode off (see the cap line, allow-listed) a
+# not-present -> present mapping needs no invalidation. The device count is
+# asserted (stable); the raw cap/ecap values are hardware-specific and ride the
+# allow-listed detail line. That the block reads below still pass byte-identically
+# with translation ON is the positive proof; forcing an out-of-domain fault (the
+# negative) is the next slice.
+plinth: iommu: translation enabled
 plinth: virtio-blk[0] sector 0 read ok (ramp verified)
 plinth: virtio-blk[1] sector 0 read ok (distinct disk)
 
@@ -146,11 +160,13 @@ plinth: virtio-blk[1] sector 0 read ok (distinct disk)
 #
 # Device MMIO now goes into a private PML4 slot claimed at boot, so every page is
 # mapped fresh and uncached and there is no "already mapped?" case to get wrong.
-# The count is the check: 12 pages is the current device set, and a change means
-# a device was added or a mapping path moved -- either way it wants a look rather
-# than a silent update. This is also the watchable half of a hazard QEMU cannot
-# otherwise demonstrate (real_hardware.md D2).
-plinth: mmio: 12 pages mapped uncached
+# The count is the check: 13 pages is the current device set -- the twelve device
+# registers plus the VT-d remapping unit's register window, mapped when block DMA
+# translation is enabled (slice 3) -- and a change means a device was added or a
+# mapping path moved, either way it wants a look rather than a silent update. This
+# is also the watchable half of a hazard QEMU cannot otherwise demonstrate
+# (real_hardware.md D2).
+plinth: mmio: 13 pages mapped uncached
 
 plinth: running hello
 hello: ring 3
@@ -864,6 +880,7 @@ plinth: boot ok
 #!allow acpi lapic base
 #!allow acpi source overrides:
 #!allow iommu unit:
+#!allow iommu cap
 #!allow plinth: pci 00:
 #!allow bar1 mem32
 #!allow bar4 mem64
