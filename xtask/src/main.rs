@@ -609,6 +609,16 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
         "-vga", "std",
     ]);
 
+    // Expose a VT-d IOMMU so the guest can discover a DMAR table (protected-DMA
+    // milestone, slice 1). Added before the virtio-blk devices below so the
+    // vIOMMU is realized ahead of the PCI devices it governs. Interrupt remapping
+    // stays off (its default), so no split irqchip is needed; and DMA translation
+    // is driven by the guest, which the kernel does not yet enable -- so DMA
+    // passes through untranslated and existing device behaviour is unchanged.
+    // caching-mode and actual translation are a later slice (Design/iommu.md D4
+    // and the QEMU-limits open question in its S8).
+    cmd.args(["-device", "intel-iommu"]);
+
     if exit_on_debug {
         // isa-debug-exit: the kernel writes N to port 0xF4 and QEMU exits with
         // status (N << 1) | 1. Kernel success (N=0) -> exit code 1.

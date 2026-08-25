@@ -85,6 +85,10 @@ pub const MAX_ISOS: usize = 16;
 /// to know who to wake). Generous for a toy kernel; x2APIC-only systems
 /// (>255 CPUs) are out of scope (D3) and would not enumerate here anyway.
 pub const MAX_CPUS: usize = 16;
+/// The largest number of DMA-remapping hardware units (DRHDs) we retain from the
+/// DMAR table. Real platforms list one per PCIe segment / root complex (a
+/// handful); QEMU's `intel-iommu` exposes one. Bounded like the lists above.
+pub const MAX_DRHD: usize = 8;
 
 /// One Interrupt Source Override: an ISA IRQ that the chipset routes to a
 /// non-default GSI and/or with a non-default polarity/trigger. The interrupt
@@ -126,6 +130,39 @@ pub struct Topology {
     /// the asserted summary line, not a wrong id.
     pub cpu_apic_ids: [u8; MAX_CPUS],
     pub cpu_id_count: usize,
+}
+
+/// One DMA Remapping Hardware Unit Definition (DRHD) from the DMAR table: a VT-d
+/// remapping unit's MMIO register base and the PCI segment it covers. The
+/// register base is what an IOMMU backend later programs; slice 1 only discovers
+/// and reports it (`Design/iommu.md` build order step 1).
+#[derive(Clone, Copy)]
+pub struct Drhd {
+    /// MMIO base of this unit's VT-d register set.
+    pub register_base: u64,
+    /// PCI segment (domain) number this unit covers (0 on single-segment PCs).
+    pub segment: u16,
+    /// INCLUDE_PCI_ALL: this unit covers every PCI device in its segment not
+    /// named by an earlier unit's device scope. When clear, the unit only covers
+    /// the devices its device-scope entries name (QEMU's `intel-iommu` reports it
+    /// this way -- an explicit scope, INCLUDE_PCI_ALL clear).
+    pub include_pci_all: bool,
+}
+
+impl Drhd {
+    const EMPTY: Drhd = Drhd { register_base: 0, segment: 0, include_pci_all: false };
+}
+
+/// The parsed DMAR table: the VT-d DMA-remapping units and the host DMA address
+/// width. Returned by `find_dmar`; consumed by the IOMMU seam (`iommu`). Pure
+/// discovery -- nothing here enables translation.
+#[derive(Clone, Copy)]
+pub struct Dmar {
+    /// Host DMA address width in bits (the DMAR "Host Address Width" field + 1).
+    /// The domain page-table depth (slice 2) is chosen from this.
+    pub host_addr_width: u8,
+    pub drhds: [Drhd; MAX_DRHD],
+    pub drhd_count: usize,
 }
 
 /// Discover the CPU + interrupt-controller topology from ACPI, report it, and
@@ -387,6 +424,99 @@ unsafe fn find_madt(phys_offset: u64, sdt_phys: u64, entry_size: usize) -> Optio
         }
     }
     None
+}
+
+/// Validate the RSDP and return the (system-description-table physical address,
+/// entry size) pair: the XSDT with 8-byte entries on an ACPI 2.0+ RSDP, else the
+/// 32-bit RSDT with 4-byte entries. `None` if the signature is wrong. This is the
+/// same RSDP read `init` does inline; it is factored out here so a second table
+/// consumer (`find_dmar`) does not duplicate or perturb the MADT discovery path.
+///
+/// # Safety
+/// `rsdp_phys` must name the firmware RSDP in mapped physical memory.
+unsafe fn sdt_from_rsdp(phys_offset: u64, rsdp_phys: u64) -> Option<(u64, usize)> {
+    let rsdp_p = ptr_at(phys_offset, rsdp_phys);
+    let mut sig = [0u8; 8];
+    for (i, b) in sig.iter_mut().enumerate() {
+        *b = rd_u8(rsdp_p, i);
+    }
+    if &sig != b"RSD PTR " {
+        return None;
+    }
+    // Revision >= 2 means an ACPI 2.0+ RSDP carrying a 64-bit XSDT; older RSDPs
+    // only have the 32-bit RSDT. QEMU q35 provides the XSDT.
+    let revision = rd_u8(rsdp_p, 15);
+    if revision >= 2 {
+        Some((rd_u64(rsdp_p, 24), 8))
+    } else {
+        Some((rd_u32(rsdp_p, 16) as u64, 4))
+    }
+}
+
+/// DMAR remapping-structure type for a DMA Remapping Hardware Unit Definition.
+const DMAR_TYPE_DRHD: u16 = 0;
+/// Offset of the first remapping structure within the DMAR: the 36-byte SDT
+/// header, then Host Address Width (1) + Flags (1) + 10 reserved bytes.
+const DMAR_STRUCTS_OFFSET: usize = 48;
+/// Bound on remapping structures walked, a guard against a corrupt length.
+const MAX_DMAR_STRUCTS: usize = 256;
+
+/// Discover the VT-d DMA-remapping units from the ACPI **DMAR** table -- the VT-d
+/// analogue of `find_madt`, and slice 1 of the IOMMU milestone (`Design/iommu.md`
+/// §6 step 1). Walks RSDP -> XSDT -> DMAR and returns each DRHD's register base.
+///
+/// Returns `None` if there is no RSDP or no DMAR table: a plain q35 with no
+/// `-device intel-iommu`, or an AMD-Vi platform (whose remapping units live in
+/// the IVRS table, a future backend). Pure discovery: reads only, bounded walk,
+/// no translation enabled -- the `acpi.rs` MADT pattern.
+///
+/// DMAR layout (ACPI spec): a 36-byte SDT header, then Host Address Width (u8) +
+/// Flags (u8) + 10 reserved, then a sequence of remapping structures each led by
+/// `{ type: u16, length: u16 }`. A DRHD (type 0) carries Flags (u8) at +4,
+/// Segment (u16) at +6, and the 64-bit Register Base at +8; its device-scope
+/// entries follow but are not needed to name the unit.
+pub fn find_dmar(rsdp: Option<u64>, phys_offset: u64) -> Option<Dmar> {
+    let rsdp_phys = rsdp?;
+    // SAFETY: rsdp_phys is BootInfo's firmware RSDP physical address, mapped at
+    // phys_offset. We only read, and every walk below is bounded against the
+    // table's own length field and a structure-count cap.
+    unsafe {
+        let (sdt, entry_size) = sdt_from_rsdp(phys_offset, rsdp_phys)?;
+        let dmar_phys = find_table(phys_offset, sdt, entry_size, b"DMAR")?;
+        let p = ptr_at(phys_offset, dmar_phys);
+        let length = rd_u32(p, 4) as usize;
+        if length < DMAR_STRUCTS_OFFSET {
+            return None; // shorter than the DMAR fixed header -> malformed
+        }
+        // "Host Address Width" is stored as width - 1; saturating_add guards a
+        // corrupt 0xFF from panicking a debug build.
+        let host_addr_width = rd_u8(p, 36).saturating_add(1);
+
+        let mut drhds = [Drhd::EMPTY; MAX_DRHD];
+        let mut drhd_count = 0usize;
+
+        let mut off = DMAR_STRUCTS_OFFSET;
+        let mut walked = 0usize;
+        while off + 4 <= length && walked < MAX_DMAR_STRUCTS {
+            walked += 1;
+            let stype = rd_u16(p, off);
+            let slen = rd_u16(p, off + 2) as usize;
+            if slen < 4 || off + slen > length {
+                break; // degenerate or overrunning structure -> stop (malformed)
+            }
+            if stype == DMAR_TYPE_DRHD && drhd_count < MAX_DRHD {
+                drhds[drhd_count] = Drhd {
+                    register_base: rd_u64(p, off + 8),
+                    segment: rd_u16(p, off + 6),
+                    include_pci_all: rd_u8(p, off + 4) & 1 != 0,
+                };
+                drhd_count += 1;
+            }
+            off += slen;
+        }
+
+        Some(Dmar { host_addr_width, drhds, drhd_count })
+    }
 }
 
 /// Parse the MADT: log the Local APIC base, each I/O APIC, each enabled CPU's

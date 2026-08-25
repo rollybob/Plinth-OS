@@ -43,6 +43,10 @@ mod interrupts;
 // silence dead-code noise in the test build, like `timer`.
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod irq;
+// The IOMMU remapping-unit seam (VT-d now, AMD-Vi later). Slice 1 is discovery
+// only and runs on the userspace boot path, not the test build.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod iommu;
 // IPC endpoints are driven from the userspace boot path (and the no_mangle
 // dispatcher); create_endpoint is unused in the test build, which stops
 // before userspace.
@@ -270,6 +274,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // overrides. Reads firmware tables through the phys-offset window; returns
         // the topology the interrupt controller consumes below.
         let topology = acpi::init(&mut serial, boot_info.rsdp_addr.into_option(), phys_offset);
+
+        // Discover the platform's DMA-remapping (IOMMU) units from ACPI --
+        // protected-DMA milestone, slice 1. With `-device intel-iommu` QEMU
+        // publishes a DMAR table; the remapping-unit seam reports each VT-d unit's
+        // register base. Pure discovery: translation stays off and DMA is
+        // unchanged (still kernel-bridged), so this only maps the ground the
+        // domain build and the forced-fault proof stand on. An AMD-Vi platform
+        // (IVRS) would report zero units here until that backend exists.
+        iommu::discover(&mut serial, boot_info.rsdp_addr.into_option(), phys_offset);
 
         // Initialise the interrupt controller (broader hardware, Stage A2). With
         // an ACPI topology this brings up the LAPIC + I/O APIC and retires the

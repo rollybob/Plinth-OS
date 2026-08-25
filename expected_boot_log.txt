@@ -64,6 +64,18 @@ plinth: framebuffer present
 plinth: acpi: S5 poweroff available (pm1a 0x604, slp_typ 0)
 plinth: acpi: 1 cpu(s), 1 ioapic(s)
 
+# VT-d IOMMU discovery (protected-DMA milestone, slice 1). With `-device
+# intel-iommu` on the q35 smoke machine, QEMU publishes a DMAR table; the ACPI
+# walker extends to it (acpi::find_dmar) and the remapping-unit seam reports the
+# DMA-remapping hardware unit(s) it names. Pure discovery -- translation stays
+# OFF and DMA is unchanged (still kernel-bridged); this only maps the ground the
+# domain build (slice 2) and the forced-fault proof (slice 4) stand on. Only the
+# stable count is asserted, as a PREFIX: the per-unit register base rides an
+# unasserted detail line (like the MADT LAPIC base and the PCI BARs), and the
+# DMA-address-width tail is not asserted either (VT-d aw-bits varies by QEMU
+# version).
+plinth: iommu: 1 dma remapping unit(s)
+
 plinth: timer armed
 
 # AP bring-up count. Asserted only because check_smoke_output does not run under
@@ -851,6 +863,7 @@ plinth: boot ok
 #!allow acpi iso:
 #!allow acpi lapic base
 #!allow acpi source overrides:
+#!allow iommu unit:
 #!allow plinth: pci 00:
 #!allow bar1 mem32
 #!allow bar4 mem64
