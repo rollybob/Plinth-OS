@@ -140,11 +140,24 @@ plinth: virtio-blk[1] msix vector 0x31
 # not-present -> present mapping needs no invalidation. The device count is
 # asserted (stable); the raw cap/ecap values are hardware-specific and ride the
 # allow-listed detail line. That the block reads below still pass byte-identically
-# with translation ON is the positive proof; forcing an out-of-domain fault (the
-# negative) is the next slice.
+# with translation ON is the positive proof; the forced out-of-domain fault below
+# is the negative that keeps it honest. The devices negotiate
+# VIRTIO_F_ACCESS_PLATFORM (their `-device ...,iommu_platform=on`), so their DMA
+# genuinely goes through the vIOMMU; the unit runs with caching-mode on, so the
+# kernel invalidates the IOTLB after each mapping change.
 plinth: iommu: translation enabled
 plinth: virtio-blk[0] sector 0 read ok (ramp verified)
 plinth: virtio-blk[1] sector 0 read ok (distinct disk)
+
+# Protected-DMA negative proof (slice 4): the device is pointed at an IOVA its
+# domain does not map, and the unit records a translation fault for exactly that
+# address; then the same driver does a normal, mapped read that succeeds and
+# raises no fault. "DMA still works with the IOMMU on" alone is consistent with a
+# domain that maps everything and protects nothing -- only a watched fault proves
+# the boundary is real. The request itself may still report complete (QEMU writes
+# the mapped status byte even though the data DMA faulted), so the proof reads the
+# fault-recording register, not the request result.
+plinth: iommu: fault control: PASS
 
 # Device MMIO is mapped UNCACHED, and this line is the assertion that it is.
 #

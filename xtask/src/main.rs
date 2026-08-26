@@ -609,15 +609,16 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
         "-vga", "std",
     ]);
 
-    // Expose a VT-d IOMMU so the guest can discover a DMAR table (protected-DMA
-    // milestone, slice 1). Added before the virtio-blk devices below so the
-    // vIOMMU is realized ahead of the PCI devices it governs. Interrupt remapping
-    // stays off (its default), so no split irqchip is needed; and DMA translation
-    // is driven by the guest, which the kernel does not yet enable -- so DMA
-    // passes through untranslated and existing device behaviour is unchanged.
-    // caching-mode and actual translation are a later slice (Design/iommu.md D4
-    // and the QEMU-limits open question in its S8).
-    cmd.args(["-device", "intel-iommu"]);
+    // Expose a VT-d IOMMU so the guest can discover a DMAR table and enforce DMA
+    // translation (protected-DMA milestone). Added before the virtio-blk devices
+    // below so the vIOMMU is realized ahead of the PCI devices it governs.
+    // Interrupt remapping stays off (its default), so no split irqchip is needed.
+    // caching-mode=on is REQUIRED for QEMU to actually enforce per-DMA
+    // translation on emulated devices (without it an out-of-domain access is not
+    // faulted -- the positive "DMA still works" would be vacuous); it also makes
+    // IOTLB invalidation mandatory after a mapping change, which the kernel does
+    // (Design/iommu.md D4).
+    cmd.args(["-device", "intel-iommu,caching-mode=on"]);
 
     if exit_on_debug {
         // isa-debug-exit: the kernel writes N to port 0xF4 and QEMU exits with
@@ -643,7 +644,10 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
         "-drive",
         &format!("if=none,format=raw,file={},id=blk0", blk.display()),
         "-device",
-        "virtio-blk-pci,drive=blk0,addr=0x3,disable-legacy=on",
+        // iommu_platform=on routes this device's DMA through the vIOMMU (it then
+        // offers VIRTIO_F_ACCESS_PLATFORM); without it QEMU's virtio bypasses the
+        // IOMMU and the domain enforcement would be vacuous.
+        "virtio-blk-pci,drive=blk0,addr=0x3,disable-legacy=on,iommu_platform=on",
     ]);
 
     // Storage device 1: the read-only boot archive. Pinned to slot 4 (just past
@@ -654,7 +658,7 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
         "-drive",
         &format!("if=none,format=raw,file={},id=blk1", archive.display()),
         "-device",
-        "virtio-blk-pci,drive=blk1,addr=0x4,disable-legacy=on",
+        "virtio-blk-pci,drive=blk1,addr=0x4,disable-legacy=on,iommu_platform=on",
     ]);
 
     // Log CPU resets and exceptions for post-mortem debugging.

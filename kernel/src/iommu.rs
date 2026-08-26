@@ -552,9 +552,62 @@ struct BlockIommu {
     levels: u8,
     prepared: usize,
     enabled: bool,
+    /// Byte offset of the first fault-recording register (FRCD) from the register
+    /// base, derived from CAP.FRO. Slice 4 reads it to confirm a forced fault.
+    fault_off: usize,
+    /// Byte offset of the IOTLB invalidate register (IOTLB_REG) from the register
+    /// base, derived from ECAP.IRO. Under caching-mode a mapping change is only
+    /// seen after invalidating here.
+    iotlb_off: usize,
 }
 
 static BLOCK_IOMMU: Mutex<Option<BlockIommu>> = Mutex::new(None);
+
+/// When set, `block_map_dma` skips the mapping for one request -- the slice-4
+/// fault probe uses it to send the device at a frame the domain does not map, to
+/// prove an out-of-domain access faults. Off in all normal operation.
+static SKIP_MAP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// VT-d fault register offsets and bits (slice 4).
+const VTD_FSTS: usize = 0x34; // fault status (RW1C)
+const FRCD_HI_FAULT: u64 = 1 << 63; // FRCD high: F (this record holds a fault)
+
+/// Context Command Register (invalidate the context cache).
+const VTD_CCMD: usize = 0x28;
+const CCMD_ICC: u64 = 1 << 63; // invalidate context cache (self-clearing)
+const CCMD_CIRG_GLOBAL: u64 = 1 << 61; // request granularity = global
+/// IOTLB register bits (the register itself is at ECAP.IRO + 8).
+const IOTLB_IVT: u64 = 1 << 63; // invalidate IOTLB (self-clearing)
+const IOTLB_IIRG_GLOBAL: u64 = 1 << 60; // request granularity = global
+/// Bound on an invalidation-completion poll.
+const INVAL_POLL_LIMIT: u32 = 1_000_000;
+
+/// Invalidate the whole context cache, then the whole IOTLB, and wait for each to
+/// complete. Required under caching-mode after changing a context entry or a
+/// page mapping, or the unit keeps using stale (or cached not-present) entries.
+///
+/// # Safety
+/// `regs` is the mapped register window; `iotlb_off` is ECAP.IRO + 8 within it.
+unsafe fn invalidate_all(regs: u64, iotlb_off: usize) {
+    reg_w64(regs, VTD_CCMD, CCMD_ICC | CCMD_CIRG_GLOBAL);
+    let mut spun = 0;
+    while reg_r64(regs, VTD_CCMD) & CCMD_ICC != 0 {
+        spun += 1;
+        if spun >= INVAL_POLL_LIMIT {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    reg_w64(regs, iotlb_off, IOTLB_IVT | IOTLB_IIRG_GLOBAL);
+    let mut spun = 0;
+    while reg_r64(regs, iotlb_off) & IOTLB_IVT != 0 {
+        spun += 1;
+        if spun >= INVAL_POLL_LIMIT {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+}
 
 /// Page-table depth for `width` bits (48 -> 4), matching `Domain::new`.
 fn levels_for(width: u8) -> Result<u8, &'static str> {
@@ -597,6 +650,13 @@ pub fn block_prepare_device(loc: pci::Location, fixed_frames: &[u64]) -> Result<
         if sagaw & (1 << (levels - 2)) == 0 {
             return Err("unit does not support the required address width");
         }
+        // CAP.FRO (bits [33:24]) is the fault-recording register offset in
+        // 16-byte units; the fault probe (slice 4) reads FRCD there.
+        let fault_off = (((cap >> 24) & 0x3ff) as usize) * 16;
+        // ECAP.IRO (bits [17:8]) is the IOTLB register block offset in 16-byte
+        // units; IOTLB_REG (what we write to invalidate) is 8 bytes past it.
+        let ecap = unsafe { reg_r64(regs_va, VTD_ECAP) };
+        let iotlb_off = (((ecap >> 8) & 0x3ff) as usize) * 16 + 8;
         // Build the shared domain + per-unit tables.
         let (domain, tables) = {
             let mut fg = FRAME_ALLOC.lock();
@@ -613,6 +673,8 @@ pub fn block_prepare_device(loc: pci::Location, fixed_frames: &[u64]) -> Result<
             levels,
             prepared: 0,
             enabled: false,
+            fault_off,
+            iotlb_off,
         });
     }
 
@@ -645,13 +707,29 @@ pub fn block_map_dma(data_phys: u64) -> Result<(), &'static str> {
     if !bi.enabled {
         return Ok(());
     }
-    let page = data_phys & !((1 << PAGE_SHIFT) - 1);
-    let mut fg = FRAME_ALLOC.lock();
-    let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
-    match bi.domain.map(fa, page, page, IOMMU_READ | IOMMU_WRITE) {
-        Ok(()) | Err(DomainError::AlreadyMapped) => Ok(()),
-        Err(_) => Err("mapping a block DMA data frame failed"),
+    // Fault probe (slice 4): deliberately leave this request's frame unmapped so
+    // the device's access to it faults.
+    if SKIP_MAP.load(core::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
     }
+    let page = data_phys & !((1 << PAGE_SHIFT) - 1);
+    let added = {
+        let mut fg = FRAME_ALLOC.lock();
+        let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
+        match bi.domain.map(fa, page, page, IOMMU_READ | IOMMU_WRITE) {
+            Ok(()) => true,
+            Err(DomainError::AlreadyMapped) => false,
+            Err(_) => return Err("mapping a block DMA data frame failed"),
+        }
+    };
+    // Under caching-mode the device only sees a new mapping after invalidation
+    // (and a not-present entry it already touched stays cached until then). Only
+    // needed when we actually added a mapping.
+    if added {
+        // SAFETY: regs_va/iotlb_off are this unit's mapped registers.
+        unsafe { invalidate_all(bi.regs_va, bi.iotlb_off) };
+    }
+    Ok(())
 }
 
 /// Point the unit at the root table and enable DMA translation. Call once, after
@@ -702,6 +780,10 @@ pub fn block_enable<W: Write>(out: &mut W) -> Result<(), &'static str> {
             }
             core::hint::spin_loop();
         }
+
+        // Flush any stale context/IOTLB state so the device sees the context
+        // entries and fixed-frame mappings established before enable.
+        invalidate_all(regs, bi.iotlb_off);
     }
 
     bi.enabled = true;
@@ -711,4 +793,43 @@ pub fn block_enable<W: Write>(out: &mut W) -> Result<(), &'static str> {
         bi.prepared
     );
     Ok(())
+}
+
+/// True once block DMA translation has been turned on. The fault probe (slice 4)
+/// only runs when this holds -- on a machine with no remapping unit there is
+/// nothing to fault.
+pub fn block_translation_enabled() -> bool {
+    BLOCK_IOMMU.lock().as_ref().is_some_and(|bi| bi.enabled)
+}
+
+/// Arm/disarm the fault probe: while armed, the next `block_map_dma` calls do NOT
+/// map their frame, so the device is sent at an address outside its domain. Slice
+/// 4 only.
+pub fn arm_skip_map(on: bool) {
+    SKIP_MAP.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read and clear the first fault-recording register. Returns `(faulting page
+/// address, fault reason)` if a fault was recorded, else `None`. Used by the
+/// slice-4 probe to confirm an out-of-domain access actually faulted; the reason
+/// for a not-present second-level mapping is 0x05 under VT-d.
+pub fn take_fault() -> Option<(u64, u32)> {
+    let g = BLOCK_IOMMU.lock();
+    let bi = g.as_ref()?;
+    // SAFETY: regs_va + fault_off is the mapped FRCD register for this unit.
+    unsafe {
+        let hi = reg_r64(bi.regs_va, bi.fault_off + 8);
+        if hi & FRCD_HI_FAULT == 0 {
+            return None;
+        }
+        let lo = reg_r64(bi.regs_va, bi.fault_off);
+        let addr = lo & SL_ADDR_MASK;
+        let reason = ((hi >> 32) & 0xff) as u32;
+        // FRCD.F is RW1C: writing the F bit back clears the record.
+        reg_w64(bi.regs_va, bi.fault_off + 8, FRCD_HI_FAULT);
+        // FSTS pending bits are RW1C: write back what we read to clear them.
+        let fsts = reg_r32(bi.regs_va, VTD_FSTS);
+        reg_w32(bi.regs_va, VTD_FSTS, fsts);
+        Some((addr, reason))
+    }
 }

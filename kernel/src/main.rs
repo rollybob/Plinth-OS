@@ -363,6 +363,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         if virtio_blk::ready(1) {
             virtio_blk::selftest_read(&mut serial, phys_offset, 1, false);
         }
+        // Protected-DMA negative proof (IOMMU milestone, slice 4): with
+        // translation on, force one out-of-domain DMA and confirm the unit
+        // faults, then that the same read succeeds once mapped. Only meaningful
+        // when translation is actually enabled.
+        if iommu::block_translation_enabled() && virtio_blk::ready(0) {
+            virtio_blk::fault_selftest(&mut serial, phys_offset, 0);
+        }
         // Every device is mapped by now (interrupt controllers in irq::init, BARs
         // and MSI-X tables in virtio_blk::init), so this count is final. It is
         // asserted in the smoke as the standing check that device registers go

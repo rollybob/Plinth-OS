@@ -53,6 +53,12 @@ const STATUS_FEATURES_OK: u8 = 8;
 /// VIRTIO_F_VERSION_1 is feature bit 32: it lives in the high feature dword
 /// (select = 1), as bit 0 there. A modern device requires it.
 const FEATURE_VERSION_1_HI_BIT: u32 = 1;
+/// VIRTIO_F_ACCESS_PLATFORM (bit 33 -> bit 1 of the high dword). When negotiated,
+/// the device issues DMA through the platform's IOMMU (translated addresses)
+/// rather than raw physical ones. QEMU offers it only when the virtio device has
+/// `iommu_platform=on`, and only then does the vIOMMU actually govern this
+/// device -- which is what makes the domain enforcement (and its faults) real.
+const FEATURE_ACCESS_PLATFORM_HI_BIT: u32 = 1 << 1;
 
 // --- virtq_desc flags ---
 const VIRTQ_DESC_F_NEXT: u16 = 1;
@@ -628,6 +634,9 @@ pub fn init<W: Write>(
     let device_cfg = base + info.device.offset as u64;
     let isr = base + info.isr.offset as u64;
 
+    // Set once feature negotiation runs: true if the device offered (and we
+    // accepted) VIRTIO_F_ACCESS_PLATFORM, i.e. its DMA goes through the IOMMU.
+    let mut access_platform = false;
     // SAFETY: `common` is the mapped common-config MMIO; the status handshake
     // and feature reads/writes below are the defined modern bring-up sequence.
     unsafe {
@@ -645,15 +654,23 @@ pub fn init<W: Write>(
         w8(common + CFG_DEVICE_STATUS, STATUS_ACK);
         w8(common + CFG_DEVICE_STATUS, STATUS_ACK | STATUS_DRIVER);
 
-        // Require VIRTIO_F_VERSION_1 (bit 32 -> bit 0 of the high dword).
+        // Require VIRTIO_F_VERSION_1 (bit 32 -> bit 0 of the high dword), and
+        // accept VIRTIO_F_ACCESS_PLATFORM (bit 33) when the device offers it, so
+        // its DMA is routed through the IOMMU (QEMU offers it under
+        // `iommu_platform=on`). No optional blk features are needed for a plain
+        // sector read.
         w32(common + CFG_DEVICE_FEATURE_SELECT, 1);
-        if r32(common + CFG_DEVICE_FEATURE) & FEATURE_VERSION_1_HI_BIT == 0 {
+        let dev_hi = r32(common + CFG_DEVICE_FEATURE);
+        if dev_hi & FEATURE_VERSION_1_HI_BIT == 0 {
             return Err("virtio-blk lacks VERSION_1");
         }
-        // Accept VERSION_1 and nothing else (no optional blk features needed
-        // for a plain sector read).
+        let mut accept_hi = FEATURE_VERSION_1_HI_BIT;
+        if dev_hi & FEATURE_ACCESS_PLATFORM_HI_BIT != 0 {
+            accept_hi |= FEATURE_ACCESS_PLATFORM_HI_BIT;
+            access_platform = true;
+        }
         w32(common + CFG_DRIVER_FEATURE_SELECT, 1);
-        w32(common + CFG_DRIVER_FEATURE, FEATURE_VERSION_1_HI_BIT);
+        w32(common + CFG_DRIVER_FEATURE, accept_hi);
         w32(common + CFG_DRIVER_FEATURE_SELECT, 0);
         w32(common + CFG_DRIVER_FEATURE, 0);
 
@@ -728,16 +745,19 @@ pub fn init<W: Write>(
         msix_vector,
     });
 
-    // Give this device's DMA an IOMMU domain: map its fixed ring + header/status
-    // frames identity and add a context entry for its source-id. Translation is
-    // turned on once (in kernel_main) after every device is prepared. On a
-    // machine with no remapping unit this reports and the block path stays
-    // untranslated (still safe -- the ring is kernel-bridged).
-    if let Err(e) = crate::iommu::block_prepare_device(
-        info.loc,
-        &[desc_phys, avail_phys, used_phys, buf_phys],
-    ) {
-        let _ = writeln!(out, "plinth: virtio-blk[{dev}] iommu prepare skipped: {e}");
+    // Give this device's DMA an IOMMU domain -- but only if it negotiated
+    // ACCESS_PLATFORM, i.e. its DMA actually goes through the IOMMU. Map its fixed
+    // ring + header/status frames identity and add a context entry for its
+    // source-id; translation is turned on once (in kernel_main) after every such
+    // device is prepared. Without ACCESS_PLATFORM (no `iommu_platform=on`, or real
+    // hardware) the device DMAs raw physical addresses and the IOMMU is left off.
+    if access_platform {
+        if let Err(e) = crate::iommu::block_prepare_device(
+            info.loc,
+            &[desc_phys, avail_phys, used_phys, buf_phys],
+        ) {
+            let _ = writeln!(out, "plinth: virtio-blk[{dev}] iommu prepare skipped: {e}");
+        }
     }
 
     let _ = writeln!(
@@ -998,4 +1018,68 @@ pub fn selftest_read<W: Write>(out: &mut W, phys_offset: u64, dev: usize, ramp: 
         }
     }
     ok
+}
+
+/// Protected-DMA proof, the negative (IOMMU milestone, slice 4): force the device
+/// to DMA into a frame its domain does NOT map, and assert the IOMMU raises a
+/// translation fault -- then prove the exact same read succeeds once the frame is
+/// mapped, so the fault is the protection and nothing else.
+///
+/// "DMA still works with the IOMMU on" (the slice-3 positive) is consistent with a
+/// domain that maps everything and protects nothing; only a watched fault proves
+/// the boundary is real. This runs at boot, after the positive selftests, on a
+/// scratch frame it allocates and frees. Recoverable: the faulting request fails
+/// in isolation and the device stays usable (confirmed by the second read).
+pub fn fault_selftest<W: Write>(out: &mut W, phys_offset: u64, dev: usize) -> bool {
+    // Clear any stale fault so what we read back is ours.
+    let _ = crate::iommu::take_fault();
+
+    // A page-aligned IOVA far above RAM (256 MiB) that no block frame maps -- the
+    // domain only maps frames actually used for DMA, all low. Using a fixed
+    // never-used address (not a reallocated scratch frame, which the add-only
+    // domain may already map from an earlier read) guarantees the access is
+    // genuinely out of domain. skip_map keeps block_map_dma from mapping it.
+    const POISON_IOVA: u64 = 0xFFFF_F000;
+
+    // Negative: send the device at the unmapped poison IOVA. The IOMMU must
+    // record a translation fault for it. (The virtqueue request may still
+    // "complete" -- QEMU writes the mapped status byte and advances the used ring
+    // even though the data DMA faulted -- so the request's own result is not the
+    // signal; the fault-recording register is.)
+    crate::iommu::arm_skip_map(true);
+    let _ = read(dev, 0, 1, POISON_IOVA);
+    crate::iommu::arm_skip_map(false);
+    let fault = crate::iommu::take_fault();
+    let faulted_here = fault.is_some_and(|(addr, _reason)| addr == POISON_IOVA);
+
+    // Positive control: a real, mapped read must succeed AND raise no fault --
+    // proving the device recovered and that the boundary, not some unrelated
+    // breakage, is what stopped the out-of-domain access.
+    let (phys, _va) = match alloc_zeroed(phys_offset) {
+        Ok(x) => x,
+        Err(e) => {
+            let _ = writeln!(out, "plinth: iommu: fault control setup: {e}");
+            return false;
+        }
+    };
+    let mapped_result = read(dev, 0, 1, phys);
+    let mapped_faulted = crate::iommu::take_fault().is_some();
+    if let Some(fa) = FRAME_ALLOC.lock().as_mut() {
+        let _ = fa.dealloc(phys);
+    }
+
+    let pass = faulted_here && mapped_result.is_ok() && !mapped_faulted;
+
+    if pass {
+        let _ = writeln!(out, "plinth: iommu: fault control: PASS");
+    } else {
+        let _ = writeln!(
+            out,
+            "plinth: iommu: fault control: FAIL (out_of_domain_faulted={} in_domain_ok={} in_domain_faulted={})",
+            faulted_here,
+            mapped_result.is_ok(),
+            mapped_faulted
+        );
+    }
+    pass
 }
