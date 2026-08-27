@@ -74,6 +74,7 @@ const USER_CRATES: &[&str] = &[
     "blkreclaim", "blkreclaimchild",
     "blkrelend", "blkrelendmid",
     "blkipclend", "blkrecvchild",
+    "bind",
     "template", "bench",
 ];
 

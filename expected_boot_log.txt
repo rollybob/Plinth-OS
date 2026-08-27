@@ -135,6 +135,12 @@ plinth: virtio-blk[1] ready (queue 0, size 64,
 plinth: virtio-blk[1] msix vector 0x31
 plinth: virtio-blk[2] ready (queue 0, size 64, capacity 2048 sectors)
 plinth: virtio-blk[2] msix vector 0x32
+# D4 (direct-binding slice 3): the notify register's page is checked against the
+# device's control structures (common-config/ISR/device-config) from the parsed
+# BAR offsets. QEMU's modern virtio-pci puts each on its own 4-KiB page, so the
+# doorbell is mappable into a library OS; a shared-page layout would force the
+# syscall fallback. Asserted so a regression to a shared page cannot pass silently.
+plinth: virtio-blk[2] bind: notify page isolated (doorbell mappable)
 
 # Protected DMA (IOMMU milestone, slice 3): every DMA-capable device now has an
 # IOMMU context entry pointing at a domain that maps exactly the frames its DMA
@@ -343,6 +349,18 @@ blk: start
 blk: read ok b0=1 b1=2 b5=6
 blk: out-of-range rejected
 plinth: blk demo: all done
+
+# Direct-binding slice 3 demo: a library OS drives the bound device's queue
+# itself. The kernel grants a BoundDevice capability; the process maps the device
+# (notify page uncached, used ring, data buffer) via bind_device, rings the
+# doorbell with a plain MMIO store, drains the used ring from its own mapping, and
+# verifies the sector-0 read the kernel pre-submitted -- no syscall on the doorbell
+# or completion path (D4 mapped doorbell + D5 libOS-drained used ring). The kernel
+# still writes the descriptor here; the library OS writes its own in slice 4.
+plinth: bind demo: 1 processes
+bind: ring 3
+bind: doorbell rung + used ring drained + sector 0 verified (libos-driven)
+plinth: bind demo: all done
 
 # Async block demo (Stage 3): depth made observable. asyncblk issues four reads
 # that overlap on the device through the libos reference futures-executor over

@@ -16,6 +16,7 @@
 //! | 14 | fb_map      | slot, va, info_ptr  | 0, or ERR                |
 //! | 15 | cap_release | slot                | 0, or ERR                |
 //! | 16 | ring_dropped| ring, user_data     | drop count, or ERR       |
+//! | 17 | bind_device | slot, va, info_ptr  | 0, or ERR                |
 //!
 //! Nr 5 (frame_free) was retired in ABI v2.8: `cap_release` generalises it to
 //! every capability kind, and a frame release is exactly what it used to do.
@@ -208,6 +209,10 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         // register/submit; owner-scoping and the subscription lookup live in
         // rings::dropped_for.
         16 => crate::rings::dropped_for(a1, a2),
+        // Direct-binding slice 3: map a bound device's doorbell + used ring + data
+        // buffer into a library OS. Non-blocking (it maps and returns), so it rides
+        // the fast syscall path.
+        17 => sys_bind_device(a1, a2, a3),
         _ => ERR,
     };
     unsafe { bkl::release() };
@@ -479,6 +484,104 @@ fn sys_fb_map(slot: u64, va: u64, info_ptr: u64) -> u64 {
         p.add(2).write_volatile(stride);
         p.add(3).write_volatile(bpp as u32);
         p.add(4).write_volatile(format as u32);
+    }
+    0
+}
+
+/// bind_device(slot, va, info_ptr): map the directly-bound device named by the
+/// capability at `slot` into the caller -- its notify register page (uncached, the
+/// doorbell) at `va`, its used ring at `va + 4096`, and a read buffer at
+/// `va + 8192` -- and write the queue size (one u32) to `info_ptr`. The kernel has
+/// pre-written a read of sector 0 into the buffer; the library OS rings the
+/// doorbell (a store to `va`), polls the used ring for the completion, and reads
+/// the buffer. Returns 0, or ERR.
+///
+/// Direct-binding slice 3 (D4/D5): the doorbell is exposed as a mapped MMIO page
+/// only because it was verified isolated from the control registers (slice 3a);
+/// the used ring drains in the library OS. The descriptor write is still the
+/// kernel's here -- the library OS writes its own in slice 4. The mapped pages name
+/// the device's own MMIO/frames, not pooled frames, so (like `fb_map`) they are
+/// not recorded in `proc.maps` and teardown frees only the page tables.
+fn sys_bind_device(slot: u64, va: u64, info_ptr: u64) -> u64 {
+    let (l4, dev) = {
+        let cur = process::current().lock();
+        let Some(proc) = cur.as_ref() else {
+            return ERR;
+        };
+        let Ok(cap) = proc.caps.lookup(slot as usize, RIGHT_MAP) else {
+            return ERR;
+        };
+        let CapObject::BoundDevice { dev } = cap.object else {
+            return ERR;
+        };
+        (proc.l4, dev as usize)
+    };
+
+    // Three contiguous user pages: notify (uncached MMIO), used ring, data buffer.
+    const PAGES: u64 = 3;
+    let span = PAGES * FRAME_SIZE;
+    if va % FRAME_SIZE != 0 || va < USER_MAP_BASE {
+        return ERR;
+    }
+    let Some(end) = va.checked_add(span) else {
+        return ERR;
+    };
+    if end > USER_MAP_END {
+        return ERR;
+    }
+    // The info destination (one u32) must be mapped user-accessible, both ends.
+    let Some(info_last) = info_ptr.checked_add(3) else {
+        return ERR;
+    };
+    if !memory::user_accessible(l4, info_ptr & !(FRAME_SIZE - 1))
+        || !memory::user_accessible(l4, info_last & !(FRAME_SIZE - 1))
+    {
+        return ERR;
+    }
+
+    // Pre-write the read descriptor and learn which pages to map (no doorbell rung).
+    let Some(bm) = crate::virtio_blk::bind_prime(dev) else {
+        return ERR;
+    };
+
+    // notify page: uncached (device MMIO); used ring + data: cacheable RAM. All
+    // writable, user-accessible, non-executable.
+    let uncached = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_CACHE
+        | PageTableFlags::NO_EXECUTE;
+    let cached = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    let maps = [
+        (va, bm.notify_page_phys, uncached),
+        (va + FRAME_SIZE, bm.used_phys, cached),
+        (va + 2 * FRAME_SIZE, bm.data_phys, cached),
+    ];
+    {
+        let mut fa_guard = FRAME_ALLOC.lock();
+        let Some(fa) = fa_guard.as_mut() else {
+            return ERR;
+        };
+        let mut done = 0usize;
+        for &(dst, phys, flags) in &maps {
+            if memory::map_user_page(l4, fa, dst, phys, flags).is_err() {
+                // Roll back the pages mapped before the failure.
+                for &(back, _, _) in &maps[..done] {
+                    memory::unmap_user_page(l4, back);
+                }
+                return ERR;
+            }
+            done += 1;
+        }
+    }
+
+    // Hand back the queue size. SAFETY: info_ptr's pages were verified above; IF is
+    // masked and the CPU is single, so nothing unmaps them under us.
+    unsafe {
+        core::ptr::write_volatile(info_ptr as *mut u32, bm.qsize as u32);
     }
     0
 }

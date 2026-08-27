@@ -138,6 +138,11 @@ pub const EVENT_SOURCE_SLOT: u64 = 1;
 /// to sys_fb_map (or libgfx's Framebuffer::map).
 pub const FB_SLOT: u64 = 1;
 
+/// A BoundDevice capability the kernel grants a scheduler-launched library OS
+/// lands here too -- the same first-grant slot as the others. Pass it to
+/// sys_bind_device (direct-binding slice 3).
+pub const BIND_SLOT: u64 = 1;
+
 /// Pixel-format codes the kernel writes into the FbInfo `format` field at
 /// sys_fb_map time (mirrors the kernel's framebuffer.rs FMT_*). A graphics
 /// library OS uses these to pick the channel order; the kernel never touches a
@@ -264,6 +269,19 @@ pub fn sys_frame_free(slot: u64) -> u64 {
 #[inline]
 pub fn sys_fb_map(slot: u64, va: u64, info_ptr: u64) -> u64 {
     syscall3(14, slot, va, info_ptr)
+}
+
+/// Map the directly-bound device named by the capability at `slot` into this
+/// address space (direct-binding slice 3): its notify register page (uncached, the
+/// doorbell) at `va`, its used ring at `va + 4096`, and a read buffer at
+/// `va + 8192`. The kernel writes the queue size (one u32) to `info_ptr` and has
+/// pre-written a read of sector 0 into the buffer. The caller then rings the
+/// doorbell (a store to `va`), polls the used ring for the completion, and reads
+/// the buffer. Returns 0, or SYS_ERR (bad slot, not a BoundDevice capability,
+/// missing RIGHT_MAP, or `va` out of range).
+#[inline]
+pub fn sys_bind_device(slot: u64, va: u64, info_ptr: u64) -> u64 {
+    syscall3(17, slot, va, info_ptr)
 }
 
 /// Charge `amount` CPU ticks against the CpuTime capability at `slot`

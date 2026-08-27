@@ -655,6 +655,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_blk} frames free after blk");
         }
 
+        // Direct-binding slice 3 demo: hand the bound device to a library OS that
+        // drives its queue itself. The kernel grants a BoundDevice capability; the
+        // process maps the device's doorbell (uncached MMIO), used ring, and data
+        // buffer via bind_device, rings the doorbell with a plain store, drains the
+        // used ring from its own mapping, and verifies the read the kernel
+        // pre-submitted -- no syscall on the doorbell or completion path. The kernel
+        // still writes the descriptor here (slice 4 moves that into the library OS).
+        if let Some(bd) = bound_dev {
+            if virtio_blk::ready(bd) {
+                const BIND_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bind-user"));
+                let bound_cap = Capability {
+                    object: CapObject::BoundDevice { dev: bd as u8 },
+                    rights: capability::RIGHT_MAP,
+                    origin: None,
+                };
+                scheduler::run("bind demo", &[BIND_BIN], phys_offset, &[Some(bound_cap)]);
+            }
+        }
+
         // Async block demo (Stage 3): depth made observable. The kernel grants a
         // BlockRange over device 0 sectors [0, 4); asyncblk issues four reads
         // that overlap on the device through the libos reference executor (a

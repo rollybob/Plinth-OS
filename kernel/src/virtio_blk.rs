@@ -274,12 +274,31 @@ struct VirtioBlk {
     /// `irq::apic_mode()`, with a MADT-supplied LAPIC to target). `None` means
     /// this device is on the INTx fallback (`intr_line` instead).
     msix_vector: Option<u8>,
-    /// `Some(buf_iova)` when this device is directly bound (direct-binding slice
-    /// 2): it has its own non-identity IOMMU domain, so the request path addresses
-    /// it with IOVAs, and its header/status buffer lives at `buf_iova` in that
-    /// domain. `None` for a kernel-bridged device -- it is handed physical
-    /// addresses, which its shared identity domain maps to themselves.
-    bound_buf_iova: Option<u64>,
+    /// `Some` when this device is directly bound (direct-binding slices 2-3): it
+    /// has its own non-identity IOMMU domain, so the request path addresses it with
+    /// IOVAs, plus the state `bind_device` maps into a library OS. `None` for a
+    /// kernel-bridged device -- handed physical addresses its shared identity
+    /// domain maps to themselves.
+    bound: Option<Bound>,
+}
+
+/// Extra state for a directly-bound device (direct-binding slices 2-3): what the
+/// request path (slice 2) and `bind_device` (slice 3) need beyond the fields a
+/// kernel-bridged device uses.
+struct Bound {
+    /// The header/status buffer's IOVA in the device's own domain, so the request
+    /// path addresses the device with IOVAs rather than physical addresses.
+    buf_iova: u64,
+    /// Physical page of the queue-0 notify register (isolated per D4), mapped
+    /// uncached into a library OS as its doorbell.
+    notify_page_phys: u64,
+    /// The used-ring frame, mapped into a library OS so it drains completions.
+    used_phys: u64,
+    /// A data buffer the bound read lands in, mapped both into the device's domain
+    /// (at `data_iova`, the device-visible address) and into a library OS (to read
+    /// the result). Kernel-owned; the library OS only reads it.
+    data_phys: u64,
+    data_iova: u64,
 }
 
 /// One slot per virtio-blk device the kernel tracks (pci::MAX_DEVICES). A
@@ -382,6 +401,7 @@ impl VirtioBlk {
         data_dev_addr: u64,
         want_interrupt: bool,
         dir: Direction,
+        notify: bool,
     ) {
         let slot = (head / DESC_PER_REQ) as usize;
         // The addresses the DEVICE is given for this request. For a kernel-bridged
@@ -392,7 +412,7 @@ impl VirtioBlk {
         // and passes its IOVA as `data_dev_addr`. The kernel-side content writes
         // below still go through `hdr_va`/`status_va` (the kernel's own mapping),
         // unchanged either way; only the descriptor address fields differ.
-        let (hdr_addr, status_addr) = match self.bound_buf_iova {
+        let (hdr_addr, status_addr) = match self.bound.as_ref().map(|b| b.buf_iova) {
             Some(buf_iova) => (
                 buf_iova + slot as u64 * HDR_BYTES,
                 buf_iova + STATUS_REGION_OFF + slot as u64,
@@ -460,10 +480,14 @@ impl VirtioBlk {
             w16(self.avail_va + 2, avail_idx.wrapping_add(1));
             fence(Ordering::SeqCst);
 
-            // Notify queue 0.
-            let notify_addr =
-                self.notify + (self.queue_notify_off as u64) * (self.notify_mult as u64);
-            w16(notify_addr, 0);
+            // Notify queue 0 -- unless the caller will ring the doorbell itself
+            // (direct-binding slice 3: the library OS rings via its mapped notify
+            // page; the kernel only writes the descriptor).
+            if notify {
+                let notify_addr =
+                    self.notify + (self.queue_notify_off as u64) * (self.notify_mult as u64);
+                w16(notify_addr, 0);
+            }
         }
     }
 
@@ -538,7 +562,7 @@ impl VirtioBlk {
             .inflights
             .submit(Inflight { target: Completion::Poll })
             .ok_or("virtio-blk free pool exhausted")?;
-        self.post_request(head, sector, count, data_phys, false, Direction::Read);
+        self.post_request(head, sector, count, data_phys, false, Direction::Read, true);
         let mut spins = 0u64;
         // SAFETY: used_va is the mapped used ring; reading idx@2 is a read.
         while unsafe { r16(self.used_va + 2) } == self.last_used {
@@ -559,6 +583,30 @@ impl VirtioBlk {
             Err("virtio-blk read failed (device status)")
         }
     }
+}
+
+/// D4 (direct_binding.md): is the queue-0 notify register's 4-KiB page free of the
+/// device's control structures (common-config, ISR, device-config)? Only then may
+/// the kernel map that page into a library OS so it rings the doorbell with a plain
+/// store; otherwise mapping it would also hand the libOS device control (reset,
+/// feature negotiation, queue programming), so the doorbell must stay a syscall.
+///
+/// Computed from the parsed BAR offsets, NOT assumed from QEMU's page-separated
+/// modern-virtio layout: real hardware need not separate them (real_hardware.md
+/// D2, and the slice-4 vacuousness are the standing "do not trust a convenient
+/// property" lessons), so slice 3b maps only when this actually holds.
+fn notify_page_isolated(info: &VirtioBlkInfo, queue_notify_off: u16) -> bool {
+    const PAGE: u32 = 4096;
+    // The queue-0 notify register's offset within the BAR, and the page holding it.
+    let notify_addr = info.notify.offset + (queue_notify_off as u32) * info.notify_mult;
+    let notify_page = notify_addr & !(PAGE - 1);
+    // A control structure [off, off+len) shares the notify page [p, p+PAGE) iff it
+    // has any byte in that range. All four structures share one BAR (init rejects
+    // otherwise), so the BAR check is a belt-and-braces guard.
+    let shares = |c: pci::VirtioCfg| {
+        c.bar == info.notify.bar && c.offset < notify_page + PAGE && c.offset + c.length > notify_page
+    };
+    !(shares(info.common) || shares(info.isr) || shares(info.device))
 }
 
 /// The span of a BAR we must map to cover all four virtio structures (the
@@ -777,6 +825,23 @@ pub fn init<W: Write>(
     // MAX_SLOTS*HDR_BYTES + MAX_SLOTS bytes, well under a 4 KiB frame).
     let slots = (qsize / DESC_PER_REQ) as usize;
 
+    // For a directly-bound device, finish its state: a data buffer mapped into the
+    // device's own domain (translation is not yet enabled, so no invalidation),
+    // and the physical addresses `bind_device` (slice 3) maps into a library OS --
+    // the queue-0 notify register's page (D4-isolated) for the doorbell, and the
+    // used-ring frame for completions.
+    let bound = if let Some(buf_iova) = bound_buf_iova {
+        let (data_phys, _data_va) = alloc_zeroed(phys_offset)?;
+        let data_iova = crate::iommu::bind_map_dma(data_phys)?;
+        let notify_reg = bar_phys
+            + info.notify.offset as u64
+            + (queue_notify_off as u64) * (info.notify_mult as u64);
+        let notify_page_phys = notify_reg & !(FRAME_SIZE - 1);
+        Some(Bound { buf_iova, notify_page_phys, used_phys, data_phys, data_iova })
+    } else {
+        None
+    };
+
     *DEVICES[dev].lock() = Some(VirtioBlk {
         notify,
         notify_mult: info.notify_mult,
@@ -793,7 +858,7 @@ pub fn init<W: Write>(
         isr_va: isr,
         intr_line: info.intr_line,
         msix_vector,
-        bound_buf_iova,
+        bound,
     });
 
     // Give this device's DMA an IOMMU domain -- but only if it negotiated
@@ -825,6 +890,19 @@ pub fn init<W: Write>(
         None => {
             let _ = writeln!(out, "plinth: virtio-blk[{dev}] msix unavailable, using INTx");
         }
+    }
+    // D4 (direct-binding slice 3): decide, from the parsed layout, whether the
+    // doorbell can be a mapped store in the library OS or must stay a syscall.
+    // Asserted so a regression to a shared-page layout (where mapping notify would
+    // leak device control) cannot pass silently. Slice 3b acts on this result.
+    if bind {
+        let isolated = notify_page_isolated(info, queue_notify_off);
+        let _ = writeln!(
+            out,
+            "plinth: virtio-blk[{dev}] bind: notify page {} (doorbell {})",
+            if isolated { "isolated" } else { "shares control registers" },
+            if isolated { "mappable" } else { "via syscall" }
+        );
     }
     Ok(())
 }
@@ -884,7 +962,7 @@ pub(crate) fn ring_post(
         .inflights
         .submit(Inflight { target: Completion::Ring { ring, user_data } })
         .ok_or(())?;
-    d.post_request(head, abs_sector, count, frame_phys, true, dir);
+    d.post_request(head, abs_sector, count, frame_phys, true, dir, true);
     Ok(())
 }
 
@@ -1150,6 +1228,39 @@ pub fn bind_selftest_read<W: Write>(out: &mut W, phys_offset: u64, dev: usize) -
         }
     }
     ok
+}
+
+/// What `bind_device` (direct-binding slice 3) maps into a library OS, plus the
+/// queue size. The physical pages: the queue-0 notify register's page (mapped
+/// uncached -- the doorbell), the used-ring frame, and the read buffer.
+pub struct BoundMap {
+    pub notify_page_phys: u64,
+    pub used_phys: u64,
+    pub data_phys: u64,
+    pub qsize: u16,
+}
+
+/// Slice 3: prime the bound device `dev` for a library OS to drive. The kernel
+/// writes a read descriptor for sector 0 into the device's data buffer and
+/// publishes it in the avail ring, but does NOT ring the doorbell -- the library
+/// OS rings it via the mapped notify page, then drains the used ring itself.
+/// Returns the physical pages `bind_device` maps and the queue size, or `None` if
+/// `dev` is not a bound device or its slot pool is exhausted.
+pub fn bind_prime(dev: usize) -> Option<BoundMap> {
+    let mut g = DEVICES.get(dev)?.lock();
+    let d = g.as_mut()?;
+    let (notify_page_phys, used_phys, data_phys, data_iova) = {
+        let b = d.bound.as_ref()?;
+        (b.notify_page_phys, b.used_phys, b.data_phys, b.data_iova)
+    };
+    let qsize = d.qsize;
+    // Write the read descriptor for sector 0 at chain head 0 -- no doorbell. The
+    // library OS owns the completion demux (it reads the used ring itself, D5), so
+    // the kernel does NOT claim an `inflights` slot: a phantom in-flight slot the
+    // kernel never drains would leave the scheduler idling on a disk waiter that
+    // never completes.
+    d.post_request(0, 0, 1, data_iova, false, Direction::Read, false);
+    Some(BoundMap { notify_page_phys, used_phys, data_phys, qsize })
 }
 
 /// Protected-DMA proof, the negative (IOMMU milestone, slice 4): force the device

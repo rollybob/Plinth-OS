@@ -125,6 +125,15 @@ pub enum CapObject {
         bytes_per_pixel: u8,
         format: u8,
     },
+    /// A directly-bound virtio-blk device (`dev` selects it), direct-binding
+    /// slice 3. `RIGHT_MAP` gates `bind_device`, which maps the device's notify
+    /// MMIO page (uncached), its used ring, and a data buffer into the holder's
+    /// address space so a library OS rings the doorbell and drains completions
+    /// itself. Pure inline data naming the device, like `EventSource`; the mapped
+    /// pages name the device's own frames/MMIO, not pooled resources, so teardown
+    /// just drops the slot (the mappings die with the address space) -- v1 grants
+    /// one bound device to one holder, so no reference count.
+    BoundDevice { dev: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,7 +443,8 @@ pub fn release_action(cap: &Capability) -> ReleaseAction {
         // forfeit rather than returned -- CPU time is not poolable.
         CapObject::CpuTime { .. }
         | CapObject::BlockRange { .. }
-        | CapObject::EventSource { .. } => ReleaseAction::DropSlot,
+        | CapObject::EventSource { .. }
+        | CapObject::BoundDevice { .. } => ReleaseAction::DropSlot,
     }
 }
 

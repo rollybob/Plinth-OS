@@ -24,6 +24,7 @@ const USER_BINARIES: &[&str] = &[
     "blkreclaim", "blkreclaimchild",
     "blkrelend", "blkrelendmid",
     "blkipclend", "blkrecvchild",
+    "bind",
 ];
 
 // Embedded only by the `bench` build (`cargo xtask bench`), matching the
