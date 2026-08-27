@@ -14,7 +14,7 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
-use libplinth::{sys_bind_device, sys_exit, sys_write, BIND_SLOT, MAP_BASE};
+use libplinth::{sys_bind_device, sys_cap_release, sys_exit, sys_write, BIND_SLOT, MAP_BASE};
 
 /// The 6-page window bind_device maps into us.
 const BASE: u64 = MAP_BASE + 0x8000;
@@ -149,6 +149,14 @@ pub extern "C" fn _start() -> ! {
         }
     }
     sys_write(b"bind: out-of-domain read confined (libos named an unmapped iova)\n");
+
+    // Release the binding explicitly (direct-binding slice 5, D7/I11): dropping the
+    // BoundDevice capability IS its teardown -- the kernel resets the device, frees
+    // its domain and buffers, and returns it to the unbound pool.
+    if sys_cap_release(BIND_SLOT) != 0 {
+        fail(b"bind: cap_release failed\n");
+    }
+    sys_write(b"bind: released the device (binding torn down)\n");
 
     sys_exit(0)
 }

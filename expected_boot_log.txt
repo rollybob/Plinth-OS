@@ -364,8 +364,15 @@ plinth: bind demo: 1 processes
 bind: ring 3
 bind: libos wrote its own descriptor, sector 0 read verified
 bind: out-of-domain read confined (libos named an unmapped iova)
+# Slice 5 (D7/I11): the library OS releases its BoundDevice capability, which IS
+# the binding's teardown -- the kernel resets the device to quiesce DMA, frees its
+# non-identity domain and buffers, clears its context entry, and returns it to the
+# unbound pool. The reclaim line below (frame counts vary, asserted as a prefix)
+# is the proof the binding's frames came home rather than leaking to reboot.
+bind: released the device (binding torn down)
 plinth: bind demo: all done
 plinth: iommu: bind fault control: PASS
+plinth: bind teardown: binding reclaimed on release
 
 # Async block demo (Stage 3): depth made observable. asyncblk issues four reads
 # that overlap on the device through the libos reference futures-executor over

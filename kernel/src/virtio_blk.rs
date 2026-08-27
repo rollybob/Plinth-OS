@@ -237,6 +237,10 @@ impl Inflights {
 /// the device DMAs to/from) as plain integers, so the struct is `Send` and can
 /// live in a static behind a spinlock.
 struct VirtioBlk {
+    /// MMIO virtual address of the common-config structure. The I/O path never
+    /// touches it after bring-up, but unbind (direct-binding slice 5) resets the
+    /// device through it to quiesce DMA before tearing the binding down.
+    common: u64,
     /// MMIO virtual address of the notify structure (the only register the I/O
     /// path touches after bring-up).
     notify: u64,
@@ -858,6 +862,7 @@ pub fn init<W: Write>(
     };
 
     *DEVICES[dev].lock() = Some(VirtioBlk {
+        common,
         notify,
         notify_mult: info.notify_mult,
         queue_notify_off,
@@ -1284,6 +1289,48 @@ pub fn bind_info(dev: usize) -> Option<BoundMap> {
         buf_iova: b.buf_iova,
         qsize: d.qsize,
     })
+}
+
+/// Tear down device `dev`'s direct binding (direct-binding slice 5, D7/I11): reset
+/// the device to quiesce all DMA, free the frames the binding owns (the virtqueue
+/// rings, the header/status buffer, and the data buffer), and free its non-identity
+/// IOMMU domain. A no-op if `dev` is not bound. Reached from the BoundDevice
+/// capability's release.
+///
+/// The caller must NOT hold FRAME_ALLOC (this takes it), so it runs from
+/// cap_release, not process teardown. Locks are taken in the established order:
+/// DEVICES -> FRAME_ALLOC, then BLOCK_IOMMU -> FRAME_ALLOC (via bind_teardown),
+/// never nested the other way.
+pub fn unbind(dev: usize) {
+    let frames: [u64; 5] = {
+        let Some(m) = DEVICES.get(dev) else { return };
+        let mut g = m.lock();
+        // Only a bound device unbinds; an empty slot or a kernel-bridged device is
+        // left untouched.
+        if g.as_ref().map_or(true, |d| d.bound.is_none()) {
+            return;
+        }
+        // Take the record out (the device is going away) and reset it, so no queue
+        // can DMA before we free its frames (D7: quiesce before unmap).
+        let d = g.take().unwrap();
+        // SAFETY: `common` is the mapped common-config MMIO from init; writing 0 to
+        // the device-status register is the virtio-defined device reset.
+        unsafe { w8(d.common + CFG_DEVICE_STATUS, 0) };
+        let b = d.bound.unwrap();
+        [b.desc_phys, b.avail_phys, b.used_phys, b.buf_phys, b.data_phys]
+    };
+    {
+        let mut fg = FRAME_ALLOC.lock();
+        if let Some(fa) = fg.as_mut() {
+            for f in frames {
+                let _ = fa.dealloc(f);
+            }
+        }
+    }
+    // Free the non-identity domain's table frames and clear the context entry. The
+    // device's BAR MMIO mapping stays mapped, as kernel MMIO always does (like fb
+    // pages) -- it is never returned to the frame allocator.
+    crate::iommu::bind_teardown();
 }
 
 /// Protected-DMA proof, the negative (IOMMU milestone, slice 4): force the device

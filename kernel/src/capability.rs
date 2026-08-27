@@ -313,6 +313,12 @@ pub enum ReleaseAction {
     ReclaimTo { origin: Origin },
     /// Nothing pooled: emptying the slot is the whole of the release.
     DropSlot,
+    /// Tear down a directly-bound device (direct-binding slice 5, D7/I11): quiesce
+    /// its queue, free its non-identity IOMMU domain and data buffer, invalidate,
+    /// and return the device to the unbound pool. The binding is a lent resource
+    /// whose fate on release is reclamation, like any other -- reached here through
+    /// the shared release path rather than a bespoke teardown.
+    UnbindDevice { dev: u8 },
     /// Not releasable on request. Only `Reply`: it names a caller that is
     /// Blocked-awaiting-reply, and dropping it would strand that caller
     /// forever. A live process must reply; a dying one is handled earlier by
@@ -443,8 +449,10 @@ pub fn release_action(cap: &Capability) -> ReleaseAction {
         // forfeit rather than returned -- CPU time is not poolable.
         CapObject::CpuTime { .. }
         | CapObject::BlockRange { .. }
-        | CapObject::EventSource { .. }
-        | CapObject::BoundDevice { .. } => ReleaseAction::DropSlot,
+        | CapObject::EventSource { .. } => ReleaseAction::DropSlot,
+        // A bound device's release is its teardown (D7/I11): the binding owns a
+        // domain + data buffer to reclaim, unlike the pure-inline kinds above.
+        CapObject::BoundDevice { dev } => ReleaseAction::UnbindDevice { dev },
     }
 }
 

@@ -671,6 +671,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     rights: capability::RIGHT_MAP,
                     origin: None,
                 };
+                let before_bind = free_frames();
                 scheduler::run("bind demo", &[BIND_BIN], phys_offset, &[Some(bound_cap)]);
                 // Confirm the IOMMU faulted on the IOVA the library OS named that
                 // its domain does not map -- the slice-4 protected-DMA proof
@@ -687,6 +688,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     None => {
                         let _ = writeln!(serial, "plinth: iommu: bind fault control: no fault");
                     }
+                }
+                // Teardown proof (slice 5, D7/I11): the demo released its
+                // BoundDevice capability, which reset the device and freed the
+                // binding's domain + ring/data frames. Those frames were held since
+                // bring-up, so more are free now than before the demo ran -- the
+                // binding came home on release rather than leaking to reboot.
+                let after_bind = free_frames();
+                if after_bind > before_bind {
+                    let _ = writeln!(
+                        serial,
+                        "plinth: bind teardown: binding reclaimed on release ({before_bind} -> {after_bind} frames)"
+                    );
+                } else {
+                    let _ = writeln!(
+                        serial,
+                        "plinth: bind teardown: NO reclamation ({before_bind} -> {after_bind})"
+                    );
                 }
             }
         }

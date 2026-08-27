@@ -450,6 +450,21 @@ impl TranslationTables {
         }
     }
 
+    /// Clear the context entry for `dev:func`, making the source-id absent. Used
+    /// by slice-5 teardown to stop the unit routing a bound device once its domain
+    /// is freed; an access from a now-absent source-id faults rather than walking a
+    /// freed page table.
+    pub fn clear_device(&mut self, dev: u8, func: u8) {
+        let devfn = ((dev as usize & 0x1f) << 3) | (func as usize & 0x7);
+        // SAFETY: ctx_phys is our context table frame; devfn < 256, so the two-u64
+        // entry is in the 512-u64 frame.
+        unsafe {
+            let ctx = &mut *table_at(self.ctx_phys);
+            ctx[2 * devfn] = 0;
+            ctx[2 * devfn + 1] = 0;
+        }
+    }
+
     /// The root-table physical address, for slice 3b to program into RTADDR.
     pub fn root_phys(&self) -> u64 {
         self.root_phys
@@ -579,6 +594,9 @@ struct BlockIommu {
 struct BoundDomain {
     domain: Domain,
     iova: IovaAllocator,
+    /// The bound device's PCI location, so teardown (slice 5) can clear its
+    /// context entry in the shared per-unit tables.
+    loc: pci::Location,
 }
 
 /// Domain id for the bound device, distinct from `BLOCK_DID` so the unit keeps
@@ -1060,7 +1078,7 @@ pub fn bind_prepare(loc: pci::Location, fixed_frames: &[u64]) -> Result<[u64; 4]
                 .map_buffer(fa, &mut iova, page, IOMMU_READ | IOMMU_WRITE)
                 .map_err(|_| "mapping a bound fixed frame failed")?;
         }
-        BoundDomain { domain, iova }
+        BoundDomain { domain, iova, loc }
     };
     // Context entry -> the bound domain, with the distinct bound domain id.
     // Present before block_enable turns translation on for the whole unit.
@@ -1097,4 +1115,35 @@ pub fn bind_map_dma(data_phys: u64) -> Result<u64, &'static str> {
         unsafe { invalidate_all(regs, iotlb_off) };
     }
     Ok(iova)
+}
+
+/// Tear down the bound device's binding (direct-binding slice 5, D7): clear its
+/// context entry so the source-id stops routing, free its non-identity domain's
+/// table frames, and invalidate the unit so no stale translation survives. The
+/// caller (`virtio_blk::unbind`) has already reset the device (quiesced its DMA)
+/// and freed the mapped ring/data frames, which are the device's, not the domain's.
+/// A no-op if nothing is bound. The caller must NOT hold FRAME_ALLOC (this takes
+/// it), which is why teardown is driven from cap_release, not process teardown.
+pub fn bind_teardown() {
+    let mut g = BLOCK_IOMMU.lock();
+    let Some(bi) = g.as_mut() else { return };
+    let regs = bi.regs_va;
+    let iotlb_off = bi.iotlb_off;
+    let enabled = bi.enabled;
+    let Some(mut bound) = bi.bound.take() else { return };
+    // Stop routing the source-id before freeing the page tables it points at: an
+    // access from a now-absent device faults instead of walking freed memory.
+    bi.tables.clear_device(bound.loc.slot, bound.loc.func);
+    {
+        let mut fg = FRAME_ALLOC.lock();
+        if let Some(fa) = fg.as_mut() {
+            bound.domain.teardown(fa);
+        }
+    }
+    // Drop the unit's cached context/IOTLB state so the cleared entry and freed
+    // domain leave nothing stale behind.
+    if enabled {
+        // SAFETY: regs/iotlb_off are the mapped registers of the shared unit.
+        unsafe { invalidate_all(regs, iotlb_off) };
+    }
 }

@@ -584,6 +584,17 @@ pub fn teardown(mut proc: Process, boot_frames: &[Option<(u64, u64)>]) {
             // Nothing pooled: a CpuTime budget (spent or not) has nothing to
             // return, and the inline kinds name no allocation.
             crate::capability::ReleaseAction::DropSlot => {}
+            // A directly-bound device (direct-binding slice 5): the binding's
+            // teardown quiesces a device and frees its domain, which needs
+            // FRAME_ALLOC and the device/IOMMU locks -- but teardown holds
+            // FRAME_ALLOC across this whole drain, so reclaiming here would
+            // re-lock it (a deadlock) or invert the DEVICES/BLOCK_IOMMU ->
+            // FRAME_ALLOC order. So a bound holder releases its device explicitly
+            // via cap_release (which does not pre-hold FRAME_ALLOC); a holder that
+            // dies WITHOUT releasing leaks its one binding until reboot -- a v1
+            // limitation, acceptable because a bound device is granted to a single
+            // library OS that unbinds in its normal teardown.
+            crate::capability::ReleaseAction::UnbindDevice { .. } => {}
             // `Refuse` exists to stop a *live* process stranding a caller by
             // releasing an unconsumed Reply. At death that caller has already
             // been woken with IPC_PEER_DIED by `ipc::reap_dying`, which runs

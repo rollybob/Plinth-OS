@@ -705,6 +705,14 @@ fn sys_cap_release(slot: u64) -> u64 {
             // D4 fallback a death takes, identical to the old drop for those cases.
             let _ = scheduler::reclaim_cap_home(&cap, origin, home);
         }
+        // Tear down the binding (direct-binding slice 5, D7/I11): quiesce the
+        // device, free its non-identity domain and data buffer, and return it to
+        // the unbound pool. cap_release does not pre-hold FRAME_ALLOC (unlike
+        // process teardown), so `unbind` takes its locks in the normal
+        // DEVICES -> FRAME_ALLOC and BLOCK_IOMMU -> FRAME_ALLOC order.
+        capability::ReleaseAction::UnbindDevice { dev } => {
+            crate::virtio_blk::unbind(dev as usize);
+        }
         // Nothing pooled.
         capability::ReleaseAction::DropSlot => {}
         capability::ReleaseAction::Refuse => unreachable!("refused above"),
