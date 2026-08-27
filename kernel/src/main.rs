@@ -655,13 +655,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_blk} frames free after blk");
         }
 
-        // Direct-binding slice 3 demo: hand the bound device to a library OS that
-        // drives its queue itself. The kernel grants a BoundDevice capability; the
-        // process maps the device's doorbell (uncached MMIO), used ring, and data
-        // buffer via bind_device, rings the doorbell with a plain store, drains the
-        // used ring from its own mapping, and verifies the read the kernel
-        // pre-submitted -- no syscall on the doorbell or completion path. The kernel
-        // still writes the descriptor here (slice 4 moves that into the library OS).
+        // Direct-binding slice 4 demo: hand the bound device to a library OS that
+        // drives its queue itself, kernel off the submit path. The kernel grants a
+        // BoundDevice capability; the process maps the device's doorbell (uncached
+        // MMIO), the desc/avail/used rings, and its buffers via bind_device, then
+        // WRITES ITS OWN descriptor chain naming buffer IOVAs, publishes it, rings
+        // the doorbell, drains the used ring, and verifies the read -- no kernel
+        // entry on the submit or completion path. It then names an unmapped IOVA to
+        // show the IOMMU confines a library-OS-written descriptor.
         if let Some(bd) = bound_dev {
             if virtio_blk::ready(bd) {
                 const BIND_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bind-user"));
@@ -671,6 +672,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     origin: None,
                 };
                 scheduler::run("bind demo", &[BIND_BIN], phys_offset, &[Some(bound_cap)]);
+                // Confirm the IOMMU faulted on the IOVA the library OS named that
+                // its domain does not map -- the slice-4 protected-DMA proof
+                // generalized to a directly-bound device whose descriptors the
+                // library OS wrote itself. The demo's own signal is that the data
+                // never arrived; this is the hardware fault behind it.
+                match iommu::take_fault() {
+                    Some((addr, _)) => {
+                        let _ = writeln!(
+                            serial,
+                            "plinth: iommu: bind fault control: PASS (fault at 0x{addr:x})"
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(serial, "plinth: iommu: bind fault control: no fault");
+                    }
+                }
             }
         }
 

@@ -286,17 +286,25 @@ struct VirtioBlk {
 /// request path (slice 2) and `bind_device` (slice 3) need beyond the fields a
 /// kernel-bridged device uses.
 struct Bound {
-    /// The header/status buffer's IOVA in the device's own domain, so the request
-    /// path addresses the device with IOVAs rather than physical addresses.
+    /// The header/status buffer's IOVA in the device's own domain. Used by the
+    /// slice-2 request path to address the device, and handed to a library OS in
+    /// slice 4 so it names the header/status buffer in the descriptors it writes.
     buf_iova: u64,
     /// Physical page of the queue-0 notify register (isolated per D4), mapped
-    /// uncached into a library OS as its doorbell.
+    /// uncached into a library OS as its doorbell (slice 3).
     notify_page_phys: u64,
-    /// The used-ring frame, mapped into a library OS so it drains completions.
+    /// The virtqueue ring frames + the header/status buffer, mapped into a library
+    /// OS (slice 4) so it writes its own descriptors (`desc`), publishes them
+    /// (`avail`), and drains completions (`used`); `buf` holds the request header
+    /// and status byte it names.
+    desc_phys: u64,
+    avail_phys: u64,
     used_phys: u64,
-    /// A data buffer the bound read lands in, mapped both into the device's domain
-    /// (at `data_iova`, the device-visible address) and into a library OS (to read
-    /// the result). Kernel-owned; the library OS only reads it.
+    buf_phys: u64,
+    /// A data buffer the read lands in, mapped both into the device's domain (at
+    /// `data_iova`, the device-visible address the library OS names) and into a
+    /// library OS (to read the result). Kernel-owned; the library OS reads it and,
+    /// in slice 4, names `data_iova` in its data descriptor.
     data_phys: u64,
     data_iova: u64,
 }
@@ -401,7 +409,6 @@ impl VirtioBlk {
         data_dev_addr: u64,
         want_interrupt: bool,
         dir: Direction,
-        notify: bool,
     ) {
         let slot = (head / DESC_PER_REQ) as usize;
         // The addresses the DEVICE is given for this request. For a kernel-bridged
@@ -480,14 +487,13 @@ impl VirtioBlk {
             w16(self.avail_va + 2, avail_idx.wrapping_add(1));
             fence(Ordering::SeqCst);
 
-            // Notify queue 0 -- unless the caller will ring the doorbell itself
-            // (direct-binding slice 3: the library OS rings via its mapped notify
-            // page; the kernel only writes the descriptor).
-            if notify {
-                let notify_addr =
-                    self.notify + (self.queue_notify_off as u64) * (self.notify_mult as u64);
-                w16(notify_addr, 0);
-            }
+            // Notify queue 0. (A directly-bound device's library OS rings its own
+            // doorbell via a mapped notify page -- slice 4 -- so the kernel-side
+            // request path here is the kernel-bridged devices and the slice-2
+            // bound selftest, all of which do want the kernel to ring.)
+            let notify_addr =
+                self.notify + (self.queue_notify_off as u64) * (self.notify_mult as u64);
+            w16(notify_addr, 0);
         }
     }
 
@@ -562,7 +568,7 @@ impl VirtioBlk {
             .inflights
             .submit(Inflight { target: Completion::Poll })
             .ok_or("virtio-blk free pool exhausted")?;
-        self.post_request(head, sector, count, data_phys, false, Direction::Read, true);
+        self.post_request(head, sector, count, data_phys, false, Direction::Read);
         let mut spins = 0u64;
         // SAFETY: used_va is the mapped used ring; reading idx@2 is a read.
         while unsafe { r16(self.used_va + 2) } == self.last_used {
@@ -837,7 +843,16 @@ pub fn init<W: Write>(
             + info.notify.offset as u64
             + (queue_notify_off as u64) * (info.notify_mult as u64);
         let notify_page_phys = notify_reg & !(FRAME_SIZE - 1);
-        Some(Bound { buf_iova, notify_page_phys, used_phys, data_phys, data_iova })
+        Some(Bound {
+            buf_iova,
+            notify_page_phys,
+            desc_phys,
+            avail_phys,
+            used_phys,
+            buf_phys,
+            data_phys,
+            data_iova,
+        })
     } else {
         None
     };
@@ -962,7 +977,7 @@ pub(crate) fn ring_post(
         .inflights
         .submit(Inflight { target: Completion::Ring { ring, user_data } })
         .ok_or(())?;
-    d.post_request(head, abs_sector, count, frame_phys, true, dir, true);
+    d.post_request(head, abs_sector, count, frame_phys, true, dir);
     Ok(())
 }
 
@@ -1230,37 +1245,45 @@ pub fn bind_selftest_read<W: Write>(out: &mut W, phys_offset: u64, dev: usize) -
     ok
 }
 
-/// What `bind_device` (direct-binding slice 3) maps into a library OS, plus the
-/// queue size. The physical pages: the queue-0 notify register's page (mapped
-/// uncached -- the doorbell), the used-ring frame, and the read buffer.
+/// What `bind_device` maps into a library OS and the IOVAs it names in the
+/// descriptors it writes (direct-binding slice 4). The physical pages mapped: the
+/// notify register page (uncached -- the doorbell), the virtqueue desc/avail/used
+/// rings, the header/status buffer, and the data buffer. The IOVAs the library OS
+/// puts in its descriptors: `data_iova` for the data, `buf_iova` for the header
+/// and status (it picks non-overlapping sub-offsets within the buffer page).
 pub struct BoundMap {
     pub notify_page_phys: u64,
+    pub desc_phys: u64,
+    pub avail_phys: u64,
     pub used_phys: u64,
+    pub buf_phys: u64,
     pub data_phys: u64,
+    pub data_iova: u64,
+    pub buf_iova: u64,
     pub qsize: u16,
 }
 
-/// Slice 3: prime the bound device `dev` for a library OS to drive. The kernel
-/// writes a read descriptor for sector 0 into the device's data buffer and
-/// publishes it in the avail ring, but does NOT ring the doorbell -- the library
-/// OS rings it via the mapped notify page, then drains the used ring itself.
-/// Returns the physical pages `bind_device` maps and the queue size, or `None` if
-/// `dev` is not a bound device or its slot pool is exhausted.
-pub fn bind_prime(dev: usize) -> Option<BoundMap> {
-    let mut g = DEVICES.get(dev)?.lock();
-    let d = g.as_mut()?;
-    let (notify_page_phys, used_phys, data_phys, data_iova) = {
-        let b = d.bound.as_ref()?;
-        (b.notify_page_phys, b.used_phys, b.data_phys, b.data_iova)
-    };
-    let qsize = d.qsize;
-    // Write the read descriptor for sector 0 at chain head 0 -- no doorbell. The
-    // library OS owns the completion demux (it reads the used ring itself, D5), so
-    // the kernel does NOT claim an `inflights` slot: a phantom in-flight slot the
-    // kernel never drains would leave the scheduler idling on a disk waiter that
-    // never completes.
-    d.post_request(0, 0, 1, data_iova, false, Direction::Read, false);
-    Some(BoundMap { notify_page_phys, used_phys, data_phys, qsize })
+/// Slice 4: report what `bind_device` maps into a library OS and the IOVAs it
+/// names. The kernel does NOT touch the queue -- the library OS writes the
+/// descriptor, publishes it in the avail ring, rings the doorbell, and drains the
+/// used ring itself (kernel off the submit path entirely). Read-only: it claims no
+/// `inflights` slot, so nothing phantom-blocks the scheduler. `None` if `dev` is
+/// not a bound device.
+pub fn bind_info(dev: usize) -> Option<BoundMap> {
+    let g = DEVICES.get(dev)?.lock();
+    let d = g.as_ref()?;
+    let b = d.bound.as_ref()?;
+    Some(BoundMap {
+        notify_page_phys: b.notify_page_phys,
+        desc_phys: b.desc_phys,
+        avail_phys: b.avail_phys,
+        used_phys: b.used_phys,
+        buf_phys: b.buf_phys,
+        data_phys: b.data_phys,
+        data_iova: b.data_iova,
+        buf_iova: b.buf_iova,
+        qsize: d.qsize,
+    })
 }
 
 /// Protected-DMA proof, the negative (IOMMU milestone, slice 4): force the device

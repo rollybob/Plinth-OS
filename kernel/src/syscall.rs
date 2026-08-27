@@ -489,19 +489,22 @@ fn sys_fb_map(slot: u64, va: u64, info_ptr: u64) -> u64 {
 }
 
 /// bind_device(slot, va, info_ptr): map the directly-bound device named by the
-/// capability at `slot` into the caller -- its notify register page (uncached, the
-/// doorbell) at `va`, its used ring at `va + 4096`, and a read buffer at
-/// `va + 8192` -- and write the queue size (one u32) to `info_ptr`. The kernel has
-/// pre-written a read of sector 0 into the buffer; the library OS rings the
-/// doorbell (a store to `va`), polls the used ring for the completion, and reads
-/// the buffer. Returns 0, or ERR.
+/// capability at `slot` into the caller so a library OS drives its queue itself.
+/// The six contiguous pages from `va`: the notify register (uncached, the
+/// doorbell), then the desc, avail, and used rings, the header/status buffer, and
+/// a data buffer (`va + 0x1000` .. `va + 0x5000`). Writes a BindInfo to
+/// `info_ptr` -- three u64s: `qsize`, then `data_iova` and `buf_iova`, the IOVAs
+/// the library OS names in the descriptors it writes. Returns 0, or ERR.
 ///
-/// Direct-binding slice 3 (D4/D5): the doorbell is exposed as a mapped MMIO page
-/// only because it was verified isolated from the control registers (slice 3a);
-/// the used ring drains in the library OS. The descriptor write is still the
-/// kernel's here -- the library OS writes its own in slice 4. The mapped pages name
-/// the device's own MMIO/frames, not pooled frames, so (like `fb_map`) they are
-/// not recorded in `proc.maps` and teardown frees only the page tables.
+/// Direct-binding slice 4 (D1/D4/D5): the library OS writes its OWN descriptor
+/// chain naming `data_iova`/`buf_iova`, publishes it in the avail ring, rings the
+/// doorbell (a store to `va`), and drains the used ring -- the kernel is off the
+/// submit path entirely, and the IOMMU is the whole defense (a descriptor naming
+/// an IOVA the device's domain does not map faults). The doorbell is a mapped MMIO
+/// page only because slice 3a verified the notify page isolated from the control
+/// registers. The mapped pages name the device's own MMIO/frames, not pooled
+/// frames, so (like `fb_map`) they are not recorded in `proc.maps` and teardown
+/// frees only the page tables.
 fn sys_bind_device(slot: u64, va: u64, info_ptr: u64) -> u64 {
     let (l4, dev) = {
         let cur = process::current().lock();
@@ -517,8 +520,9 @@ fn sys_bind_device(slot: u64, va: u64, info_ptr: u64) -> u64 {
         (proc.l4, dev as usize)
     };
 
-    // Three contiguous user pages: notify (uncached MMIO), used ring, data buffer.
-    const PAGES: u64 = 3;
+    // Six contiguous user pages: notify (uncached MMIO), desc, avail, used, buf,
+    // data.
+    const PAGES: u64 = 6;
     let span = PAGES * FRAME_SIZE;
     if va % FRAME_SIZE != 0 || va < USER_MAP_BASE {
         return ERR;
@@ -529,22 +533,24 @@ fn sys_bind_device(slot: u64, va: u64, info_ptr: u64) -> u64 {
     if end > USER_MAP_END {
         return ERR;
     }
-    // The info destination (one u32) must be mapped user-accessible, both ends.
-    let Some(info_last) = info_ptr.checked_add(3) else {
+    // The BindInfo destination (three u64s = 24 bytes) must be mapped
+    // user-accessible, both ends.
+    const INFO_BYTES: u64 = 24;
+    let Some(info_last) = info_ptr.checked_add(INFO_BYTES - 1) else {
         return ERR;
     };
-    if !memory::user_accessible(l4, info_ptr & !(FRAME_SIZE - 1))
+    if info_ptr % 8 != 0
+        || !memory::user_accessible(l4, info_ptr & !(FRAME_SIZE - 1))
         || !memory::user_accessible(l4, info_last & !(FRAME_SIZE - 1))
     {
         return ERR;
     }
 
-    // Pre-write the read descriptor and learn which pages to map (no doorbell rung).
-    let Some(bm) = crate::virtio_blk::bind_prime(dev) else {
+    let Some(bm) = crate::virtio_blk::bind_info(dev) else {
         return ERR;
     };
 
-    // notify page: uncached (device MMIO); used ring + data: cacheable RAM. All
+    // notify page: uncached (device MMIO); rings + buffers: cacheable RAM. All
     // writable, user-accessible, non-executable.
     let uncached = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
@@ -557,8 +563,11 @@ fn sys_bind_device(slot: u64, va: u64, info_ptr: u64) -> u64 {
         | PageTableFlags::NO_EXECUTE;
     let maps = [
         (va, bm.notify_page_phys, uncached),
-        (va + FRAME_SIZE, bm.used_phys, cached),
-        (va + 2 * FRAME_SIZE, bm.data_phys, cached),
+        (va + FRAME_SIZE, bm.desc_phys, cached),
+        (va + 2 * FRAME_SIZE, bm.avail_phys, cached),
+        (va + 3 * FRAME_SIZE, bm.used_phys, cached),
+        (va + 4 * FRAME_SIZE, bm.buf_phys, cached),
+        (va + 5 * FRAME_SIZE, bm.data_phys, cached),
     ];
     {
         let mut fa_guard = FRAME_ALLOC.lock();
@@ -578,10 +587,14 @@ fn sys_bind_device(slot: u64, va: u64, info_ptr: u64) -> u64 {
         }
     }
 
-    // Hand back the queue size. SAFETY: info_ptr's pages were verified above; IF is
-    // masked and the CPU is single, so nothing unmaps them under us.
+    // Hand back the BindInfo (qsize, data_iova, buf_iova). SAFETY: [info_ptr,
+    // info_ptr+24) verified mapped, user-accessible, and 8-aligned above; IF is
+    // masked and the CPU is single, so nothing unmaps it under us.
     unsafe {
-        core::ptr::write_volatile(info_ptr as *mut u32, bm.qsize as u32);
+        let p = info_ptr as *mut u64;
+        p.add(0).write_volatile(bm.qsize as u64);
+        p.add(1).write_volatile(bm.data_iova);
+        p.add(2).write_volatile(bm.buf_iova);
     }
     0
 }
