@@ -188,6 +188,8 @@ pub enum DomainError {
     /// The remapping unit's address width is not a VT-d page-table depth
     /// (39/48/57-bit -> 3/4/5 levels).
     UnsupportedWidth,
+    /// The per-domain IOVA allocator's window is fully allocated.
+    IovaExhausted,
 }
 
 /// A device DMA domain: a second-level page-table tree rooted at `root`. The
@@ -831,5 +833,143 @@ pub fn take_fault() -> Option<(u64, u32)> {
         let fsts = reg_r32(bi.regs_va, VTD_FSTS);
         reg_w32(bi.regs_va, VTD_FSTS, fsts);
         Some((addr, reason))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IOVA allocator + non-identity buffer mapping -- direct-binding slice 1.
+//
+// Every mapping above uses an IDENTITY IOVA (IOVA == physical): the
+// kernel-bridged block path maps each frame to itself, because the kernel is the
+// sole writer of the device's descriptors, so an identity map is the simplest
+// correct choice and the IOVA is never exposed to anyone. Direct binding
+// (`direct_binding.md`, D1/D3) inverts that: a library OS will write its OWN
+// descriptors, naming IOVAs the device reads directly, so the IOVA must reveal
+// nothing about physical layout. The kernel therefore hands each mapped frame an
+// OPAQUE IOVA from a per-domain allocator over a fixed window; the IOVA is
+// meaningless outside the domain, and the hardware refuses any IOVA the kernel
+// did not map -- that hardware refusal is what lets a libOS-written descriptor
+// be safe (I3/I5, D1).
+//
+// This is slice 1: the allocator plus a map-at-assigned-IOVA path over the
+// existing `Domain`, pure structure over the frame allocator, unit-tested before
+// any device is bound. It deliberately carries NO invalidation -- no remapping
+// unit is live at this layer, and `Domain` stays invalidation-agnostic exactly
+// as the slice-3 block path leaves invalidation to `block_map_dma` around the
+// same `Domain::map`. On the bind path (slice 2) the caller invalidates the live
+// unit after a map. Test-only in the shipping build until slice 2 is the first
+// caller (the `Domain`/`frame_alloc` precedent).
+// ---------------------------------------------------------------------------
+
+/// How many freed IOVAs the allocator remembers for reuse. Paired map/unmap
+/// traffic stays within this; if it overflows, a freed IOVA is simply not
+/// recycled (the window's own slack absorbs it) rather than being mis-recycled.
+const IOVA_FREELIST: usize = 64;
+
+/// A per-domain allocator of opaque device IOVAs over a fixed, page-aligned
+/// window `[base, base + pages * 4KiB)`. A bump cursor plus a small free stack:
+/// `alloc` reuses a freed IOVA before advancing the cursor, so a steady
+/// map/unmap workload does not walk off the window. `base` is required nonzero so
+/// IOVA 0 stays an obviously-invalid sentinel and never a live buffer address.
+///
+/// The window layout is kernel policy the libOS never sees: it receives only the
+/// individual IOVAs this hands out, never the base, the bounds, or the physical
+/// frames behind them.
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+pub struct IovaAllocator {
+    /// The next never-yet-allocated IOVA (the bump cursor).
+    next: u64,
+    /// One past the end of the window.
+    end: u64,
+    /// Recently freed IOVAs, handed back out before the cursor advances.
+    free: [u64; IOVA_FREELIST],
+    free_len: usize,
+}
+
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+impl IovaAllocator {
+    /// A window of `pages` 4-KiB IOVAs starting at `base`. `base` must be
+    /// page-aligned and nonzero; a zero or unaligned base is a kernel bug (it
+    /// would make IOVA 0 or an unaligned address live), so it is asserted rather
+    /// than handled.
+    pub fn new(base: u64, pages: usize) -> IovaAllocator {
+        debug_assert!(
+            base != 0 && base % (1 << PAGE_SHIFT) == 0,
+            "iova window base must be nonzero and page-aligned"
+        );
+        IovaAllocator {
+            next: base,
+            end: base + ((pages as u64) << PAGE_SHIFT),
+            free: [0; IOVA_FREELIST],
+            free_len: 0,
+        }
+    }
+
+    /// Hand out an opaque, page-aligned IOVA, or `None` when the window is spent.
+    /// Reuses a freed IOVA (LIFO) before advancing the cursor, so churn is bounded
+    /// to the live working set rather than the total ever mapped.
+    pub fn alloc(&mut self) -> Option<u64> {
+        if self.free_len > 0 {
+            self.free_len -= 1;
+            return Some(self.free[self.free_len]);
+        }
+        if self.next < self.end {
+            let iova = self.next;
+            self.next += 1 << PAGE_SHIFT;
+            Some(iova)
+        } else {
+            None
+        }
+    }
+
+    /// Return an IOVA for reuse. Remembered if the free stack has room; otherwise
+    /// dropped (the window's slack covers it) -- never handed out incorrectly.
+    pub fn free(&mut self, iova: u64) {
+        if self.free_len < self.free.len() {
+            self.free[self.free_len] = iova;
+            self.free_len += 1;
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+impl Domain {
+    /// Assign an opaque IOVA from `alloc` and map `phys` at it -- a NON-identity
+    /// mapping -- returning the IOVA for a library OS to name in its descriptors.
+    /// The inverse of `unmap_buffer`.
+    ///
+    /// If the map fails, the IOVA is returned to `alloc`, so a failed call leaks
+    /// no IOVA; any intermediate tables `map` allocated before failing are
+    /// reclaimed by `teardown`, exactly as for a direct `map`. No invalidation is
+    /// issued here (see the section comment) -- the bind-path caller invalidates
+    /// the live unit after this returns.
+    pub fn map_buffer(
+        &mut self,
+        frames: &mut FrameAlloc,
+        alloc: &mut IovaAllocator,
+        phys: u64,
+        perms: u64,
+    ) -> Result<u64, DomainError> {
+        let iova = alloc.alloc().ok_or(DomainError::IovaExhausted)?;
+        match self.map(frames, iova, phys, perms) {
+            Ok(()) => Ok(iova),
+            Err(e) => {
+                alloc.free(iova);
+                Err(e)
+            }
+        }
+    }
+
+    /// Unmap a buffer mapped by `map_buffer` and return its IOVA to `alloc` for
+    /// reuse. `NotMapped` if the IOVA is not currently mapped; in that case the
+    /// IOVA is not returned to the allocator (it was never a live mapping).
+    pub fn unmap_buffer(
+        &mut self,
+        alloc: &mut IovaAllocator,
+        iova: u64,
+    ) -> Result<(), DomainError> {
+        self.unmap(iova)?;
+        alloc.free(iova);
+        Ok(())
     }
 }

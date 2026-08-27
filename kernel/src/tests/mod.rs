@@ -239,6 +239,10 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "iommu::rejects_unsupported_width", run: iommu::rejects_unsupported_width },
     TestCase { name: "iommu::context_entry_encoding", run: iommu::context_entry_encoding },
     TestCase { name: "iommu::translation_tables_teardown_frees", run: iommu::translation_tables_teardown_frees },
+    TestCase { name: "iommu::iova_map_translate_roundtrip", run: iommu::iova_map_translate_roundtrip },
+    TestCase { name: "iommu::iova_allocator_reuse", run: iommu::iova_allocator_reuse },
+    TestCase { name: "iommu::iova_exhaustion", run: iommu::iova_exhaustion },
+    TestCase { name: "iommu::map_buffer_teardown_no_leak", run: iommu::map_buffer_teardown_no_leak },
 ];
 
 /// Run every registered test. Returns true if all passed.

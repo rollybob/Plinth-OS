@@ -13,7 +13,9 @@
 //! that teardown returns every table frame and not one data frame.
 
 use super::TestCtx;
-use crate::iommu::{Domain, DomainError, TranslationTables, IOMMU_READ, IOMMU_WRITE};
+use crate::iommu::{
+    Domain, DomainError, IovaAllocator, TranslationTables, IOMMU_READ, IOMMU_WRITE,
+};
 use crate::test_assert;
 
 /// QEMU's remapping unit is 48-bit -> a 4-level table. The tests use that width.
@@ -186,6 +188,112 @@ pub fn translation_tables_teardown_frees(ctx: &mut TestCtx) -> Result<(), &'stat
     test_assert!(
         ctx.frames.free_frames() == before,
         "teardown must return the root and context frames"
+    );
+    Ok(())
+}
+
+// --- Opaque IOVA allocator + non-identity buffer mapping (direct-binding slice 1) ---
+
+/// The IOVA window the buffer tests allocate from. Nonzero (0 is the invalid
+/// sentinel) and well clear of the low identity IOVAs the slice-2/3 tests use, so
+/// the returned IOVA cannot accidentally equal a physical address under test.
+const IOVA_BASE: u64 = 0x4000_0000; // 1 GiB
+
+/// `map_buffer` assigns an opaque, NON-identity IOVA and maps the frame at it;
+/// `translate` resolves that IOVA to the physical frame (carrying the offset);
+/// `unmap_buffer` clears it. The slice-1 headline: the libOS-facing IOVA is not
+/// the physical address, unlike the slice-3 identity block map.
+pub fn iova_map_translate_roundtrip(ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut d = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let mut alloc = IovaAllocator::new(IOVA_BASE, 16);
+
+    let phys = 0x00AA_0000u64;
+    let iova = d
+        .map_buffer(ctx.frames, &mut alloc, phys, IOMMU_READ | IOMMU_WRITE)
+        .map_err(|_| "map_buffer failed")?;
+
+    // The assigned IOVA is opaque: the window base, NOT the physical address --
+    // the property that makes it safe to hand to a library OS.
+    test_assert!(iova == IOVA_BASE, "first IOVA must come from the window base");
+    test_assert!(iova != phys, "the IOVA must not be the physical address (non-identity)");
+
+    test_assert!(d.translate(iova) == Some(phys), "translate must resolve the mapped frame");
+    test_assert!(
+        d.translate(iova + 0x40) == Some(phys + 0x40),
+        "translate must carry the page offset"
+    );
+
+    d.unmap_buffer(&mut alloc, iova).map_err(|_| "unmap_buffer failed")?;
+    test_assert!(d.translate(iova).is_none(), "translate after unmap_buffer must be None");
+
+    d.teardown(ctx.frames);
+    Ok(())
+}
+
+/// Distinct allocations get distinct, page-aligned IOVAs, and freeing one returns
+/// it for reuse (LIFO) so paired map/unmap traffic stays within the window rather
+/// than walking the cursor off the end.
+pub fn iova_allocator_reuse(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut alloc = IovaAllocator::new(IOVA_BASE, 4);
+    let a = alloc.alloc().ok_or("first alloc must succeed")?;
+    let b = alloc.alloc().ok_or("second alloc must succeed")?;
+    test_assert!(a != b, "distinct allocations must be distinct");
+    test_assert!(a % 0x1000 == 0 && b % 0x1000 == 0, "IOVAs must be page-aligned");
+
+    alloc.free(b);
+    let c = alloc.alloc().ok_or("alloc after free must succeed")?;
+    test_assert!(c == b, "a freed IOVA must be reused before the cursor advances");
+    Ok(())
+}
+
+/// A spent window yields `IovaExhausted` -- both directly from `alloc()` and
+/// surfaced through `map_buffer` -- and the mappings made before exhaustion still
+/// tear down with no leak.
+pub fn iova_exhaustion(ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let before = ctx.frames.free_frames();
+    let mut d = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let mut alloc = IovaAllocator::new(IOVA_BASE, 2); // exactly two IOVAs
+
+    let i0 = d
+        .map_buffer(ctx.frames, &mut alloc, 0x10_0000, IOMMU_READ)
+        .map_err(|_| "first map_buffer failed")?;
+    let i1 = d
+        .map_buffer(ctx.frames, &mut alloc, 0x20_0000, IOMMU_READ)
+        .map_err(|_| "second map_buffer failed")?;
+    test_assert!(i0 != i1, "the two window IOVAs must be distinct");
+    test_assert!(
+        d.map_buffer(ctx.frames, &mut alloc, 0x30_0000, IOMMU_READ)
+            == Err(DomainError::IovaExhausted),
+        "a third map must exhaust the two-page window"
+    );
+    test_assert!(alloc.alloc().is_none(), "alloc must also report the window spent");
+
+    d.teardown(ctx.frames);
+    test_assert!(
+        ctx.frames.free_frames() == before,
+        "teardown must return every frame after exhaustion"
+    );
+    Ok(())
+}
+
+/// The load-bearing no-leak property through the allocator path: several buffers
+/// mapped at opaque IOVAs, all table frames returned on teardown and no mapped
+/// data frame freed. Non-vacuous: asserts table frames were really consumed first.
+pub fn map_buffer_teardown_no_leak(ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let before = ctx.frames.free_frames();
+    let mut d = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let mut alloc = IovaAllocator::new(IOVA_BASE, 8);
+
+    for k in 0..4u64 {
+        d.map_buffer(ctx.frames, &mut alloc, 0x10_0000 + k * 0x1000, IOMMU_READ | IOMMU_WRITE)
+            .map_err(|_| "map_buffer failed")?;
+    }
+    test_assert!(ctx.frames.free_frames() < before, "mapping must consume table frames");
+
+    d.teardown(ctx.frames);
+    test_assert!(
+        ctx.frames.free_frames() == before,
+        "teardown must return every table frame (no leak, no over-free)"
     );
     Ok(())
 }
