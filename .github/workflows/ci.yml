@@ -6,22 +6,49 @@ on:
   pull_request:
 
 env:
-  # TCG on shared CI runners is slower than a local machine.
-  PLINTH_QEMU_TIMEOUT: "180"
+  # TCG on shared CI runners is slower than a local machine, and the
+  # protected-DMA path (intel-iommu with caching-mode => a per-DMA invalidation
+  # on every mapping change) adds real per-request cost under emulation. Give
+  # each QEMU invocation generous headroom so a slow boot is not read as a hang.
+  PLINTH_QEMU_TIMEOUT: "300"
 
 jobs:
   qemu:
     runs-on: ubuntu-latest
+    # Why a container instead of the stock runner:
+    # The runner's apt qemu-system-x86 is 8.2 (Ubuntu 24.04). That version
+    # mishandles the emulated intel-iommu on the q35 boot path: with
+    # `-device intel-iommu,caching-mode=on` -- which the protected-DMA milestone
+    # requires so its forced out-of-domain fault actually fires (without it the
+    # proof is vacuous) -- OVMF can no longer DMA-read the AHCI boot disk. It
+    # halts at "No bootable option or device was found" and the run times out.
+    # intel-iommu is global to the q35 root complex, so it governs even the
+    # firmware's boot-time reads and there is no per-device exemption. QEMU 10.x
+    # handles this correctly (validated locally on 11.0), so run the whole job
+    # in a Debian trixie container to get qemu-system-x86 10.x. Revisit this if
+    # the stock runner's QEMU moves to >= 10.
+    container:
+      image: buildpack-deps:trixie
     steps:
       - uses: actions/checkout@v4
 
       - name: Install QEMU
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-x86
+          apt-get update
+          apt-get install -y qemu-system-x86
+          # Print the version so a future boot regression can be pinned to it.
+          qemu-system-x86_64 --version
 
-      # rust-toolchain.toml pins nightly + rust-src; the rustup proxy
-      # installs it on first cargo invocation.
+      # buildpack-deps ships curl/git/build-essential but not rustup (the stock
+      # runner image has a rustup proxy; this container does not). Install it
+      # here; rust-toolchain.toml pins the nightly + rust-src + llvm-tools-preview
+      # and rustup fetches them on first use in the next step.
+      - name: Install rustup
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Install toolchain
         run: rustup show
 
@@ -32,9 +59,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # Keyed on the toolchain too: artifacts built by a different
-          # rustc must not be restored after a toolchain change.
-          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          # Keyed on the toolchain too: artifacts built by a different rustc must
+          # not be restored after a toolchain change. The `trixie` segment busts
+          # any cache left by the old host-runner job (different glibc, so its
+          # host-compiled xtask/proc-macro artifacts are not reusable here).
+          key: ${{ runner.os }}-cargo-trixie-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Clobber lint
         run: cargo xtask check
