@@ -117,6 +117,10 @@ plinth: scanning PCI bus
 plinth: storage controller SATA (AHCI) at 00:1f.2 vendor 8086, unsupported (no driver)
 plinth: virtio-blk found at 00:03.0
 plinth: virtio-blk found at 00:04.0
+# Device 2 (slot 5) is the directly-bound device (direct-binding slice 2): the
+# kernel claims it with its OWN non-identity IOMMU domain rather than the shared
+# kernel-bridged one the other two use.
+plinth: virtio-blk found at 00:05.0
 plinth: virtio-blk[0] ready (queue 0, size 64, capacity 2048 sectors)
 
 # MSI-X completions (broader hardware, Stage A3, D7): once Stage A2's LAPIC is
@@ -129,6 +133,8 @@ plinth: virtio-blk[0] ready (queue 0, size 64, capacity 2048 sectors)
 plinth: virtio-blk[0] msix vector 0x30
 plinth: virtio-blk[1] ready (queue 0, size 64,
 plinth: virtio-blk[1] msix vector 0x31
+plinth: virtio-blk[2] ready (queue 0, size 64, capacity 2048 sectors)
+plinth: virtio-blk[2] msix vector 0x32
 
 # Protected DMA (IOMMU milestone, slice 3): every DMA-capable device now has an
 # IOMMU context entry pointing at a domain that maps exactly the frames its DMA
@@ -159,6 +165,15 @@ plinth: virtio-blk[1] sector 0 read ok (distinct disk)
 # fault-recording register, not the request result.
 plinth: iommu: fault control: PASS
 
+# Direct-binding slice 2: the bound device (slot 5) is driven kernel-side through
+# its OWN non-identity IOMMU domain -- its virtqueue rings and this read's data
+# buffer live at opaque IOVAs assigned by the per-domain allocator, not at their
+# physical addresses. A successful sector-0 read is the non-vacuous proof: the
+# device is programmed with IOVAs, so a wrong IOVA->physical mapping would DMA to
+# the wrong frame and the ramp check would fail. The library OS does not yet write
+# its own descriptors (slices 3-5); here the kernel still submits.
+plinth: virtio-blk[2] bind selftest: sector 0 read ok via non-identity domain
+
 # Device MMIO is mapped UNCACHED, and this line is the assertion that it is.
 #
 # Until 2026-08-18 it was not. map_kernel_mmio built a NO_CACHE mapping at
@@ -173,13 +188,13 @@ plinth: iommu: fault control: PASS
 #
 # Device MMIO now goes into a private PML4 slot claimed at boot, so every page is
 # mapped fresh and uncached and there is no "already mapped?" case to get wrong.
-# The count is the check: 13 pages is the current device set -- the twelve device
-# registers plus the VT-d remapping unit's register window, mapped when block DMA
-# translation is enabled (slice 3) -- and a change means a device was added or a
-# mapping path moved, either way it wants a look rather than a silent update. This
-# is also the watchable half of a hazard QEMU cannot otherwise demonstrate
-# (real_hardware.md D2).
-plinth: mmio: 13 pages mapped uncached
+# The count is the check: 18 pages is the current device set -- the twelve device
+# registers plus the VT-d remapping unit's register window (13), plus the directly-
+# bound device's own virtio BAR window and MSI-X table (+5, direct-binding slice
+# 2) -- and a change means a device was added or a mapping path moved, either way
+# it wants a look rather than a silent update. This is also the watchable half of a
+# hazard QEMU cannot otherwise demonstrate (real_hardware.md D2).
+plinth: mmio: 18 pages mapped uncached
 
 plinth: running hello
 hello: ring 3

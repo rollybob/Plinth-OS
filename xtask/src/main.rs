@@ -340,6 +340,22 @@ fn block_image() -> PathBuf {
     path
 }
 
+/// The directly-bound device's backing image (direct-binding slice 2). Same
+/// deterministic ramp as `block_image` (sector 0 byte j is j & 0xFF), so the
+/// bound selftest verifies it exactly as the ramp-disk selftest does. A separate
+/// file from `blk.img` so QEMU is never asked to open one image on two drives.
+/// 1 MiB; content-stable.
+fn bind_image() -> PathBuf {
+    let out_dir = workspace_root().join("target/disk-images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let path = out_dir.join("bind.img");
+    let data: Vec<u8> = (0..1024u64 * 1024)
+        .map(|i| ((i / 512 + i % 512) & 0xFF) as u8)
+        .collect();
+    std::fs::write(&path, &data).expect("failed to write bind image");
+    path
+}
+
 // Mirror of libfs::archive (the CANONICAL format definition; see that module).
 // The on-disk layout is intentionally trivial so this writer stays a faithful
 // mirror of the bare-target reader; archive_image round-trips the result
@@ -659,6 +675,19 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
         &format!("if=none,format=raw,file={},id=blk1", archive.display()),
         "-device",
         "virtio-blk-pci,drive=blk1,addr=0x4,disable-legacy=on,iommu_platform=on",
+    ]);
+
+    // Storage device 2: the directly-bound device (direct-binding slice 2),
+    // pinned to slot 5. The kernel claims it with its OWN non-identity IOMMU
+    // domain (its virtqueue at opaque IOVAs) rather than the shared kernel-bridged
+    // domain the other two use. iommu_platform=on so its DMA is governed by the
+    // vIOMMU, like the others -- direct binding relies on that confinement.
+    let bind_disk = bind_image();
+    cmd.args([
+        "-drive",
+        &format!("if=none,format=raw,file={},id=blk2", bind_disk.display()),
+        "-device",
+        "virtio-blk-pci,drive=blk2,addr=0x5,disable-legacy=on,iommu_platform=on",
     ]);
 
     // Log CPU resets and exceptions for post-mortem debugging.

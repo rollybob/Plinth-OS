@@ -193,10 +193,11 @@ fn read8(bus: u8, slot: u8, func: u8, offset: u8) -> u8 {
     (dword >> ((offset as u32 & 3) * 8)) as u8
 }
 
-/// The most virtio-blk devices the kernel tracks. Two today: a test/ramp disk
-/// and the boot archive (see `virtio_blk` and the boot code). Raising this is a
-/// one-line change here plus a wider `virtio_blk` device array.
-pub const MAX_DEVICES: usize = 2;
+/// The most virtio-blk devices the kernel tracks. Three today: a test/ramp disk,
+/// the boot archive, and the directly-bound device (direct-binding slice 2; see
+/// `virtio_blk` and the boot code). The `virtio_blk` device array and
+/// `enable_completion_irqs`' per-index handler match track this width.
+pub const MAX_DEVICES: usize = 3;
 
 /// Scan for virtio-blk devices. q35 places them on bus 0, but we sweep all
 /// 256 buses x 32 slots anyway (cheap, and it avoids hard-coding placement),

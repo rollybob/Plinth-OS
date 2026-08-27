@@ -274,6 +274,12 @@ struct VirtioBlk {
     /// `irq::apic_mode()`, with a MADT-supplied LAPIC to target). `None` means
     /// this device is on the INTx fallback (`intr_line` instead).
     msix_vector: Option<u8>,
+    /// `Some(buf_iova)` when this device is directly bound (direct-binding slice
+    /// 2): it has its own non-identity IOMMU domain, so the request path addresses
+    /// it with IOVAs, and its header/status buffer lives at `buf_iova` in that
+    /// domain. `None` for a kernel-bridged device -- it is handed physical
+    /// addresses, which its shared identity domain maps to themselves.
+    bound_buf_iova: Option<u64>,
 }
 
 /// One slot per virtio-blk device the kernel tracks (pci::MAX_DEVICES). A
@@ -373,13 +379,34 @@ impl VirtioBlk {
         head: u16,
         sector: u64,
         count: u64,
-        data_phys: u64,
+        data_dev_addr: u64,
         want_interrupt: bool,
         dir: Direction,
     ) {
         let slot = (head / DESC_PER_REQ) as usize;
-        let hdr_phys = self.hdr_phys(slot);
-        let status_phys = self.status_phys(slot);
+        // The addresses the DEVICE is given for this request. For a kernel-bridged
+        // device they are physical (its shared identity domain maps each to
+        // itself); for a directly-bound device (slice 2) they are IOVAs in the
+        // device's own domain -- the header and status sit in the buffer frame
+        // mapped at `buf_iova`, and the caller has already mapped the data frame
+        // and passes its IOVA as `data_dev_addr`. The kernel-side content writes
+        // below still go through `hdr_va`/`status_va` (the kernel's own mapping),
+        // unchanged either way; only the descriptor address fields differ.
+        let (hdr_addr, status_addr) = match self.bound_buf_iova {
+            Some(buf_iova) => (
+                buf_iova + slot as u64 * HDR_BYTES,
+                buf_iova + STATUS_REGION_OFF + slot as u64,
+            ),
+            None => {
+                // With DMA translation on, the device can only reach frames its
+                // domain maps. Identity-map this request's data frame before the
+                // device sees the descriptor (add-only, idempotent; a no-op when
+                // translation is off). Bound devices pre-map their data, so this
+                // is skipped.
+                let _ = crate::iommu::block_map_dma(data_dev_addr);
+                (self.hdr_phys(slot), self.status_phys(slot))
+            }
+        };
         let (req_type, data_flags) = match dir {
             // Device-writable: the device DMAs the read result into the frame.
             Direction::Read => (VIRTIO_BLK_T_IN, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE),
@@ -387,10 +414,6 @@ impl VirtioBlk {
             // out to the disk, so it must not also be marked device-writable.
             Direction::Write => (VIRTIO_BLK_T_OUT, VIRTQ_DESC_F_NEXT),
         };
-        // With DMA translation on, the device can only reach frames its domain
-        // maps. Identity-map this request's data frame before the device sees the
-        // descriptor (add-only, idempotent; a no-op when translation is off).
-        let _ = crate::iommu::block_map_dma(data_phys);
         // SAFETY: all addresses below are kernel-mapped ring/MMIO/buffer
         // addresses set up in `init`; data_phys is a caller-owned frame. The
         // descriptor chain [head, head+1, head+2] is within the queue (head <=
@@ -412,17 +435,17 @@ impl VirtioBlk {
             // Three chained descriptors (each 16 B: addr, len, flags, next) at
             // this chain's head, linking head -> head+1 -> head+2.
             let d = self.desc_va + head as u64 * 16;
-            w64(d, hdr_phys);
+            w64(d, hdr_addr);
             w32(d + 8, 16);
             w16(d + 12, VIRTQ_DESC_F_NEXT);
             w16(d + 14, head + 1);
 
-            w64(d + 16, data_phys);
+            w64(d + 16, data_dev_addr);
             w32(d + 24, (count * SECTOR_SIZE) as u32);
             w16(d + 28, data_flags);
             w16(d + 30, head + 2);
 
-            w64(d + 32, status_phys);
+            w64(d + 32, status_addr);
             w32(d + 40, 1);
             w16(d + 44, VIRTQ_DESC_F_WRITE);
             w16(d + 46, 0);
@@ -613,6 +636,7 @@ pub fn init<W: Write>(
     info: &VirtioBlkInfo,
     phys_offset: u64,
     dev: usize,
+    bind: bool,
 ) -> Result<(), &'static str> {
     if dev >= pci::MAX_DEVICES {
         return Err("virtio-blk device index out of range");
@@ -689,6 +713,32 @@ pub fn init<W: Write>(
     let (used_phys, used_va) = alloc_zeroed(phys_offset)?;
     let (buf_phys, buf_va) = alloc_zeroed(phys_offset)?;
 
+    // Decide the addresses the DEVICE is programmed with. A directly-bound device
+    // (direct-binding slice 2) gets its own non-identity domain now -- its rings
+    // and buffer mapped at opaque IOVAs -- and is programmed with those IOVAs; a
+    // kernel-bridged device is programmed with the physical ring bases (identity
+    // in the shared block domain). Binding requires ACCESS_PLATFORM, or the
+    // device's DMA would bypass the IOMMU that is supposed to confine it.
+    let (desc_addr, avail_addr, used_addr, bound_buf_iova);
+    if bind {
+        if !access_platform {
+            return Err("a bound device must negotiate ACCESS_PLATFORM (iommu_platform=on)");
+        }
+        let iovas = crate::iommu::bind_prepare(
+            info.loc,
+            &[desc_phys, avail_phys, used_phys, buf_phys],
+        )?;
+        desc_addr = iovas[0];
+        avail_addr = iovas[1];
+        used_addr = iovas[2];
+        bound_buf_iova = Some(iovas[3]);
+    } else {
+        desc_addr = desc_phys;
+        avail_addr = avail_phys;
+        used_addr = used_phys;
+        bound_buf_iova = None;
+    }
+
     let (qsize, queue_notify_off);
     // SAFETY: queue 0 programming on the mapped common-config MMIO.
     unsafe {
@@ -700,9 +750,9 @@ pub fn init<W: Write>(
         qsize = dev_qsize.min(QUEUE_SIZE_MAX);
         w16(common + CFG_QUEUE_SIZE, qsize); // may only shrink; qsize <= dev
 
-        w64_split(common + CFG_QUEUE_DESC, desc_phys);
-        w64_split(common + CFG_QUEUE_DRIVER, avail_phys);
-        w64_split(common + CFG_QUEUE_DEVICE, used_phys);
+        w64_split(common + CFG_QUEUE_DESC, desc_addr);
+        w64_split(common + CFG_QUEUE_DRIVER, avail_addr);
+        w64_split(common + CFG_QUEUE_DEVICE, used_addr);
         queue_notify_off = r16(common + CFG_QUEUE_NOTIFY_OFF);
         if msix_vector.is_some() {
             // queue_select is still 0 from above; route queue 0's completions
@@ -743,15 +793,19 @@ pub fn init<W: Write>(
         isr_va: isr,
         intr_line: info.intr_line,
         msix_vector,
+        bound_buf_iova,
     });
 
     // Give this device's DMA an IOMMU domain -- but only if it negotiated
     // ACCESS_PLATFORM, i.e. its DMA actually goes through the IOMMU. Map its fixed
-    // ring + header/status frames identity and add a context entry for its
-    // source-id; translation is turned on once (in kernel_main) after every such
-    // device is prepared. Without ACCESS_PLATFORM (no `iommu_platform=on`, or real
-    // hardware) the device DMAs raw physical addresses and the IOMMU is left off.
-    if access_platform {
+    // ring + header/status frames identity into the SHARED block domain and add a
+    // context entry for its source-id; translation is turned on once (in
+    // kernel_main) after every such device is prepared. A directly-bound device
+    // is skipped here -- it already built its own non-identity domain and context
+    // entry above via `bind_prepare`. Without ACCESS_PLATFORM (no
+    // `iommu_platform=on`, or real hardware) the device DMAs raw physical
+    // addresses and the IOMMU is left off.
+    if access_platform && !bind {
         if let Err(e) = crate::iommu::block_prepare_device(
             info.loc,
             &[desc_phys, avail_phys, used_phys, buf_phys],
@@ -1015,6 +1069,84 @@ pub fn selftest_read<W: Write>(out: &mut W, phys_offset: u64, dev: usize, ramp: 
         }
         (false, _) => {
             let _ = writeln!(out, "plinth: virtio-blk[{dev}] sector 0 read FAILED");
+        }
+    }
+    ok
+}
+
+/// Direct-binding slice 2 proof: read sector 0 of the directly-bound device
+/// `dev`, whose virtqueue rings and this request's data buffer live at opaque,
+/// NON-identity IOVAs in the device's own IOMMU domain, and verify the ramp.
+///
+/// A successful read is the non-vacuous proof of the whole non-identity path: the
+/// device is programmed with IOVAs, not physical addresses, so if the domain's
+/// IOVA->physical mapping were wrong the device would DMA to the wrong frame and
+/// the ramp check would fail. It also asserts the data IOVA genuinely differs
+/// from the physical frame, so "non-identity" is not an empty claim. Allocates
+/// and frees a scratch frame (the frame; the transient domain mapping persists
+/// harmlessly for the boot -- teardown is a later slice). Returns true on success.
+pub fn bind_selftest_read<W: Write>(out: &mut W, phys_offset: u64, dev: usize) -> bool {
+    let (phys, va) = match alloc_zeroed(phys_offset) {
+        Ok(x) => x,
+        Err(e) => {
+            let _ = writeln!(out, "plinth: virtio-blk[{dev}] bind selftest: {e}");
+            return false;
+        }
+    };
+    // Map the data buffer into the bound device's domain; the device is given this
+    // IOVA, not the physical frame -- the non-identity path under test.
+    let data_iova = match crate::iommu::bind_map_dma(phys) {
+        Ok(iova) => iova,
+        Err(e) => {
+            let _ = writeln!(out, "plinth: virtio-blk[{dev}] bind selftest map: {e}");
+            if let Some(fa) = FRAME_ALLOC.lock().as_mut() {
+                let _ = fa.dealloc(phys);
+            }
+            return false;
+        }
+    };
+    let non_identity = data_iova != phys;
+
+    let read_result = {
+        let mut g = DEVICES[dev].lock();
+        match g.as_mut() {
+            Some(d) => d.read_block_polled(0, 1, data_iova),
+            None => Err("bound device not present"),
+        }
+    };
+    let read_ok = read_result.is_ok();
+
+    // The first SECTOR_SIZE bytes must match the ramp formula (byte i == i%256),
+    // the same deterministic image the ramp disk uses.
+    let ramp_ok = read_ok && {
+        let mut good = true;
+        for i in 0..SECTOR_SIZE {
+            // SAFETY: va is the scratch frame; 512 bytes were DMA'd into it.
+            if unsafe { r8(va + i) } != (i % 256) as u8 {
+                good = false;
+                break;
+            }
+        }
+        good
+    };
+
+    if let Some(fa) = FRAME_ALLOC.lock().as_mut() {
+        let _ = fa.dealloc(phys);
+    }
+
+    let ok = non_identity && read_ok && ramp_ok;
+    if ok {
+        let _ = writeln!(
+            out,
+            "plinth: virtio-blk[{dev}] bind selftest: sector 0 read ok via non-identity domain"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "plinth: virtio-blk[{dev}] bind selftest FAILED (non_identity={non_identity} read_ok={read_ok} ramp_ok={ramp_ok})"
+        );
+        if let Err(e) = read_result {
+            let _ = writeln!(out, "plinth: virtio-blk[{dev}] bind read error: {e}");
         }
     }
     ok

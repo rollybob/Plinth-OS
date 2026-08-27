@@ -552,6 +552,10 @@ struct BlockIommu {
     tables: TranslationTables,
     domain: Domain,
     levels: u8,
+    /// The unit's DMA address width in bits (48 under QEMU), kept so a second
+    /// domain (the bound device's, direct-binding slice 2) can be sized for the
+    /// same unit without re-reading CAP.
+    addr_width: u8,
     prepared: usize,
     enabled: bool,
     /// Byte offset of the first fault-recording register (FRCD) from the register
@@ -561,7 +565,31 @@ struct BlockIommu {
     /// base, derived from ECAP.IRO. Under caching-mode a mapping change is only
     /// seen after invalidating here.
     iotlb_off: usize,
+    /// The one directly-bound device's private non-identity domain, if any
+    /// (direct-binding slice 2). It shares this unit's registers and root/context
+    /// tables but has its own domain + opaque IOVA allocator and a distinct
+    /// domain id, so it is confined separately from the shared block domain (D9).
+    bound: Option<BoundDomain>,
 }
+
+/// A directly-bound device's private DMA state (direct-binding slice 2): its own
+/// non-identity `Domain` and the opaque IOVA allocator that names frames in it.
+/// Lives inside `BlockIommu` because it shares that unit's registers and
+/// root/context tables (q35 has a single remapping unit).
+struct BoundDomain {
+    domain: Domain,
+    iova: IovaAllocator,
+}
+
+/// Domain id for the bound device, distinct from `BLOCK_DID` so the unit keeps
+/// the bound device's translations separate from the shared block domain's.
+const BOUND_DID: u16 = 2;
+/// The bound device's opaque IOVA window: a 1 GiB base (well clear of any
+/// physical frame the allocator hands out, so an IOVA is never mistaken for a
+/// physical address) with room for the virtqueue rings, the header/status
+/// buffer, and a handful of data buffers.
+const BOUND_IOVA_BASE: u64 = 0x4000_0000;
+const BOUND_IOVA_PAGES: usize = 256;
 
 static BLOCK_IOMMU: Mutex<Option<BlockIommu>> = Mutex::new(None);
 
@@ -673,10 +701,12 @@ pub fn block_prepare_device(loc: pci::Location, fixed_frames: &[u64]) -> Result<
             tables,
             domain,
             levels,
+            addr_width: unit.addr_width,
             prepared: 0,
             enabled: false,
             fault_off,
             iotlb_off,
+            bound: None,
         });
     }
 
@@ -972,4 +1002,99 @@ impl Domain {
         alloc.free(iova);
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Direct-binding: a device on its own non-identity domain -- slice 2.
+//
+// The two kernel-bridged block devices share ONE identity domain (IOVA == phys),
+// because the kernel writes their descriptors. Direct binding (direct_binding.md
+// D2/D9) is the opposite: one device gets its OWN domain, and its virtqueue rings
+// and buffers live at OPAQUE, NON-IDENTITY IOVAs from slice 1's allocator. This
+// slice sets that up; the kernel still drives the device here (the library OS
+// writes its own descriptors only in slices 3-5). A device is either
+// kernel-bridged or bound, never both (D9).
+//
+// The bound device shares the one q35 remapping unit with the block devices, so
+// its context entry lives in the same per-unit root/context tables and it uses
+// the same registers for invalidation -- it differs only in pointing at a
+// distinct domain with a distinct domain id (BOUND_DID). These are shipping-path
+// functions (virtio_blk::init calls bind_prepare; the bound selftest calls
+// bind_map_dma), so unlike the pure structure above they are not test-gated.
+// ---------------------------------------------------------------------------
+
+/// Claim `loc` as a directly-bound device: build it a fresh non-identity domain,
+/// map its fixed frames (the virtqueue desc/avail/used rings + the header/status
+/// buffer) at opaque IOVAs, add a context entry pointing at that domain, and
+/// return the assigned IOVAs in the same order as `fixed_frames`. The caller
+/// programs the device's queue registers with the ring IOVAs.
+///
+/// Requires the unit to be up -- a kernel-bridged block device must be prepared
+/// first (the bound device is enumerated after the block devices). v1 binds one
+/// device. Does NOT enable translation: `block_enable` does that once, after
+/// every device (bridged and bound) has a context entry. The fixed-frame
+/// mappings are made pre-enable, so no invalidation is needed here (block_enable
+/// flushes the whole unit at enable time).
+pub fn bind_prepare(loc: pci::Location, fixed_frames: &[u64]) -> Result<[u64; 4], &'static str> {
+    if fixed_frames.len() != 4 {
+        return Err("bind_prepare expects the four fixed virtqueue frames");
+    }
+    let mut g = BLOCK_IOMMU.lock();
+    let bi = g
+        .as_mut()
+        .ok_or("bind needs the remapping unit (prepare a block device first)")?;
+    if bi.bound.is_some() {
+        return Err("a device is already directly bound (v1 binds one)");
+    }
+    let addr_width = bi.addr_width;
+    let levels = bi.levels;
+    let mut iovas = [0u64; 4];
+    let bound = {
+        let mut fg = FRAME_ALLOC.lock();
+        let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
+        let mut domain = Domain::new(fa, addr_width).map_err(|_| "bound domain alloc failed")?;
+        let mut iova = IovaAllocator::new(BOUND_IOVA_BASE, BOUND_IOVA_PAGES);
+        for (i, &frame) in fixed_frames.iter().enumerate() {
+            let page = frame & !((1 << PAGE_SHIFT) - 1);
+            iovas[i] = domain
+                .map_buffer(fa, &mut iova, page, IOMMU_READ | IOMMU_WRITE)
+                .map_err(|_| "mapping a bound fixed frame failed")?;
+        }
+        BoundDomain { domain, iova }
+    };
+    // Context entry -> the bound domain, with the distinct bound domain id.
+    // Present before block_enable turns translation on for the whole unit.
+    bi.tables.set_device(loc.slot, loc.func, bound.domain.root(), levels, BOUND_DID);
+    bi.bound = Some(bound);
+    Ok(iovas)
+}
+
+/// Map one data frame into the bound device's domain at an opaque IOVA and return
+/// it, invalidating the unit so a post-enable mapping is actually seen (the bound
+/// analogue of `block_map_dma`). Errs if no device is bound. v1 is not idempotent
+/// -- a fresh IOVA per call -- which suits the kernel-driven bound selftest;
+/// per-request reuse is a later slice's concern.
+pub fn bind_map_dma(data_phys: u64) -> Result<u64, &'static str> {
+    let mut g = BLOCK_IOMMU.lock();
+    let bi = g.as_mut().ok_or("no remapping unit")?;
+    let regs = bi.regs_va;
+    let iotlb_off = bi.iotlb_off;
+    let enabled = bi.enabled;
+    let bound = bi.bound.as_mut().ok_or("no bound device")?;
+    let page = data_phys & !((1 << PAGE_SHIFT) - 1);
+    let iova = {
+        let mut fg = FRAME_ALLOC.lock();
+        let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
+        bound
+            .domain
+            .map_buffer(fa, &mut bound.iova, page, IOMMU_READ | IOMMU_WRITE)
+            .map_err(|_| "mapping a bound data frame failed")?
+    };
+    // Under caching-mode a not-present -> present change is only seen after
+    // invalidation; pre-enable this is skipped (block_enable flushes at enable).
+    if enabled {
+        // SAFETY: regs/iotlb_off are the mapped registers of the shared unit.
+        unsafe { invalidate_all(regs, iotlb_off) };
+    }
+    Ok(iova)
 }

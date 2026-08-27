@@ -338,9 +338,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // This runs before any process is created, so the BAR's kernel-half
         // MMIO mapping propagates to every process address space.
         let (infos, ndev) = pci::init(&mut serial);
+        // The directly-bound device (direct-binding slice 2) is pinned at PCI slot
+        // BIND_SLOT by the xtask. It is claimed with its OWN non-identity IOMMU
+        // domain instead of the shared kernel-bridged one (D9), so `init` takes the
+        // bound path for it. Remember its index for the kernel-driven proof below.
+        const BIND_SLOT: u8 = 5;
+        let mut bound_dev = None;
         for i in 0..ndev {
             let info = infos[i].as_ref().expect("dense up to ndev");
-            if let Err(e) = virtio_blk::init(&mut serial, info, phys_offset, i) {
+            let bind = info.loc.slot == BIND_SLOT;
+            if bind {
+                bound_dev = Some(i);
+            }
+            if let Err(e) = virtio_blk::init(&mut serial, info, phys_offset, i, bind) {
                 let _ = writeln!(serial, "plinth: virtio-blk[{i}] init failed: {e}");
             }
         }
@@ -369,6 +379,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // when translation is actually enabled.
         if iommu::block_translation_enabled() && virtio_blk::ready(0) {
             virtio_blk::fault_selftest(&mut serial, phys_offset, 0);
+        }
+        // Direct-binding slice 2: prove the bound device works driven through its
+        // own non-identity IOMMU domain (its virtqueue at opaque IOVAs), still
+        // kernel-submitted. Only when a device was actually bound and came up.
+        if let Some(bd) = bound_dev {
+            if virtio_blk::ready(bd) {
+                virtio_blk::bind_selftest_read(&mut serial, phys_offset, bd);
+            }
         }
         // Every device is mapped by now (interrupt controllers in irq::init, BARs
         // and MSI-X tables in virtio_blk::init), so this count is final. It is
