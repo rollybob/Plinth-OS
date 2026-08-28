@@ -1,124 +1,48 @@
-//! Direct-binding slice 4 demo: a library OS writes its OWN virtqueue descriptors.
+//! Direct-binding D9 demo: the reference async executor drives a directly-bound
+//! device end to end -- both the positive and the negative through the SAME executor.
 //!
-//! Slice 3 had the kernel write the descriptor and the libOS only ring + drain.
-//! Here the kernel is off the submit path entirely: `bind_device` maps the notify
-//! page, the desc/avail/used rings, the header/status buffer, and a data buffer,
-//! and returns the IOVAs (`data_iova`, `buf_iova`) to name. This process builds the
-//! descriptor chain itself, publishes it, rings the doorbell, drains the used ring,
-//! and verifies the read. The IOMMU is the whole defense -- a descriptor naming an
-//! IOVA the device's domain does not map faults (the negative check below).
+//! `bind_device` maps the notify page, the desc/avail/used rings, and the header/
+//! status + data buffers into this process, and returns the IOVAs its IOMMU domain
+//! resolves (the libOS names IOVAs, never physical addresses -- D1/I5). The reference
+//! executor (`libos::ring`) then writes its own descriptors, rings the doorbell, and
+//! drains the used ring, with the kernel off the submit path.
+//!
+//! - Positive (slice 4): four overlapping `read_bound`s through `join`, each verified
+//!   against its own sector's ramp -- the D9 payoff, the same overlap machinery
+//!   `asyncblk` uses, now over a directly-bound device.
+//! - Negative (slice 5): one `read_bound_poison` through the same executor names an
+//!   out-of-domain IOVA. The IOMMU confines the device, so the sector never lands in
+//!   the reactor's buffer. This closes the milestone: the whole demo runs through the
+//!   executor -- no hand-written descriptor chain remains -- and the IOMMU defense is
+//!   proven on the executor's own read path, not assumed.
 
 #![no_std]
 #![no_main]
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, Ordering};
 
 use libos::ring;
 use libplinth::{sys_cap_release, sys_exit, sys_write, BIND_SLOT, MAP_BASE};
 
-/// The 6-page window bind_device maps into us.
+/// The base of the 6-page window `bind_device` maps into us (notify, desc, avail,
+/// used, buf, data). The executor owns the layout above this; we only name the base.
 const BASE: u64 = MAP_BASE + 0x8000;
-const NOTIFY: u64 = BASE;
-const DESC: u64 = BASE + 0x1000;
-const AVAIL: u64 = BASE + 0x2000;
-const USED: u64 = BASE + 0x3000;
-const BUF: u64 = BASE + 0x4000;
-const DATA: u64 = BASE + 0x5000;
 
-/// Our chosen sub-layout within the buffer page (the libOS owns it, so any
-/// non-overlapping offsets work): request header at +0, status byte at +64.
-const HDR_OFF: u64 = 0;
-const STATUS_OFF: u64 = 64;
-
-// virtio split-ring descriptor flags and the virtio-blk read request type.
-const F_NEXT: u16 = 1;
-const F_WRITE: u16 = 2;
-const AVAIL_NO_INTERRUPT: u16 = 1;
-const T_IN: u32 = 0;
+/// virtio-blk OK status, checked on the positive reads.
 const BLK_OK: u8 = 0;
-
-/// Write one 16-byte split-ring descriptor at `at`: addr, len, flags, next.
-/// SAFETY: `at` is inside our mapped, writable desc-ring page.
-unsafe fn write_desc(at: u64, addr: u64, len: u32, flags: u16, next: u16) {
-    write_volatile(at as *mut u64, addr);
-    write_volatile((at + 8) as *mut u32, len);
-    write_volatile((at + 12) as *mut u16, flags);
-    write_volatile((at + 14) as *mut u16, next);
-}
-
-/// Submit a one-sector read of `sector` into `data_addr` (an IOVA) using chain
-/// head 0, ring the doorbell, and wait for the used ring to advance. Returns the
-/// status byte the device wrote. The whole submit is our own writes -- no syscall.
-/// SAFETY: all VAs are pages bind_device mapped for us; `qsize` is the ring size.
-unsafe fn submit_read(qsize: u16, buf_iova: u64, data_addr: u64, sector: u64) -> u8 {
-    // Request header + status sentinel in our buffer page.
-    write_volatile((BUF + HDR_OFF) as *mut u32, T_IN);
-    write_volatile((BUF + HDR_OFF + 4) as *mut u32, 0);
-    write_volatile((BUF + HDR_OFF + 8) as *mut u64, sector);
-    write_volatile((BUF + STATUS_OFF) as *mut u8, 0xFF);
-
-    // Descriptor chain at head 0: hdr (device-read) -> data (device-write) ->
-    // status (device-write). Addresses are IOVAs the device's domain resolves.
-    write_desc(DESC, buf_iova + HDR_OFF, 16, F_NEXT, 1);
-    write_desc(DESC + 16, data_addr, 512, F_NEXT | F_WRITE, 2);
-    write_desc(DESC + 32, buf_iova + STATUS_OFF, 1, F_WRITE, 0);
-
-    // Read the used index before we ring, so we can wait for exactly one advance.
-    let used_before = read_volatile((USED + 2) as *const u16);
-
-    // Publish head 0 in the avail ring, ordered before the doorbell.
-    write_volatile(AVAIL as *mut u16, AVAIL_NO_INTERRUPT);
-    let idx = read_volatile((AVAIL + 2) as *const u16);
-    let ring_slot = (idx % qsize) as u64;
-    write_volatile((AVAIL + 4 + ring_slot * 2) as *mut u16, 0u16);
-    fence(Ordering::SeqCst);
-    write_volatile((AVAIL + 2) as *mut u16, idx.wrapping_add(1));
-    fence(Ordering::SeqCst);
-
-    // Ring the doorbell (queue index 0) with a plain MMIO store.
-    write_volatile(NOTIFY as *mut u16, 0u16);
-
-    // Drain: poll the used ring in our own mapping until the device advances it.
-    let mut spins = 0u64;
-    while read_volatile((USED + 2) as *const u16) == used_before {
-        spins += 1;
-        if spins >= 200_000_000 {
-            return 0xFE; // timed out -- report a non-OK status
-        }
-        core::hint::spin_loop();
-    }
-    read_volatile((BUF + STATUS_OFF) as *const u8)
-}
-
-/// True if the 512-byte data buffer holds the sector-0 ramp (byte i == i % 256).
-/// SAFETY: DATA is our mapped data page.
-unsafe fn data_is_ramp() -> bool {
-    let mut i = 0u64;
-    while i < 512 {
-        if read_volatile((DATA + i) as *const u8) != (i % 256) as u8 {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     sys_write(b"bind: ring 3\n");
 
     // Bind through the reference executor (D9): init_bound issues bind_device,
-    // mapping the six-page window at BASE, and hands back [qsize, data_iova,
-    // buf_iova] for the manual negative probe below to reuse the same mapping.
-    let mut info = [0u64; 3]; // qsize, data_iova, buf_iova
+    // mapping the six-page window at BASE and recording the geometry the reactor
+    // needs to write its own descriptors. `info` (qsize, data_iova, buf_iova) is the
+    // same geometry the reactor keeps; we do not need it here now that both the
+    // positive and the negative go through the executor.
+    let mut info = [0u64; 3];
     if !ring::init_bound(BIND_SLOT, BASE, &mut info) {
         fail(b"bind: init_bound failed\n");
-    }
-    let qsize = info[0] as u16;
-    let buf_iova = info[2];
-    if qsize == 0 {
-        fail(b"bind: queue size zero\n");
     }
 
     // Positive: FOUR overlapping reads through the reference executor over the bound
@@ -160,28 +84,44 @@ pub extern "C" fn _start() -> ! {
     }
     sys_write(b"bind: executor ran 4 overlapping reads over the bound device, each verified\n");
 
-    // Negative: name an IOVA the device's domain does NOT map. The IOMMU must
-    // confine the device, so the read cannot land in our buffer. The request may
-    // still "complete" -- QEMU writes the mapped status byte even though the data
-    // DMA faulted, so the used ring advances -- which is exactly why the userspace
-    // signal is "the data never arrived" and the kernel confirms the hardware
-    // fault from the fault-recording register after we exit.
-    const POISON_IOVA: u64 = 0xFFFF_F000; // far above the domain's mapped window
-    // SAFETY: DATA is our mapped page; the rings/buffer likewise.
+    // Negative, carried up through the executor (slice 5): a read driven by the SAME
+    // reference executor, but naming an IOVA the device's domain does NOT map. The
+    // IOMMU must confine the device, so the sector cannot land in the reactor's
+    // buffer. The request may still "complete" -- QEMU writes the mapped status byte
+    // even though the data DMA faulted, so the used ring advances and the executor's
+    // wait returns -- which is exactly why the userspace signal is "the data never
+    // arrived," and the kernel confirms the hardware fault from the fault-recording
+    // register after we exit. This is slice 4's forced-fault proof inherited by the
+    // executor's own read path rather than a hand-written descriptor chain.
+    let poison = ring::read_bound_poison(0);
+    let pva = poison.data_va();
+    // Zero this read's landing sub-buffer first, so a stale ramp from the positive
+    // pass (slot reuse) cannot masquerade as a delivered read.
+    // SAFETY: pva is the reactor's mapped per-slot data sub-buffer for this read.
     unsafe {
-        // Zero the buffer so a stale ramp from the positive read cannot masquerade
-        // as a delivered read.
         let mut i = 0u64;
         while i < 512 {
-            write_volatile((DATA + i) as *mut u8, 0u8);
+            write_volatile((pva + i) as *mut u8, 0u8);
             i += 1;
         }
-        let _ = submit_read(qsize, buf_iova, POISON_IOVA, 0);
-        if data_is_ramp() {
-            fail(b"bind: out-of-domain read was NOT confined (data leaked in)\n");
-        }
     }
-    sys_write(b"bind: out-of-domain read confined (libos named an unmapped iova)\n");
+    let _ = ring::block_on(poison);
+    // Confined: the sector must not have arrived. Sample bytes whose ramp value is
+    // nonzero (byte 0 of sector 0 is 0 either way, so it cannot witness a leak).
+    // SAFETY: pva is this read's mapped sub-buffer.
+    let leaked = unsafe {
+        let mut hit = false;
+        for &j in &[1u64, 7, 255, 511] {
+            if read_volatile((pva + j) as *const u8) != 0 {
+                hit = true;
+            }
+        }
+        hit
+    };
+    if leaked {
+        fail(b"bind: out-of-domain executor read was NOT confined (data leaked in)\n");
+    }
+    sys_write(b"bind: out-of-domain executor read confined (named an unmapped iova)\n");
 
     // Release the binding explicitly (direct-binding slice 5, D7/I11): dropping the
     // BoundDevice capability IS its teardown -- the kernel resets the device, frees

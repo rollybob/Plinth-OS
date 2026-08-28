@@ -355,16 +355,18 @@ plinth: blk demo: all done
 # the device (notify page uncached, desc/avail/used rings, buffers) via bind_device
 # and WRITES ITS OWN descriptor chain naming buffer IOVAs -- no kernel entry on the
 # submit or completion path (D1 amended I5: a libOS names IOVAs, never physical
-# addresses). The positive sector-0 read is driven through the reference async
-# executor over the bound device (D9 slice 1+2): init_bound + read_bound, the
-# executor writing the descriptors behind the read future. It then names an IOVA its
-# domain does not map: the IOMMU confines the device (the read never arrives), and
-# the kernel confirms the hardware fault from the fault-recording register -- the
-# slice-4 protected-DMA proof, now for a library-OS-written descriptor.
+# addresses). Both the positive and the negative run through the reference async
+# executor over the bound device (D9): the positive is four overlapping read_bound
+# calls joined together, the executor writing the descriptors behind each read future.
+# The negative (slice 5) is one read_bound_poison through the SAME executor naming an
+# IOVA its domain does not map: the IOMMU confines the device (the read never
+# arrives), and the kernel confirms the hardware fault from the fault-recording
+# register -- the slice-4 protected-DMA proof carried up onto the executor's own read
+# path, closing the milestone (no hand-written descriptor chain remains).
 plinth: bind demo: 1 processes
 bind: ring 3
 bind: executor ran 4 overlapping reads over the bound device, each verified
-bind: out-of-domain read confined (libos named an unmapped iova)
+bind: out-of-domain executor read confined (named an unmapped iova)
 # Slice 5 (D7/I11): the library OS releases its BoundDevice capability, which IS
 # the binding's teardown -- the kernel resets the device to quiesce DMA, frees its
 # non-identity domain and buffers, clears its context entry, and returns it to the

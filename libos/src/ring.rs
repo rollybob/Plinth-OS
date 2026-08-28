@@ -168,6 +168,11 @@ const B_STATUS_BASE: u64 = 2048;
 const B_STATUS_TIMEOUT: u64 = 0xFE;
 /// Sentinel for a `read_bound` that could not get an in-flight slot (all busy).
 const B_SLOT_NONE: usize = usize::MAX;
+/// An IOVA deliberately outside the bound device's mapped domain window, named only
+/// by `read_bound_poison` to prove the IOMMU confines an executor-driven read
+/// (direct-binding slice 5). Far above any buffer IOVA `bind_device` assigns, so the
+/// device's data-write DMA to it faults and the sector never reaches the buffer.
+const B_POISON_IOVA: u64 = 0xFFFF_F000;
 
 #[inline]
 unsafe fn r16(a: u64) -> u16 {
@@ -427,15 +432,23 @@ impl Reactor {
     /// desc ring (naming this slot's header/data/status IOVAs) and publish the chain
     /// head in the avail ring. Does NOT ring the doorbell -- `block_on` rings once
     /// per batch, so overlapping reads post together and run on the device at once.
+    /// When `poison`, the data descriptor names `B_POISON_IOVA` (outside the domain)
+    /// instead of this slot's mapped buffer, so the IOMMU faults the data DMA -- the
+    /// executor-driven negative proof (slice 5); the header/status IOVAs stay mapped
+    /// so the request still completes and the reactor's wait returns.
     /// SAFETY: the geometry VAs are this process's `bind_device` mapping and
     /// `i < chains`, so every sub-region is within the mapped pages.
-    unsafe fn bound_enqueue(&mut self, i: usize, sector: u64) {
+    unsafe fn bound_enqueue(&mut self, i: usize, sector: u64, poison: bool) {
         let b = self.bound;
         let head = (i as u16) * B_DESC_PER_READ;
         let hdr_va = b.buf + i as u64 * B_HDR_STRIDE;
         let hdr_iova = b.buf_iova + i as u64 * B_HDR_STRIDE;
         let status_iova = b.buf_iova + B_STATUS_BASE + i as u64;
-        let data_iova = b.data_iova + i as u64 * B_SECTOR_LEN as u64;
+        let data_iova = if poison {
+            B_POISON_IOVA
+        } else {
+            b.data_iova + i as u64 * B_SECTOR_LEN as u64
+        };
 
         // Request header + a status sentinel the device overwrites, in slot i's
         // header/status sub-region.
@@ -776,6 +789,9 @@ pub struct BoundRead {
     /// (that read resolves immediately with an error rather than blocking a join).
     slot: usize,
     posted: bool,
+    /// When set, the data descriptor names an out-of-domain IOVA rather than this
+    /// slot's mapped buffer -- the executor-driven confinement proof (slice 5).
+    poison: bool,
 }
 
 /// Create a bound read of one 512-byte `sector`. A free in-flight slot is claimed
@@ -788,7 +804,26 @@ pub fn read_bound(sector: u64) -> BoundRead {
     let ud = r.next_ud;
     r.next_ud = r.next_ud.wrapping_add(1);
     let slot = r.bound_alloc(ud).unwrap_or(B_SLOT_NONE);
-    BoundRead { ud, sector, slot, posted: false }
+    BoundRead { ud, sector, slot, posted: false, poison: false }
+}
+
+/// Create a bound read that names an out-of-domain IOVA for its data buffer instead
+/// of this slot's mapped sub-buffer -- the negative proof, carried up through the
+/// reference executor, that the IOMMU confines a bound read (direct-binding slice 5).
+/// Identical to `read_bound` in every other respect: it claims a slot and rides the
+/// same submit/park/reap path; only the data descriptor's address is poisoned, so the
+/// device's data-write DMA faults and the sector never reaches `data_va()`. The
+/// request still completes (its status write is to a mapped IOVA), so `block_on`
+/// returns rather than hanging, and the confinement shows up as "the data never
+/// arrived" -- the hardware fault behind it is confirmed kernel-side after the process
+/// exits. Where slice 4's forced-fault proof used a hand-written descriptor chain,
+/// this inherits the defense through the executor's own read future.
+pub fn read_bound_poison(sector: u64) -> BoundRead {
+    let r = reactor();
+    let ud = r.next_ud;
+    r.next_ud = r.next_ud.wrapping_add(1);
+    let slot = r.bound_alloc(ud).unwrap_or(B_SLOT_NONE);
+    BoundRead { ud, sector, slot, posted: false, poison: true }
 }
 
 impl BoundRead {
@@ -819,7 +854,7 @@ impl Future for BoundRead {
         if !me.posted {
             // SAFETY: init_bound mapped the bound geometry before any read is polled,
             // and `slot < chains`.
-            unsafe { reactor().bound_enqueue(me.slot, me.sector) };
+            unsafe { reactor().bound_enqueue(me.slot, me.sector, me.poison) };
             me.posted = true;
         }
         match reactor().take(me.ud) {
