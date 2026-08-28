@@ -61,6 +61,11 @@ const IPC_REPLY: u64 = 3;
 /// the handler lives in `rings`. (register/submit are non-blocking and ride the
 /// `syscall` fast path, nr 12/13.)
 const RING_WAIT: u64 = 6;
+/// bind_wait: block until a directly-bound device's used ring advances past the
+/// caller-supplied last-seen index (direct-binding slice 3). Shares the gate
+/// because it parks; a1 = BoundDevice cap slot (rdi), a2 = last-seen used index
+/// (rsi). See virtio_blk::bind_wait.
+const BIND_WAIT: u64 = 7;
 
 /// IPC status, returned in rax -- separate from the message payload (rsi) and
 /// the transferred-cap landing slot (rdx). Splitting status from the payload
@@ -491,6 +496,9 @@ extern "C" fn ipc_dispatch(frame: *mut TrapFrame) -> u64 {
         // Shares the gate, dispatched to the async-ring subsystem. a1 = the Ring
         // capability slot (rdi). Blocks until the ring's CQ is non-empty.
         RING_WAIT => crate::rings::ring_wait(a1, frame as u64),
+        // Shares the gate, dispatched to the block subsystem. a1 = BoundDevice cap
+        // slot, a2 = last-seen used index. Blocks until the bound device completes.
+        BIND_WAIT => crate::virtio_blk::bind_wait(a1, a2, frame as u64),
         _ => IPC_ERR,
     };
     unsafe { bkl::release() };

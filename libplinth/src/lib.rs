@@ -369,6 +369,9 @@ pub const BLK_E_DEV: u64 = 4;
 // resumable trap frame.
 
 const RING_WAIT: u64 = 6;
+/// bind_wait op on the `int 0x80` gate (direct-binding slice 3): block until a
+/// directly-bound device advances its used ring past the caller's last-seen index.
+const BIND_WAIT: u64 = 7;
 
 /// ring_register(sq_slot, cq_slot, entries): bind two caller-owned frames (both
 /// mapped, read+write) as an SQ/CQ pair and return a ring capability slot, or
@@ -402,6 +405,34 @@ pub fn sys_ring_wait(ring: u64) -> u64 {
             inlateout("rax") RING_WAIT => ret,
             in("rdi") ring,
             out("rsi") _, out("rdx") _, out("rcx") _,
+            out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// bind_wait(bind_slot, used_seen): block until the directly-bound device named by
+/// the BoundDevice capability at `bind_slot` advances its used ring past
+/// `used_seen` (the library OS's last-consumed used index), then return 0
+/// (direct-binding slice 3). Returns SYS_ERR on a bad cap or non-bound device. The
+/// library OS reaps the used ring itself after the wake; the kernel only parks and
+/// is woken by the device's completion IRQ. Pass `used_seen` masked to the used
+/// ring's 16-bit index space.
+#[inline]
+pub fn sys_bind_wait(bind_slot: u64, used_seen: u64) -> u64 {
+    let ret: u64;
+    // SAFETY: int 0x80 is the kernel's blocking-call gate; its handler saves and
+    // restores every register except the result (rax). The wait blocks until the
+    // bound device's completion IRQ wakes the process (or returns at once if the
+    // device already advanced its used ring past used_seen).
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") BIND_WAIT => ret,
+            in("rdi") bind_slot,
+            in("rsi") used_seen,
+            out("rdx") _, out("rcx") _,
             out("r8") _, out("r9") _, out("r10") _, out("r11") _,
             options(nostack),
         );

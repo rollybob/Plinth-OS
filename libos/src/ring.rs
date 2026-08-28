@@ -47,8 +47,9 @@ use core::sync::atomic::{fence, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use libplinth::{
-    sys_bind_device, sys_frame_alloc, sys_frame_map, sys_ring_dropped, sys_ring_register,
-    sys_ring_submit, sys_ring_wait, sys_write, write_dec, MAP_END, PAGE_SIZE, SYS_ERR,
+    sys_bind_device, sys_bind_wait, sys_frame_alloc, sys_frame_map, sys_ring_dropped,
+    sys_ring_register, sys_ring_submit, sys_ring_wait, sys_write, write_dec, MAP_END, PAGE_SIZE,
+    SYS_ERR,
 };
 
 /// Ring depth: a power of two that fits one frame and exceeds any realistic
@@ -143,19 +144,15 @@ enum Mode {
 // bound path where the libOS writes its own descriptors (mirrors bind-user).
 const VD_F_NEXT: u16 = 1;
 const VD_F_WRITE: u16 = 2;
-const VD_AVAIL_NO_INTERRUPT: u16 = 1;
 const VBLK_T_IN: u32 = 0;
 /// Sub-layout the reactor chooses within the one bound buffer page it owns: the
 /// request header at +0, the status byte at +64 (any non-overlapping offsets work).
 const B_HDR_OFF: u64 = 0;
 const B_STATUS_OFF: u64 = 64;
-/// One 512-byte sector per bound read (slice 2 is single-sector, single in-flight).
+/// One 512-byte sector per bound read (single-sector, single in-flight for now).
 const B_SECTOR_LEN: u32 = 512;
-/// Busy-poll bound on the slice-2 used-ring wait, so a wedged device reports an
-/// error instead of hanging the executor. Slice 3 removes this with a real park.
-const B_SPIN_LIMIT: u64 = 200_000_000;
-/// Status the bound wait stages if the used ring never advances (slice-2 timeout);
-/// distinct from any real virtio-blk status (BLK_OK..BLK_E_DEV are small).
+/// Status the bound wait stages if `sys_bind_wait` errors (bad cap / non-bound
+/// device); distinct from any real virtio-blk status (BLK_OK..BLK_E_DEV are small).
 const B_STATUS_TIMEOUT: u64 = 0xFE;
 
 #[inline]
@@ -199,6 +196,9 @@ struct Bound {
     qsize: u16,
     data_iova: u64,
     buf_iova: u64,
+    /// The BoundDevice capability slot, passed to `sys_bind_wait` to park on this
+    /// device's completion IRQ (slice 3).
+    bind_slot: u64,
     /// The used-ring index already consumed; a completion is "the used index moved
     /// past this." Single in-flight for slice 2, so this advances by one per read.
     used_seen: u16,
@@ -218,6 +218,7 @@ impl Bound {
             qsize: 0,
             data_iova: 0,
             buf_iova: 0,
+            bind_slot: 0,
             used_seen: 0,
             inflight: 0,
         }
@@ -417,8 +418,10 @@ impl Reactor {
         // baselining it here (not at init) is what makes the wait correct.
         self.bound.used_seen = r16(b.used + 2);
 
-        // Publish head 0 in the avail ring, ordered before the doorbell.
-        w16(b.avail, VD_AVAIL_NO_INTERRUPT);
+        // Publish head 0 in the avail ring, ordered before the doorbell. Flags = 0
+        // (interrupts NOT suppressed): the executor parks in sys_bind_wait, so the
+        // device must raise its completion IRQ to wake us (slice 3).
+        w16(b.avail, 0);
         let idx = r16(b.avail + 2);
         let slot = (idx % b.qsize) as u64;
         w16(b.avail + 4 + slot * 2, 0);
@@ -432,23 +435,28 @@ impl Reactor {
         self.bound.inflight = ud;
     }
 
-    /// Slice-2 completion for the bound path: busy-poll the used ring until the
-    /// device advances it, then stage the status byte for the in-flight read under
-    /// its cookie (so the shared `take`/done-table path resolves it just like a
-    /// kernel-bridged completion). A wedged device stages a timeout status rather
-    /// than spinning forever. Slice 3 replaces the poll with a blocking wait on the
-    /// completion IRQ. SAFETY: the used and buffer VAs are this process's bind
+    /// Completion for the bound path (slice 3): park in `sys_bind_wait` until the
+    /// device advances its used ring past `used_seen`, then stage the status byte
+    /// for the in-flight read under its cookie (so the shared `take`/done-table path
+    /// resolves it just like a kernel-bridged completion). No busy-poll: the kernel
+    /// wakes us on the device's completion IRQ. The kernel re-checks the
+    /// device-advanced used index under IF=0 before parking, so a completion that
+    /// lands in the gap between our read below and the syscall is not lost; a
+    /// spurious wake just re-parks. A syscall error stages a timeout status rather
+    /// than looping forever. SAFETY: the used and buffer VAs are this process's bind
     /// mapping.
     unsafe fn bound_wait(&mut self) {
-        let (used, buf, seen) = (self.bound.used, self.bound.buf, self.bound.used_seen);
-        let mut spins = 0u64;
+        let (used, buf, seen, bind_slot) = (
+            self.bound.used,
+            self.bound.buf,
+            self.bound.used_seen,
+            self.bound.bind_slot,
+        );
         while r16(used + 2) == seen {
-            spins += 1;
-            if spins >= B_SPIN_LIMIT {
+            if sys_bind_wait(bind_slot, seen as u64) == SYS_ERR {
                 self.stage_bound(B_STATUS_TIMEOUT);
                 return;
             }
-            core::hint::spin_loop();
         }
         let status = r8(buf + B_STATUS_OFF) as u64;
         self.bound.used_seen = r16(used + 2);
@@ -531,6 +539,7 @@ pub fn init_bound(bind_slot: u64, base_va: u64, info_out: &mut [u64; 3]) -> bool
         qsize: qsize as u16,
         data_iova: info[1],
         buf_iova: info[2],
+        bind_slot,
         used_seen: 0,
         inflight: 0,
     };
@@ -1081,9 +1090,9 @@ pub fn block_on<F: Future + Unpin>(mut fut: F) -> F::Output {
             }
             Mode::Bound => {
                 // The poll above already wrote the descriptors and rang the doorbell
-                // (the submit is the libOS's own, no kernel entry). Block for the
-                // completion and stage it -- slice 2 busy-polls the used ring; slice
-                // 3 swaps in a real park on the completion IRQ.
+                // (the submit is the libOS's own, no kernel entry). Park for the
+                // completion via sys_bind_wait and stage it -- the kernel wakes us on
+                // the device's completion IRQ (slice 3).
                 // SAFETY: bound geometry is set (init_bound ran before any poll).
                 unsafe { r.bound_wait() };
             }

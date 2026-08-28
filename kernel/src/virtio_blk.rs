@@ -311,6 +311,12 @@ struct Bound {
     /// in slice 4, names `data_iova` in its data descriptor.
     data_phys: u64,
     data_iova: u64,
+    /// The process parked in `bind_wait` on this device's completion, or `None`
+    /// (direct-binding slice 3). The library OS owns the used ring and demuxes its
+    /// own completions, so the kernel's only role here is to park the holder and
+    /// wake it on the completion IRQ -- it never touches the used ring. Set under
+    /// the device lock by `bind_wait`, taken by the completion IRQ handler.
+    waiter: Option<usize>,
 }
 
 /// One slot per virtio-blk device the kernel tracks (pci::MAX_DEVICES). A
@@ -856,6 +862,7 @@ pub fn init<W: Write>(
             buf_phys,
             data_phys,
             data_iova,
+            waiter: None,
         })
     } else {
         None
@@ -1029,6 +1036,22 @@ fn complete_irq(dev: usize) {
                 d.intr_line
             }
         };
+        // Direct-binding slice 3: a bound device's used ring belongs to the library
+        // OS, so the kernel must NOT drain or demux it (there are no `inflights` for
+        // bound requests). Its only job on this IRQ is to wake the holder parked in
+        // `bind_wait`. Ack happened above; take the waiter here and wake it below,
+        // after the device lock drops (wake_with touches the scheduler table), like
+        // the kernel-bridged path. The used index the holder re-checks is advanced
+        // by the DEVICE, not by us, so a wake with no parked waiter is harmless.
+        if d.bound.is_some() {
+            let waiter = d.bound.as_mut().and_then(|b| b.waiter.take());
+            drop(guard);
+            if let Some(w) = waiter {
+                scheduler::wake_with(w, 0, 0, u64::MAX);
+            }
+            irq::eoi(eoi_line);
+            return;
+        }
         (d.drain_completions(&mut done), eoi_line)
     };
     // Route each completion after dropping the device lock. Posting to a CQ
@@ -1055,9 +1078,68 @@ fn complete_irq(dev: usize) {
     irq::eoi(eoi_line);
 }
 
-// The completion-IRQ stubs: one per device, because the two devices sit on
-// distinct INTx lines (QEMU q35), so each vector maps to a known device and EOIs
-// its own line. Raising pci::MAX_DEVICES means adding a stub here. BKL (D4):
+/// bind_wait(bind_slot, used_seen): block until the directly-bound device named by
+/// the BoundDevice capability at `bind_slot` advances its used ring past
+/// `used_seen` (the library OS's last-consumed used index), then return 0
+/// (direct-binding slice 3). The library OS owns the used ring and demuxes its own
+/// completions; the kernel's only role is to park the holder and wake it on the
+/// completion IRQ (`complete_irq`'s bound branch). Returns `u64::MAX` on a bad cap
+/// or a non-bound device. On the `int 0x80` gate (it parks); `frame_ptr` is the
+/// caller's saved trap frame.
+///
+/// No-lost-wakeup discipline, the same one `ring_wait` relies on: we are IF=0 from
+/// the int 0x80 entry, and the used index is advanced by the DEVICE, not the
+/// kernel. So we re-read it here under IF=0 and compare to `used_seen`. If it has
+/// already moved -- the completion landed in the window after the library OS's own
+/// last read, whether or not the IRQ handler has run -- we return without parking.
+/// Otherwise no completion IRQ can be serviced until the idle path re-enables
+/// interrupts, by which point this process is already Blocked, so the wake cannot
+/// be lost.
+pub fn bind_wait(bind_slot: u64, used_seen: u64, frame_ptr: u64) -> u64 {
+    // Resolve the BoundDevice capability to a device index (RIGHT_MAP, like
+    // bind_device does).
+    let dev = {
+        let cur = crate::process::current().lock();
+        let Some(proc) = cur.as_ref() else {
+            return u64::MAX;
+        };
+        let Ok(cap) = proc.caps.lookup(bind_slot as usize, crate::capability::RIGHT_MAP) else {
+            return u64::MAX;
+        };
+        let crate::capability::CapObject::BoundDevice { dev } = cap.object else {
+            return u64::MAX;
+        };
+        dev as usize
+    };
+
+    let current = scheduler::current_slot();
+    {
+        let Some(g) = DEVICES.get(dev) else {
+            return u64::MAX;
+        };
+        let mut guard = g.lock();
+        let Some(d) = guard.as_mut() else {
+            return u64::MAX;
+        };
+        if d.bound.is_none() {
+            return u64::MAX; // not a directly-bound device
+        }
+        // SAFETY: used_va is this device's mapped used ring; idx@2 is device-written.
+        let used_idx = unsafe { r16(d.used_va + 2) };
+        if used_idx as u64 != used_seen {
+            return 0; // a completion is already available -- do not park
+        }
+        // Register as the waiter, then park. The IRQ handler takes this and wakes us.
+        d.bound.as_mut().unwrap().waiter = Some(current);
+    }
+    scheduler::block_current(frame_ptr)
+}
+
+// The completion-IRQ stubs: one per device. Devices 0/1 (kernel-bridged) sit on
+// distinct INTx lines (QEMU q35); device 2 is the directly-bound device, whose
+// handler wakes the bind_wait holder rather than draining. Each vector maps to a
+// known device and EOIs its own line. Raising pci::MAX_DEVICES means adding a stub
+// here. BKL (D4):
 // acquired/released around complete_irq -- it calls scheduler::wake_with,
 // which touches the scheduler table.
 extern "x86-interrupt" fn blk_interrupt_dev0(_frame: InterruptStackFrame) {
@@ -1068,6 +1150,14 @@ extern "x86-interrupt" fn blk_interrupt_dev0(_frame: InterruptStackFrame) {
 extern "x86-interrupt" fn blk_interrupt_dev1(_frame: InterruptStackFrame) {
     bkl::acquire();
     complete_irq(1);
+    unsafe { bkl::release() };
+}
+// Device 2 is the directly-bound device (direct-binding slice 3). Its completion
+// IRQ routes through the same `complete_irq`, which takes the bound branch: ack +
+// wake the `bind_wait` holder, no used-ring drain.
+extern "x86-interrupt" fn blk_interrupt_dev2(_frame: InterruptStackFrame) {
+    bkl::acquire();
+    complete_irq(2);
     unsafe { bkl::release() };
 }
 
@@ -1098,6 +1188,7 @@ pub fn enable_completion_irqs() {
         let handler: extern "x86-interrupt" fn(InterruptStackFrame) = match dev {
             0 => blk_interrupt_dev0,
             1 => blk_interrupt_dev1,
+            2 => blk_interrupt_dev2,
             _ => continue, // add a stub if MAX_DEVICES grows
         };
         interrupts::set_irq_handler(vector, handler);
