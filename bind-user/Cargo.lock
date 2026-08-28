@@ -6,6 +6,14 @@ version = 4
 name = "bind-user"
 version = "0.1.0"
 dependencies = [
+ "libos",
+ "libplinth",
+]
+
+[[package]]
+name = "libos"
+version = "0.1.0"
+dependencies = [
  "libplinth",
 ]
 

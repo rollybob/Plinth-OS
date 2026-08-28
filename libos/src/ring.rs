@@ -43,11 +43,12 @@
 
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{fence, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use libplinth::{
-    sys_frame_alloc, sys_frame_map, sys_ring_dropped, sys_ring_register, sys_ring_submit,
-    sys_ring_wait, sys_write, write_dec, MAP_END, PAGE_SIZE, SYS_ERR,
+    sys_bind_device, sys_frame_alloc, sys_frame_map, sys_ring_dropped, sys_ring_register,
+    sys_ring_submit, sys_ring_wait, sys_write, write_dec, MAP_END, PAGE_SIZE, SYS_ERR,
 };
 
 /// Ring depth: a power of two that fits one frame and exceeds any realistic
@@ -116,10 +117,121 @@ unsafe fn w64(a: u64, v: u64) {
     core::ptr::write_volatile(a as *mut u64, v)
 }
 
+// --- direct-bound path (D9 slice 1+2) ---
+//
+// A second reactor mode drives a *directly-bound* device: bind_device maps the
+// device's virtqueue + notify page into this process, and the reactor writes its
+// own descriptors and rings the doorbell, with the kernel off the submit path
+// (direct_binding.md D1/D9). Everything above the reactor -- the `block_on` loop
+// and the future it drives -- is written against the reactor, not the mode.
+
+/// Which submission/completion path this reactor drives. Chosen once, at `init`
+/// (kernel-bridged) or `init_bound` (direct-bound), and fixed for the reactor's
+/// life -- honoring D9's ruling that a device is one or the other, never both.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// SQ/CQ frames registered with the kernel; submit via the `ring_submit`
+    /// doorbell, completions posted by the kernel into the CQ (the original path).
+    KernelBridged,
+    /// The reactor owns the bound device's virtqueue and writes its own
+    /// descriptors; the kernel is off the submit path. Slice 2 waits for a
+    /// completion by busy-polling the used ring (slice 3 swaps in a blocking wait).
+    Bound,
+}
+
+// virtio split-ring descriptor flags and the virtio-blk read request type, for the
+// bound path where the libOS writes its own descriptors (mirrors bind-user).
+const VD_F_NEXT: u16 = 1;
+const VD_F_WRITE: u16 = 2;
+const VD_AVAIL_NO_INTERRUPT: u16 = 1;
+const VBLK_T_IN: u32 = 0;
+/// Sub-layout the reactor chooses within the one bound buffer page it owns: the
+/// request header at +0, the status byte at +64 (any non-overlapping offsets work).
+const B_HDR_OFF: u64 = 0;
+const B_STATUS_OFF: u64 = 64;
+/// One 512-byte sector per bound read (slice 2 is single-sector, single in-flight).
+const B_SECTOR_LEN: u32 = 512;
+/// Busy-poll bound on the slice-2 used-ring wait, so a wedged device reports an
+/// error instead of hanging the executor. Slice 3 removes this with a real park.
+const B_SPIN_LIMIT: u64 = 200_000_000;
+/// Status the bound wait stages if the used ring never advances (slice-2 timeout);
+/// distinct from any real virtio-blk status (BLK_OK..BLK_E_DEV are small).
+const B_STATUS_TIMEOUT: u64 = 0xFE;
+
+#[inline]
+unsafe fn r16(a: u64) -> u16 {
+    core::ptr::read_volatile(a as *const u16)
+}
+#[inline]
+unsafe fn w16(a: u64, v: u16) {
+    core::ptr::write_volatile(a as *mut u16, v)
+}
+#[inline]
+unsafe fn r8(a: u64) -> u8 {
+    core::ptr::read_volatile(a as *const u8)
+}
+#[inline]
+unsafe fn w8(a: u64, v: u8) {
+    core::ptr::write_volatile(a as *mut u8, v)
+}
+/// Write one 16-byte split-ring descriptor at `at`: addr, len, flags, next.
+/// SAFETY: `at` is inside the mapped, writable desc-ring page.
+#[inline]
+unsafe fn write_desc(at: u64, addr: u64, len: u32, flags: u16, next: u16) {
+    core::ptr::write_volatile(at as *mut u64, addr);
+    core::ptr::write_volatile((at + 8) as *mut u32, len);
+    core::ptr::write_volatile((at + 12) as *mut u16, flags);
+    core::ptr::write_volatile((at + 14) as *mut u16, next);
+}
+
+/// Geometry of a directly-bound device, filled by `init_bound` from `bind_device`.
+/// The six pages are the contiguous window bind_device maps; the two IOVAs are the
+/// names the device's IOMMU domain resolves (the libOS writes IOVAs, never physical
+/// addresses -- D1/I5). Valid only while the reactor's mode is `Bound`.
+#[derive(Clone, Copy)]
+struct Bound {
+    notify: u64,
+    desc: u64,
+    avail: u64,
+    used: u64,
+    buf: u64,
+    data: u64,
+    qsize: u16,
+    data_iova: u64,
+    buf_iova: u64,
+    /// The used-ring index already consumed; a completion is "the used index moved
+    /// past this." Single in-flight for slice 2, so this advances by one per read.
+    used_seen: u16,
+    /// `user_data` of the one outstanding bound read, or 0 (cookies start at 1).
+    inflight: u64,
+}
+
+impl Bound {
+    const fn empty() -> Self {
+        Bound {
+            notify: 0,
+            desc: 0,
+            avail: 0,
+            used: 0,
+            buf: 0,
+            data: 0,
+            qsize: 0,
+            data_iova: 0,
+            buf_iova: 0,
+            used_seen: 0,
+            inflight: 0,
+        }
+    }
+}
+
 /// The per-process reactor: the registered ring plus the table of completions
 /// reaped from the CQ but not yet consumed by a future's `poll`.
 struct Reactor {
     ready: bool,
+    /// Which submit/completion path this reactor drives (set at init/init_bound).
+    mode: Mode,
+    /// Direct-bound device geometry; meaningful only while `mode == Bound`.
+    bound: Bound,
     handle: u64,
     /// Monotonic cookie source; each read gets a unique `user_data`.
     next_ud: u64,
@@ -151,6 +263,8 @@ struct Reactor {
 
 static mut REACTOR: Reactor = Reactor {
     ready: false,
+    mode: Mode::KernelBridged,
+    bound: Bound::empty(),
     handle: SYS_ERR,
     next_ud: 1,
     done: [(0, 0); CAP],
@@ -274,6 +388,89 @@ impl Reactor {
             sys_write(b"\n");
         }
     }
+
+    /// Submit one bound read: write its descriptor chain into the mapped desc ring
+    /// and ring the doorbell -- the libOS's own submit, no kernel entry (the
+    /// bound-mode analogue of `push_sq` plus the kernel drain). Slice 2 is single
+    /// in-flight: a 3-descriptor chain at head 0 (hdr -> data -> status) naming
+    /// buffer IOVAs the device's IOMMU domain maps. SAFETY: the geometry VAs are
+    /// this process's `bind_device` mapping and `qsize` came from that bind.
+    unsafe fn submit_bound(&mut self, ud: u64, sector: u64) {
+        // Copy the geometry out so the used-ring snapshot below can borrow self
+        // mutably. All fields are Copy.
+        let b = self.bound;
+        // Request header + a status sentinel the device overwrites, in our buffer.
+        w32(b.buf + B_HDR_OFF, VBLK_T_IN);
+        w32(b.buf + B_HDR_OFF + 4, 0);
+        w64(b.buf + B_HDR_OFF + 8, sector);
+        w8(b.buf + B_STATUS_OFF, 0xFF);
+
+        // Chain at head 0: hdr (device-read) -> data (device-write) -> status
+        // (device-write). Addresses are IOVAs, never physical (D1/I5).
+        write_desc(b.desc, b.buf_iova + B_HDR_OFF, 16, VD_F_NEXT, 1);
+        write_desc(b.desc + 16, b.data_iova, B_SECTOR_LEN, VD_F_NEXT | VD_F_WRITE, 2);
+        write_desc(b.desc + 32, b.buf_iova + B_STATUS_OFF, 1, VD_F_WRITE, 0);
+
+        // Snapshot the used-ring index NOW, before ringing, so the wait blocks for
+        // exactly this request's advance. The kernel's boot-time bind selftest
+        // already drove one read through this device, so the index is not zero --
+        // baselining it here (not at init) is what makes the wait correct.
+        self.bound.used_seen = r16(b.used + 2);
+
+        // Publish head 0 in the avail ring, ordered before the doorbell.
+        w16(b.avail, VD_AVAIL_NO_INTERRUPT);
+        let idx = r16(b.avail + 2);
+        let slot = (idx % b.qsize) as u64;
+        w16(b.avail + 4 + slot * 2, 0);
+        fence(Ordering::SeqCst);
+        w16(b.avail + 2, idx.wrapping_add(1));
+        fence(Ordering::SeqCst);
+
+        // Ring the doorbell (queue index 0) with a plain MMIO store, then record
+        // the outstanding cookie so the wait can stage its completion.
+        w16(b.notify, 0);
+        self.bound.inflight = ud;
+    }
+
+    /// Slice-2 completion for the bound path: busy-poll the used ring until the
+    /// device advances it, then stage the status byte for the in-flight read under
+    /// its cookie (so the shared `take`/done-table path resolves it just like a
+    /// kernel-bridged completion). A wedged device stages a timeout status rather
+    /// than spinning forever. Slice 3 replaces the poll with a blocking wait on the
+    /// completion IRQ. SAFETY: the used and buffer VAs are this process's bind
+    /// mapping.
+    unsafe fn bound_wait(&mut self) {
+        let (used, buf, seen) = (self.bound.used, self.bound.buf, self.bound.used_seen);
+        let mut spins = 0u64;
+        while r16(used + 2) == seen {
+            spins += 1;
+            if spins >= B_SPIN_LIMIT {
+                self.stage_bound(B_STATUS_TIMEOUT);
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        let status = r8(buf + B_STATUS_OFF) as u64;
+        self.bound.used_seen = r16(used + 2);
+        self.stage_bound(status);
+    }
+
+    /// Stage a bound completion into the done table under the in-flight cookie and
+    /// clear it. Drops the completion (counts an `undelivered`) if the table is
+    /// full, matching the kernel-bridged overrun accounting.
+    fn stage_bound(&mut self, status: u64) {
+        let ud = self.bound.inflight;
+        if ud == 0 {
+            return;
+        }
+        if self.done_len < CAP {
+            self.done[self.done_len] = (ud, status);
+            self.done_len += 1;
+        } else {
+            self.undelivered = self.undelivered.saturating_add(1);
+        }
+        self.bound.inflight = 0;
+    }
 }
 
 /// Set up the executor's ring once: allocate + map an SQ and a CQ frame and
@@ -298,6 +495,55 @@ pub fn init() -> bool {
     r.handle = handle;
     r.ready = true;
     true
+}
+
+/// Set up the executor over a *directly-bound* device instead of a kernel-bridged
+/// ring (D9). Binds the device named by the `BoundDevice` capability at
+/// `bind_slot`, mapping its virtqueue + notify page as six contiguous pages at
+/// `base_va` (notify, desc, avail, used, buf, data), and records the geometry the
+/// reactor needs to write its own descriptors. `info_out` receives
+/// `[qsize, data_iova, buf_iova]` -- the same values `bind_device` returns -- for a
+/// caller that also drives manual probes over the same mapping. Returns false if
+/// the bind fails or reports a zero-size queue. Mutually exclusive with `init`: a
+/// reactor is one mode for its life, so calling this after `init` (or twice)
+/// returns whether the reactor is already bound rather than rebinding.
+pub fn init_bound(bind_slot: u64, base_va: u64, info_out: &mut [u64; 3]) -> bool {
+    let r = reactor();
+    if r.ready {
+        return r.mode == Mode::Bound;
+    }
+    let mut info = [0u64; 3];
+    if sys_bind_device(bind_slot, base_va, info.as_mut_ptr() as u64) != 0 {
+        return false;
+    }
+    let qsize = info[0];
+    if qsize == 0 || qsize > u16::MAX as u64 {
+        return false;
+    }
+    r.mode = Mode::Bound;
+    r.bound = Bound {
+        notify: base_va,
+        desc: base_va + PAGE_SIZE,
+        avail: base_va + 2 * PAGE_SIZE,
+        used: base_va + 3 * PAGE_SIZE,
+        buf: base_va + 4 * PAGE_SIZE,
+        data: base_va + 5 * PAGE_SIZE,
+        qsize: qsize as u16,
+        data_iova: info[1],
+        buf_iova: info[2],
+        used_seen: 0,
+        inflight: 0,
+    };
+    r.ready = true;
+    *info_out = info;
+    true
+}
+
+/// The VA of the bound device's data page -- where a `read_bound` DMAs its sector.
+/// The caller verifies the delivered bytes here (the reactor owns the buffer, so it
+/// names the VA). Zero unless the reactor is bound.
+pub fn bound_data_va() -> u64 {
+    reactor().bound.data
 }
 
 /// How many event completions this reactor has reaped carrying the kernel's
@@ -435,6 +681,47 @@ impl Future for Write {
             unsafe {
                 push_sq(RING_OP_WRITE, me.ud, me.range_slot, me.frame_slot, me.sector_off, me.count)
             };
+            me.posted = true;
+        }
+        match reactor().take(me.ud) {
+            Some(status) => Poll::Ready(status),
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// A pending read over a *directly-bound* device (D9). Same lifecycle as `Read`,
+/// but its submit is the reactor writing a descriptor chain and ringing the
+/// doorbell itself -- no kernel entry -- and its completion is staged by the
+/// reactor's bound wait. The sector's bytes land in the reactor's own data page
+/// (`bound_data_va`), not a caller-named frame. Requires the reactor be in bound
+/// mode (`init_bound`).
+pub struct BoundRead {
+    ud: u64,
+    sector: u64,
+    posted: bool,
+}
+
+/// Create a bound read of one 512-byte `sector` into the bound reactor's data page.
+/// Nothing is submitted until the future is first polled. Each future draws a unique
+/// `user_data` cookie so it rides the same `take`/done-table path as a kernel-bridged
+/// read (single in-flight for slice 2).
+pub fn read_bound(sector: u64) -> BoundRead {
+    let r = reactor();
+    let ud = r.next_ud;
+    r.next_ud = r.next_ud.wrapping_add(1);
+    BoundRead { ud, sector, posted: false }
+}
+
+impl Future for BoundRead {
+    /// The virtio-blk status byte, zero-extended (BLK_OK or a device error).
+    type Output = u64;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u64> {
+        let me = self.get_mut(); // BoundRead is Unpin
+        if !me.posted {
+            // SAFETY: init_bound mapped the bound geometry before any read is polled.
+            unsafe { reactor().submit_bound(me.ud, me.sector) };
             me.posted = true;
         }
         match reactor().take(me.ud) {
@@ -773,20 +1060,33 @@ pub fn block_on<F: Future + Unpin>(mut fut: F) -> F::Output {
         if let Poll::Ready(v) = Pin::new(&mut fut).poll(&mut cx) {
             return v;
         }
-        // The poll above enqueued any not-yet-posted submissions; ring the
-        // doorbell (drains the whole SQ in one kernel entry), then block for the
-        // next completion and reap it. A redundant submit (nothing new) is a
-        // cheap no-op that posts zero.
-        let handle = reactor().handle;
-        let _ = sys_ring_submit(handle);
-        let _ = sys_ring_wait(handle);
         let r = reactor();
-        r.reap();
-        // Voice any loss counted during the reap before re-polling -- both the
-        // kernel's CQ drops and the reactor's own table overruns. Runs inside the
-        // blocking loop deliberately: a stream the caller is not draining (a mouse
-        // flood behind a keyboard wait) surfaces here or not at all. No-op unless
-        // something was lost, so the deterministic tour is unaffected.
-        r.report_losses();
+        match r.mode {
+            Mode::KernelBridged => {
+                // The poll above enqueued any not-yet-posted submissions; ring the
+                // doorbell (drains the whole SQ in one kernel entry), then block for
+                // the next completion and reap it. A redundant submit (nothing new)
+                // is a cheap no-op that posts zero.
+                let handle = r.handle;
+                let _ = sys_ring_submit(handle);
+                let _ = sys_ring_wait(handle);
+                r.reap();
+                // Voice any loss counted during the reap before re-polling -- both
+                // the kernel's CQ drops and the reactor's own table overruns. Runs
+                // inside the blocking loop deliberately: a stream the caller is not
+                // draining (a mouse flood behind a keyboard wait) surfaces here or
+                // not at all. No-op unless something was lost, so the deterministic
+                // tour is unaffected.
+                r.report_losses();
+            }
+            Mode::Bound => {
+                // The poll above already wrote the descriptors and rang the doorbell
+                // (the submit is the libOS's own, no kernel entry). Block for the
+                // completion and stage it -- slice 2 busy-polls the used ring; slice
+                // 3 swaps in a real park on the completion IRQ.
+                // SAFETY: bound geometry is set (init_bound ran before any poll).
+                unsafe { r.bound_wait() };
+            }
+        }
     }
 }

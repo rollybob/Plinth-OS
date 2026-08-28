@@ -350,19 +350,20 @@ blk: read ok b0=1 b1=2 b5=6
 blk: out-of-range rejected
 plinth: blk demo: all done
 
-# Direct-binding slice 4 demo: a library OS drives the bound device's queue itself,
-# kernel off the submit path. The kernel grants a BoundDevice capability; the
-# process maps the device (notify page uncached, desc/avail/used rings, buffers)
-# via bind_device, WRITES ITS OWN descriptor chain naming buffer IOVAs, publishes
-# it, rings the doorbell with a plain MMIO store, drains the used ring, and verifies
-# the sector-0 read -- no kernel entry on the submit or completion path (D1 amended
-# I5: a libOS names IOVAs, never physical addresses). It then names an IOVA its
+# Direct-binding demo: a library OS drives the bound device's queue itself, kernel
+# off the submit path. The kernel grants a BoundDevice capability; the process binds
+# the device (notify page uncached, desc/avail/used rings, buffers) via bind_device
+# and WRITES ITS OWN descriptor chain naming buffer IOVAs -- no kernel entry on the
+# submit or completion path (D1 amended I5: a libOS names IOVAs, never physical
+# addresses). The positive sector-0 read is driven through the reference async
+# executor over the bound device (D9 slice 1+2): init_bound + read_bound, the
+# executor writing the descriptors behind the read future. It then names an IOVA its
 # domain does not map: the IOMMU confines the device (the read never arrives), and
 # the kernel confirms the hardware fault from the fault-recording register -- the
 # slice-4 protected-DMA proof, now for a library-OS-written descriptor.
 plinth: bind demo: 1 processes
 bind: ring 3
-bind: libos wrote its own descriptor, sector 0 read verified
+bind: executor wrote its own descriptors, sector 0 read verified
 bind: out-of-domain read confined (libos named an unmapped iova)
 # Slice 5 (D7/I11): the library OS releases its BoundDevice capability, which IS
 # the binding's teardown -- the kernel resets the device to quiesce DMA, frees its

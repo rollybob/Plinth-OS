@@ -14,7 +14,8 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
-use libplinth::{sys_bind_device, sys_cap_release, sys_exit, sys_write, BIND_SLOT, MAP_BASE};
+use libos::ring;
+use libplinth::{sys_cap_release, sys_exit, sys_write, BIND_SLOT, MAP_BASE};
 
 /// The 6-page window bind_device maps into us.
 const BASE: u64 = MAP_BASE + 0x8000;
@@ -107,25 +108,31 @@ unsafe fn data_is_ramp() -> bool {
 pub extern "C" fn _start() -> ! {
     sys_write(b"bind: ring 3\n");
 
+    // Bind through the reference executor (D9): init_bound issues bind_device,
+    // mapping the six-page window at BASE, and hands back [qsize, data_iova,
+    // buf_iova] for the manual negative probe below to reuse the same mapping.
     let mut info = [0u64; 3]; // qsize, data_iova, buf_iova
-    if sys_bind_device(BIND_SLOT, BASE, info.as_mut_ptr() as u64) != 0 {
-        fail(b"bind: bind_device failed\n");
+    if !ring::init_bound(BIND_SLOT, BASE, &mut info) {
+        fail(b"bind: init_bound failed\n");
     }
     let qsize = info[0] as u16;
-    let data_iova = info[1];
     let buf_iova = info[2];
     if qsize == 0 {
         fail(b"bind: queue size zero\n");
     }
 
-    // Positive: our own descriptor names the mapped data IOVA; the read lands and
-    // is the ramp.
-    // SAFETY: the pages were just mapped; qsize/IOVAs came from bind_device.
-    let status = unsafe { submit_read(qsize, buf_iova, data_iova, 0) };
-    if status != BLK_OK || !unsafe { data_is_ramp() } {
-        fail(b"bind: libos-written read did not deliver the ramp\n");
+    // Positive: drive the read through the reference executor over the bound
+    // device. The executor writes the descriptor chain and rings the doorbell
+    // itself -- kernel off the submit path (D9) -- and its read future resolves with
+    // the device's status once the used ring advances. The bytes land in the
+    // reactor's own data page (the same DATA page below, since init_bound mapped at
+    // BASE). Same libOS-writes-its-own-descriptors property as the manual path, now
+    // behind the async executor.
+    let status = ring::block_on(ring::read_bound(0));
+    if status as u8 != BLK_OK || !unsafe { data_is_ramp() } {
+        fail(b"bind: executor-driven bound read did not deliver the ramp\n");
     }
-    sys_write(b"bind: libos wrote its own descriptor, sector 0 read verified\n");
+    sys_write(b"bind: executor wrote its own descriptors, sector 0 read verified\n");
 
     // Negative: name an IOVA the device's domain does NOT map. The IOMMU must
     // confine the device, so the read cannot land in our buffer. The request may

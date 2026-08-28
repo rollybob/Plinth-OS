@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 libplinth = { path = "../libplinth" }
+libos = { path = "../libos" }
 
 [profile.dev]
 panic = "abort"
