@@ -26,7 +26,10 @@ capabilities. Block I/O and input are both async
 completion rings (io_uring-shaped shared-memory queues) -- block reads and
 writes as one-shot requests, input as multishot subscriptions -- with a
 reference `no_std` async executor in `libos` driving many requests in flight
-and event streams at once.
+and event streams at once. A device can instead be bound directly to one library
+OS behind an IOMMU domain -- the library OS then writes its own virtqueue
+descriptors naming IOVAs and rings the doorbell itself, the kernel off the submit
+path and the hardware confining the device's DMA.
 Interrupts run through the Local APIC + I/O APIC (MSI-X for the disk, a
 per-CPU LAPIC timer), and the kernel boots and schedules on every CPU the
 ACPI MADT reports, serialized by a single big kernel lock; scheduling uses
@@ -98,6 +101,25 @@ against the cost to determinism rather than taken for granted.
   with the two cap-checks' direction reversed (`BlockRange` via `RIGHT_WRITE`,
   the I/O frame via `RIGHT_READ`), proving the ring mechanism needed no change
   to carry the opposite direction.
+- [x] **Protected DMA and direct device binding.** The block ring above keeps the
+  kernel the sole writer of physical descriptors precisely because nothing else
+  confines a device's DMA. An IOMMU changes that: each device gets a private page
+  table (a `Domain`), so it can physically reach only the frames the kernel mapped
+  into it -- proven non-vacuously by forcing an out-of-domain access and catching
+  the hardware fault. On that foundation a device can be **directly bound** to one
+  library OS: the kernel maps the virtqueue and the notify register into the library
+  OS and hands it buffer IOVAs, and from then on the library OS **writes its own
+  descriptors and rings the doorbell itself, with the kernel off the submit path
+  entirely** (`bind_device`, ABI v2.12). The library OS names an IOVA, never a
+  physical address, and the IOMMU -- not the kernel-as-sole-writer -- is what stops
+  it aiming DMA at memory it does not own; a descriptor naming an unmapped IOVA
+  faults in hardware. The same reference `no_std` async executor runs *unmodified*
+  over a bound device (only its `init` differs), overlapping many reads in flight
+  with the kernel woken only to park on the completion IRQ (`bind_wait`). This is
+  the textbook exokernel secure binding and the first step toward the share-nothing
+  direction -- one owner, its own domain; a device is either kernel-bridged or
+  directly bound, never both, and releasing the `BoundDevice` capability tears the
+  binding down and returns the device to the shared pool.
 - [x] **Console input.** The i8042 keyboard's IRQ feeds raw scancodes behind an
   interrupt-controller seam; an `EventSource` capability multiplexes the device.
   Input rides the **same completion rings as block I/O**: a keystroke answers no
@@ -204,17 +226,18 @@ against the cost to determinism rather than taken for granted.
 
 ## Stability
 
-The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.11**.
+The ABI is versioned in [ABI.md](ABI.md); the current contract is **v2.12**.
 v2 added IPC and revised `spawn`, the one incompatible change from v1 (made
 while Phase 2 is still pre-release); v2.1 (`spawn_from_buffer`), v2.2
 (console input), v2.3 (`block_read` moved to the blocking gate), v2.4
 (async completion rings, retiring `block_read`), v2.5 (input as multishot
 ring subscriptions, retiring `event_recv`), v2.6 (`RING_OP_WRITE`, the
 write half of the block ring ABI), v2.7 (the `Framebuffer` capability +
-the `fb_map` syscall), v2.8 (`cap_release`, retiring `frame_free`), and
+the `fb_map` syscall), v2.8 (`cap_release`, retiring `frame_free`),
 v2.11 (`ring_dropped`, making a subscription's dropped-event count
-readable) are all additive over v2 but for the three retired-and-shimmed
-ops. Two are not: v2.9 (a lent capability comes home when its borrower
+readable), and v2.12 (direct virtqueue binding -- `bind_device`, the
+`bind_wait` gate op, and the `BoundDevice` capability) are all additive over
+v2 but for the three retired-and-shimmed ops. Two are not: v2.9 (a lent capability comes home when its borrower
 dies) gives an existing status field a meaning a correct v2.8 caller may
 not expect, and v2.10 (the lend reserves the slot it left from) is
 observable -- a program counting its free slots sees one fewer per

@@ -338,7 +338,7 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
   gdt.rs           GDT/TSS, sysret-compatible selector layout
   serial.rs        serial console
   framebuffer.rs   discover the GOP framebuffer; hand it out as a Framebuffer cap
-  tests/           in-kernel test suite (78 tests, run in QEMU)
+  tests/           in-kernel test suite (123 tests, run in QEMU)
 
 libplinth/   user-side syscall + gate shim -- deliberately NOT a library OS
 libos/       allocator library OSes (BumpAlloc, FreeListAlloc) + ring, a
@@ -443,7 +443,12 @@ xtask/       build orchestration: user binaries, disk images, QEMU,
   stays the sole writer of physical DMA addresses, so the device is multiplexed
   with no IOMMU); the `no_std` async executor that turns a completion into a
   woken future or an event stream lives in `libos`, replaceable like every other
-  policy.
+  policy. A device can instead be taken out of that shared pool and **bound
+  directly** to one library OS behind an IOMMU domain: the library OS then writes
+  its own virtqueue descriptors naming IOVAs and rings the doorbell itself, the
+  kernel off the submit path entirely and the hardware -- not the kernel-as-sole-
+  writer -- confining the device's DMA (`bind_device`, ABI v2.12). The same
+  executor drives a bound device unmodified.
 - **Status is split from payload on every blocking call.** IPC returns a
   *status* word separate from its message (the message in `RSI`), and a ring
   block completion separates its status from the disk data (which lands in the
