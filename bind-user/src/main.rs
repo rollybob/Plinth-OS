@@ -121,18 +121,44 @@ pub extern "C" fn _start() -> ! {
         fail(b"bind: queue size zero\n");
     }
 
-    // Positive: drive the read through the reference executor over the bound
-    // device. The executor writes the descriptor chain and rings the doorbell
-    // itself -- kernel off the submit path (D9) -- and its read future resolves with
-    // the device's status once the used ring advances. The bytes land in the
-    // reactor's own data page (the same DATA page below, since init_bound mapped at
-    // BASE). Same libOS-writes-its-own-descriptors property as the manual path, now
-    // behind the async executor.
-    let status = ring::block_on(ring::read_bound(0));
-    if status as u8 != BLK_OK || !unsafe { data_is_ramp() } {
-        fail(b"bind: executor-driven bound read did not deliver the ramp\n");
+    // Positive: FOUR overlapping reads through the reference executor over the bound
+    // device -- the D9 payoff (the same join/overlap machinery asyncblk uses, now
+    // over a directly-bound device, with the kernel off the submit path). Each read
+    // lands in its own reactor-owned sub-buffer; a wrong slot->buffer route shows up
+    // as a sector's ramp in the wrong place.
+    const N: usize = 4;
+    let r0 = ring::read_bound(0);
+    let r1 = ring::read_bound(1);
+    let r2 = ring::read_bound(2);
+    let r3 = ring::read_bound(3);
+    // Capture each read's landing buffer before join takes ownership of the reads.
+    let vas = [r0.data_va(), r1.data_va(), r2.data_va(), r3.data_va()];
+    let status = ring::block_on(ring::join([r0, r1, r2, r3]));
+
+    // Every read OK, and each buffer holds ITS sector's ramp: byte j of sector s is
+    // (s + j) & 0xFF (the bind image's per-sector ramp), so no completion was routed
+    // to the wrong slot.
+    let mut ok = true;
+    let mut s = 0usize;
+    while s < N {
+        if status[s] as u8 != BLK_OK {
+            ok = false;
+        }
+        for &j in &[0u64, 1, 7, 511] {
+            let expect = ((s as u64 + j) & 0xFF) as u8;
+            // SAFETY: vas[s] is this read's mapped sub-buffer; the device DMA'd its
+            // sector in.
+            let got = unsafe { read_volatile((vas[s] + j) as *const u8) };
+            if got != expect {
+                ok = false;
+            }
+        }
+        s += 1;
     }
-    sys_write(b"bind: executor wrote its own descriptors, sector 0 read verified\n");
+    if !ok {
+        fail(b"bind: executor overlapping reads did not each deliver their sector\n");
+    }
+    sys_write(b"bind: executor ran 4 overlapping reads over the bound device, each verified\n");
 
     // Negative: name an IOVA the device's domain does NOT map. The IOMMU must
     // confine the device, so the read cannot land in our buffer. The request may

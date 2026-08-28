@@ -145,15 +145,29 @@ enum Mode {
 const VD_F_NEXT: u16 = 1;
 const VD_F_WRITE: u16 = 2;
 const VBLK_T_IN: u32 = 0;
-/// Sub-layout the reactor chooses within the one bound buffer page it owns: the
-/// request header at +0, the status byte at +64 (any non-overlapping offsets work).
-const B_HDR_OFF: u64 = 0;
-const B_STATUS_OFF: u64 = 64;
-/// One 512-byte sector per bound read (single-sector, single in-flight for now).
+/// One 512-byte sector per bound read.
 const B_SECTOR_LEN: u32 = 512;
-/// Status the bound wait stages if `sys_bind_wait` errors (bad cap / non-bound
-/// device); distinct from any real virtio-blk status (BLK_OK..BLK_E_DEV are small).
+/// Max concurrent bound reads (slice 4). The reactor owns one 4-KiB data page and
+/// one 4-KiB header/status page and subdivides each per slot, so the ceiling is the
+/// data page over the 512-byte sector: 4096 / 512 = 8. (The desc page holds 256
+/// descriptors = 85 three-descriptor chains, and a real queue is far deeper, so the
+/// data page is the binding constraint.) Multi-in-flight now lives in userspace
+/// because the kernel is off the submit path (direct_binding.md D9 / section 9.4).
+const B_MAX_INFLIGHT: usize = 8;
+/// Descriptors per read: a 3-chain (header -> data -> status). Slot i owns the chain
+/// whose head descriptor index is `i * B_DESC_PER_READ`.
+const B_DESC_PER_READ: u16 = 3;
+/// Per-slot sub-layout of the one header/status buffer page: slot i's 16-byte
+/// request header at `i*16`, its status byte at `B_STATUS_BASE + i`. Non-overlapping
+/// for i < B_MAX_INFLIGHT (headers occupy 0..128, statuses 2048..2056).
+const B_HDR_STRIDE: u64 = 16;
+const B_STATUS_BASE: u64 = 2048;
+/// Status the bound path stages if `sys_bind_wait` errors (bad cap / non-bound
+/// device) or a read cannot get a slot; distinct from any real virtio-blk status
+/// (BLK_OK..BLK_E_DEV are small).
 const B_STATUS_TIMEOUT: u64 = 0xFE;
+/// Sentinel for a `read_bound` that could not get an in-flight slot (all busy).
+const B_SLOT_NONE: usize = usize::MAX;
 
 #[inline]
 unsafe fn r16(a: u64) -> u16 {
@@ -199,11 +213,16 @@ struct Bound {
     /// The BoundDevice capability slot, passed to `sys_bind_wait` to park on this
     /// device's completion IRQ (slice 3).
     bind_slot: u64,
-    /// The used-ring index already consumed; a completion is "the used index moved
-    /// past this." Single in-flight for slice 2, so this advances by one per read.
+    /// In-flight slots this device supports = min(qsize / 3, B_MAX_INFLIGHT).
+    chains: usize,
+    /// The used-ring index already reaped; a completion is "the used index moved
+    /// past this." Advances by one per completed chain (slice 4: many per wake).
     used_seen: u16,
-    /// `user_data` of the one outstanding bound read, or 0 (cookies start at 1).
-    inflight: u64,
+    /// Per-slot in-flight cookie: slot i is busy with read `slot_cookie[i]`, or 0
+    /// when free (cookies start at 1). Slot i owns chain head `i*3`, data sub-buffer
+    /// i, and the header/status sub-region i -- the userspace demux that replaces the
+    /// kernel's `Inflights` on the bound path.
+    slot_cookie: [u64; B_MAX_INFLIGHT],
 }
 
 impl Bound {
@@ -219,8 +238,9 @@ impl Bound {
             data_iova: 0,
             buf_iova: 0,
             bind_slot: 0,
+            chains: 0,
             used_seen: 0,
-            inflight: 0,
+            slot_cookie: [0; B_MAX_INFLIGHT],
         }
     }
 }
@@ -390,84 +410,111 @@ impl Reactor {
         }
     }
 
-    /// Submit one bound read: write its descriptor chain into the mapped desc ring
-    /// and ring the doorbell -- the libOS's own submit, no kernel entry (the
-    /// bound-mode analogue of `push_sq` plus the kernel drain). Slice 2 is single
-    /// in-flight: a 3-descriptor chain at head 0 (hdr -> data -> status) naming
-    /// buffer IOVAs the device's IOMMU domain maps. SAFETY: the geometry VAs are
-    /// this process's `bind_device` mapping and `qsize` came from that bind.
-    unsafe fn submit_bound(&mut self, ud: u64, sector: u64) {
-        // Copy the geometry out so the used-ring snapshot below can borrow self
-        // mutably. All fields are Copy.
+    /// Claim a free in-flight slot for cookie `ud`, or `None` if all `chains` slots
+    /// are busy (backpressure -- the caller retries after a reap frees one). This is
+    /// the userspace analogue of the kernel's `Inflights::submit` on the bound path.
+    fn bound_alloc(&mut self, ud: u64) -> Option<usize> {
+        for i in 0..self.bound.chains {
+            if self.bound.slot_cookie[i] == 0 {
+                self.bound.slot_cookie[i] = ud;
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Enqueue slot `i`'s read of `sector`: write its 3-descriptor chain into the
+    /// desc ring (naming this slot's header/data/status IOVAs) and publish the chain
+    /// head in the avail ring. Does NOT ring the doorbell -- `block_on` rings once
+    /// per batch, so overlapping reads post together and run on the device at once.
+    /// SAFETY: the geometry VAs are this process's `bind_device` mapping and
+    /// `i < chains`, so every sub-region is within the mapped pages.
+    unsafe fn bound_enqueue(&mut self, i: usize, sector: u64) {
         let b = self.bound;
-        // Request header + a status sentinel the device overwrites, in our buffer.
-        w32(b.buf + B_HDR_OFF, VBLK_T_IN);
-        w32(b.buf + B_HDR_OFF + 4, 0);
-        w64(b.buf + B_HDR_OFF + 8, sector);
-        w8(b.buf + B_STATUS_OFF, 0xFF);
+        let head = (i as u16) * B_DESC_PER_READ;
+        let hdr_va = b.buf + i as u64 * B_HDR_STRIDE;
+        let hdr_iova = b.buf_iova + i as u64 * B_HDR_STRIDE;
+        let status_iova = b.buf_iova + B_STATUS_BASE + i as u64;
+        let data_iova = b.data_iova + i as u64 * B_SECTOR_LEN as u64;
 
-        // Chain at head 0: hdr (device-read) -> data (device-write) -> status
-        // (device-write). Addresses are IOVAs, never physical (D1/I5).
-        write_desc(b.desc, b.buf_iova + B_HDR_OFF, 16, VD_F_NEXT, 1);
-        write_desc(b.desc + 16, b.data_iova, B_SECTOR_LEN, VD_F_NEXT | VD_F_WRITE, 2);
-        write_desc(b.desc + 32, b.buf_iova + B_STATUS_OFF, 1, VD_F_WRITE, 0);
+        // Request header + a status sentinel the device overwrites, in slot i's
+        // header/status sub-region.
+        w32(hdr_va, VBLK_T_IN);
+        w32(hdr_va + 4, 0);
+        w64(hdr_va + 8, sector);
+        w8(b.buf + B_STATUS_BASE + i as u64, 0xFF);
 
-        // Snapshot the used-ring index NOW, before ringing, so the wait blocks for
-        // exactly this request's advance. The kernel's boot-time bind selftest
-        // already drove one read through this device, so the index is not zero --
-        // baselining it here (not at init) is what makes the wait correct.
-        self.bound.used_seen = r16(b.used + 2);
+        // The chain at head i*3: hdr (device-read) -> data (device-write) -> status
+        // (device-write). Descriptor k lives at desc + k*16; addresses are IOVAs,
+        // never physical (D1/I5).
+        let d = b.desc + head as u64 * 16;
+        write_desc(d, hdr_iova, 16, VD_F_NEXT, head + 1);
+        write_desc(d + 16, data_iova, B_SECTOR_LEN, VD_F_NEXT | VD_F_WRITE, head + 2);
+        write_desc(d + 32, status_iova, 1, VD_F_WRITE, 0);
 
-        // Publish head 0 in the avail ring, ordered before the doorbell. Flags = 0
-        // (interrupts NOT suppressed): the executor parks in sys_bind_wait, so the
-        // device must raise its completion IRQ to wake us (slice 3).
+        // Publish the head in the avail ring (flags = 0: interrupts NOT suppressed,
+        // so the device raises the completion IRQ the executor parks on).
         w16(b.avail, 0);
         let idx = r16(b.avail + 2);
-        let slot = (idx % b.qsize) as u64;
-        w16(b.avail + 4 + slot * 2, 0);
+        w16(b.avail + 4 + (idx % b.qsize) as u64 * 2, head);
         fence(Ordering::SeqCst);
         w16(b.avail + 2, idx.wrapping_add(1));
         fence(Ordering::SeqCst);
-
-        // Ring the doorbell (queue index 0) with a plain MMIO store, then record
-        // the outstanding cookie so the wait can stage its completion.
-        w16(b.notify, 0);
-        self.bound.inflight = ud;
     }
 
-    /// Completion for the bound path (slice 3): park in `sys_bind_wait` until the
-    /// device advances its used ring past `used_seen`, then stage the status byte
-    /// for the in-flight read under its cookie (so the shared `take`/done-table path
-    /// resolves it just like a kernel-bridged completion). No busy-poll: the kernel
-    /// wakes us on the device's completion IRQ. The kernel re-checks the
-    /// device-advanced used index under IF=0 before parking, so a completion that
-    /// lands in the gap between our read below and the syscall is not lost; a
-    /// spurious wake just re-parks. A syscall error stages a timeout status rather
-    /// than looping forever. SAFETY: the used and buffer VAs are this process's bind
-    /// mapping.
-    unsafe fn bound_wait(&mut self) {
-        let (used, buf, seen, bind_slot) = (
-            self.bound.used,
-            self.bound.buf,
-            self.bound.used_seen,
-            self.bound.bind_slot,
-        );
-        while r16(used + 2) == seen {
-            if sys_bind_wait(bind_slot, seen as u64) == SYS_ERR {
-                self.stage_bound(B_STATUS_TIMEOUT);
+    /// Ring the bound device's doorbell (queue 0) for whatever was enqueued since
+    /// the last ring. SAFETY: notify is this process's mapped doorbell page.
+    unsafe fn bound_doorbell(&self) {
+        w16(self.bound.notify, 0);
+    }
+
+    /// Park until the device advances its used ring past what we have reaped
+    /// (`used_seen`), then return (slice 3). The kernel re-checks the
+    /// device-advanced used index under IF=0 before parking, so a completion landing
+    /// in the gap is not lost; a spurious wake just re-parks. On a `sys_bind_wait`
+    /// error, fail every outstanding slot so `block_on` cannot hang. SAFETY: used VA
+    /// is this process's bind mapping.
+    unsafe fn bound_park(&mut self) {
+        while r16(self.bound.used + 2) == self.bound.used_seen {
+            if sys_bind_wait(self.bound.bind_slot, self.bound.used_seen as u64) == SYS_ERR {
+                self.bound_fail_all();
                 return;
             }
         }
-        let status = r8(buf + B_STATUS_OFF) as u64;
-        self.bound.used_seen = r16(used + 2);
-        self.stage_bound(status);
     }
 
-    /// Stage a bound completion into the done table under the in-flight cookie and
-    /// clear it. Drops the completion (counts an `undelivered`) if the table is
-    /// full, matching the kernel-bridged overrun accounting.
-    fn stage_bound(&mut self, status: u64) {
-        let ud = self.bound.inflight;
+    /// Reap every completion the device has posted since `used_seen` (slice 4: many
+    /// per wake). For each used element, map its echoed chain head back to a slot,
+    /// read that slot's status byte, stage it under the slot's cookie (the shared
+    /// `take`/done-table path), and free the slot. SAFETY: used/buf VAs are this
+    /// process's bind mapping.
+    unsafe fn bound_reap(&mut self) {
+        let (used, buf, qsize) = (self.bound.used, self.bound.buf, self.bound.qsize);
+        loop {
+            let used_idx = r16(used + 2);
+            if self.bound.used_seen == used_idx {
+                break;
+            }
+            // Order the status/id reads after observing the used-index advance.
+            fence(Ordering::SeqCst);
+            let ring_slot = (self.bound.used_seen % qsize) as u64;
+            // Used element { id: u32, len: u32 }; id is the chain head we submitted.
+            let head = r32(used + 4 + ring_slot * 8);
+            let i = (head / B_DESC_PER_READ as u32) as usize;
+            if i < self.bound.chains {
+                let status = r8(buf + B_STATUS_BASE + i as u64) as u64;
+                let ud = self.bound.slot_cookie[i];
+                self.bound.slot_cookie[i] = 0;
+                self.stage_done(ud, status);
+            }
+            self.bound.used_seen = self.bound.used_seen.wrapping_add(1);
+        }
+    }
+
+    /// Stage one bound completion into the done table under its cookie. Drops it
+    /// (counts an `undelivered`, matching the kernel-bridged overrun accounting) if
+    /// the table is full; a zero cookie (a freed/unknown slot) is ignored.
+    fn stage_done(&mut self, ud: u64, status: u64) {
         if ud == 0 {
             return;
         }
@@ -477,7 +524,18 @@ impl Reactor {
         } else {
             self.undelivered = self.undelivered.saturating_add(1);
         }
-        self.bound.inflight = 0;
+    }
+
+    /// Fail every outstanding bound slot with a timeout status (used only when
+    /// `sys_bind_wait` errors), so the parked reads resolve instead of hanging.
+    fn bound_fail_all(&mut self) {
+        for i in 0..self.bound.chains {
+            let ud = self.bound.slot_cookie[i];
+            if ud != 0 {
+                self.bound.slot_cookie[i] = 0;
+                self.stage_done(ud, B_STATUS_TIMEOUT);
+            }
+        }
     }
 }
 
@@ -528,31 +586,37 @@ pub fn init_bound(bind_slot: u64, base_va: u64, info_out: &mut [u64; 3]) -> bool
     if qsize == 0 || qsize > u16::MAX as u64 {
         return false;
     }
+    // In-flight ceiling: min(qsize / 3, MAX). Never zero for a real queue (qsize is
+    // at least 3), but guard so a pathological queue disables the bound path rather
+    // than dividing by zero downstream.
+    let chains = ((qsize / B_DESC_PER_READ as u64) as usize).min(B_MAX_INFLIGHT);
+    if chains == 0 {
+        return false;
+    }
+    let used = base_va + 3 * PAGE_SIZE;
     r.mode = Mode::Bound;
     r.bound = Bound {
         notify: base_va,
         desc: base_va + PAGE_SIZE,
         avail: base_va + 2 * PAGE_SIZE,
-        used: base_va + 3 * PAGE_SIZE,
+        used,
         buf: base_va + 4 * PAGE_SIZE,
         data: base_va + 5 * PAGE_SIZE,
         qsize: qsize as u16,
         data_iova: info[1],
         buf_iova: info[2],
         bind_slot,
-        used_seen: 0,
-        inflight: 0,
+        chains,
+        // Baseline the reap cursor at the current used index: the kernel's boot-time
+        // bind selftest already drove one read through this device, so the index is
+        // not zero. All later reaps are relative to this.
+        // SAFETY: `used` is this process's mapped used-ring page (just bound).
+        used_seen: unsafe { r16(used + 2) },
+        slot_cookie: [0; B_MAX_INFLIGHT],
     };
     r.ready = true;
     *info_out = info;
     true
-}
-
-/// The VA of the bound device's data page -- where a `read_bound` DMAs its sector.
-/// The caller verifies the delivered bytes here (the reactor owns the buffer, so it
-/// names the VA). Zero unless the reactor is bound.
-pub fn bound_data_va() -> u64 {
-    reactor().bound.data
 }
 
 /// How many event completions this reactor has reaped carrying the kernel's
@@ -700,26 +764,44 @@ impl Future for Write {
 }
 
 /// A pending read over a *directly-bound* device (D9). Same lifecycle as `Read`,
-/// but its submit is the reactor writing a descriptor chain and ringing the
-/// doorbell itself -- no kernel entry -- and its completion is staged by the
-/// reactor's bound wait. The sector's bytes land in the reactor's own data page
-/// (`bound_data_va`), not a caller-named frame. Requires the reactor be in bound
-/// mode (`init_bound`).
+/// but its submit is the reactor writing a descriptor chain itself -- no kernel
+/// entry -- and its completion is staged by the reactor's bound reap. The sector's
+/// bytes land in the reactor's own per-slot data sub-buffer (`data_va()`), not a
+/// caller-named frame. Many `BoundRead`s can be in flight at once (slice 4), each on
+/// its own slot. Requires the reactor be in bound mode (`init_bound`).
 pub struct BoundRead {
     ud: u64,
     sector: u64,
+    /// The in-flight slot claimed at creation, or `B_SLOT_NONE` if all were busy
+    /// (that read resolves immediately with an error rather than blocking a join).
+    slot: usize,
     posted: bool,
 }
 
-/// Create a bound read of one 512-byte `sector` into the bound reactor's data page.
-/// Nothing is submitted until the future is first polled. Each future draws a unique
-/// `user_data` cookie so it rides the same `take`/done-table path as a kernel-bridged
-/// read (single in-flight for slice 2).
+/// Create a bound read of one 512-byte `sector`. A free in-flight slot is claimed
+/// now (so `data_va()` is known before the join), but nothing is submitted until the
+/// future is first polled -- so a batch of reads posts together and overlaps on the
+/// device. Each future draws a unique `user_data` cookie and rides the same
+/// `take`/done-table path as a kernel-bridged read.
 pub fn read_bound(sector: u64) -> BoundRead {
     let r = reactor();
     let ud = r.next_ud;
     r.next_ud = r.next_ud.wrapping_add(1);
-    BoundRead { ud, sector, posted: false }
+    let slot = r.bound_alloc(ud).unwrap_or(B_SLOT_NONE);
+    BoundRead { ud, sector, slot, posted: false }
+}
+
+impl BoundRead {
+    /// The VA where this read's sector lands -- the reactor owns the buffer, so it
+    /// names the address; the caller verifies the bytes here once the read resolves.
+    /// Zero if the read got no slot (all in-flight slots were busy).
+    pub fn data_va(&self) -> u64 {
+        if self.slot == B_SLOT_NONE {
+            0
+        } else {
+            reactor().bound.data + self.slot as u64 * B_SECTOR_LEN as u64
+        }
+    }
 }
 
 impl Future for BoundRead {
@@ -728,9 +810,16 @@ impl Future for BoundRead {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u64> {
         let me = self.get_mut(); // BoundRead is Unpin
+        if me.slot == B_SLOT_NONE {
+            // No slot was available at creation: resolve as an error rather than
+            // blocking the executor forever. (The demo stays within B_MAX_INFLIGHT,
+            // so this is the honest failure mode, not a normal path.)
+            return Poll::Ready(B_STATUS_TIMEOUT);
+        }
         if !me.posted {
-            // SAFETY: init_bound mapped the bound geometry before any read is polled.
-            unsafe { reactor().submit_bound(me.ud, me.sector) };
+            // SAFETY: init_bound mapped the bound geometry before any read is polled,
+            // and `slot < chains`.
+            unsafe { reactor().bound_enqueue(me.slot, me.sector) };
             me.posted = true;
         }
         match reactor().take(me.ud) {
@@ -886,22 +975,26 @@ impl<const N: usize> Future for Collect<'_, N> {
     }
 }
 
-/// Await several reads together: polls each unfinished child on every poll, so
-/// they all enqueue up front and overlap on the device. Resolves to each read's
-/// status, indexed as the input array.
-pub struct JoinReads<const N: usize> {
-    reads: [Read; N],
+/// Await several homogeneous reads together: polls each unfinished child on every
+/// poll, so they all enqueue up front and overlap on the device. Resolves to each
+/// read's status, indexed as the input array. Generic over the read future, so it
+/// joins kernel-bridged `Read`s or directly-bound `BoundRead`s the same way -- the
+/// D9 property that the executor's overlap machinery does not change with the mode
+/// underneath (both have `Output = u64`).
+pub struct JoinReads<F: Future<Output = u64> + Unpin, const N: usize> {
+    reads: [F; N],
     status: [u64; N],
     done: [bool; N],
 }
 
-/// Join `N` reads into one future. `block_on(join([...]))` issues them all,
-/// then resolves once every one has completed.
-pub fn join<const N: usize>(reads: [Read; N]) -> JoinReads<N> {
+/// Join `N` reads into one future. `block_on(join([...]))` issues them all, then
+/// resolves once every one has completed. `F` is inferred from the array -- `Read`
+/// for a kernel-bridged ring, `BoundRead` for a directly-bound device.
+pub fn join<F: Future<Output = u64> + Unpin, const N: usize>(reads: [F; N]) -> JoinReads<F, N> {
     JoinReads { reads, status: [0; N], done: [false; N] }
 }
 
-impl<const N: usize> Future for JoinReads<N> {
+impl<F: Future<Output = u64> + Unpin, const N: usize> Future for JoinReads<F, N> {
     type Output = [u64; N];
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<[u64; N]> {
@@ -909,7 +1002,7 @@ impl<const N: usize> Future for JoinReads<N> {
         let mut all = true;
         for i in 0..N {
             if !me.done[i] {
-                // Read is Unpin, so a fresh Pin over the array element is sound.
+                // F is Unpin, so a fresh Pin over the array element is sound.
                 match Pin::new(&mut me.reads[i]).poll(cx) {
                     Poll::Ready(s) => {
                         me.status[i] = s;
@@ -1089,12 +1182,17 @@ pub fn block_on<F: Future + Unpin>(mut fut: F) -> F::Output {
                 r.report_losses();
             }
             Mode::Bound => {
-                // The poll above already wrote the descriptors and rang the doorbell
-                // (the submit is the libOS's own, no kernel entry). Park for the
-                // completion via sys_bind_wait and stage it -- the kernel wakes us on
-                // the device's completion IRQ (slice 3).
+                // The poll above enqueued any new reads into the desc/avail rings
+                // (the submit is the libOS's own, no kernel entry) but did not ring.
+                // Ring once for the whole batch so overlapping reads run together,
+                // then park for the next completion(s) and reap them all -- the
+                // kernel wakes us on the device's completion IRQ (slice 3).
                 // SAFETY: bound geometry is set (init_bound ran before any poll).
-                unsafe { r.bound_wait() };
+                unsafe {
+                    r.bound_doorbell();
+                    r.bound_park();
+                    r.bound_reap();
+                }
             }
         }
     }

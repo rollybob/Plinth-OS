@@ -363,7 +363,7 @@ plinth: blk demo: all done
 # slice-4 protected-DMA proof, now for a library-OS-written descriptor.
 plinth: bind demo: 1 processes
 bind: ring 3
-bind: executor wrote its own descriptors, sector 0 read verified
+bind: executor ran 4 overlapping reads over the bound device, each verified
 bind: out-of-domain read confined (libos named an unmapped iova)
 # Slice 5 (D7/I11): the library OS releases its BoundDevice capability, which IS
 # the binding's teardown -- the kernel resets the device to quiesce DMA, frees its
