@@ -1,4 +1,4 @@
-# Plinth ABI v2.11
+# Plinth ABI v2.12
 
 This is the contract between a Plinth program and the kernel: the call
 interfaces, the capability model, the executable format, and the state a
@@ -140,6 +140,50 @@ v2 adds inter-process communication and concurrency, and revises one v1 call:
   on-disk formats are. (The kernel's own diagnostic console draws only when there
   is no serial port or on a panic; it is not an ABI surface and no tenant can
   reach it -- D11.) Purely additive: no existing call changed.
+
+### v2.12 (direct virtqueue binding -- a library OS drives a device itself)
+
+- **New: `bind_device` syscall (nr 17).** `bind_device(slot, base_va, info_ptr)`
+  exclusively binds the virtio-blk device named by a `BoundDevice` capability and
+  maps its single virtqueue into the caller: six contiguous pages at `base_va` --
+  the notify register (uncached, user-accessible MMIO), the descriptor / available /
+  used rings, and a header/status + data buffer region -- and writes a `BindInfo`
+  (queue size and the two buffer IOVAs) to `info_ptr`. The kernel gives the device a
+  private IOMMU domain, maps the virtqueue and buffers into it at kernel-assigned
+  IOVAs, and programs the device's queue registers. From then on the library OS
+  writes its own descriptors naming those IOVAs and rings the doorbell with a plain
+  store -- **no kernel entry on the submit path**. `RIGHT_MAP` gates the bind; a
+  non-`BoundDevice` capability is refused on the kind check.
+- **New: `bind_wait` on the `int 0x80` gate (op 7).** `bind_wait(slot, used_seen)`
+  blocks the caller until the bound device's completion interrupt advances its used
+  ring past `used_seen`, then returns. It re-reads the device-advanced used index
+  with interrupts off before parking, so a completion landing in the gap between the
+  caller's last read and the park is not lost (a spurious wake simply re-parks). This
+  is the one kernel entry a bound reactor makes to block: the kernel does no
+  descriptor or DMA work, it only parks and wakes on the device IRQ, and the library
+  OS drains its own used ring. Interrupt delivery stays a kernel interrupt that wakes
+  a blocked tenant -- user-mode interrupt delivery is not in this ABI.
+- **New: the `BoundDevice` capability.** Names a device that may be exclusively
+  bound; carries `RIGHT_MAP`. Binding takes the device out of the shared,
+  kernel-bridged pool -- a device is either kernel-bridged or directly bound, never
+  both. Releasing the capability with `cap_release` (nr 15) **is** the teardown: the
+  kernel resets the device to quiesce in-flight DMA, invalidates and tears down the
+  domain, frees the ring and buffer frames, and returns the device to the unbound
+  pool. A holder that dies without releasing leaks its one binding until reboot (a
+  documented v1 limitation).
+- **The IOMMU is the whole defense.** A directly-bound library OS names IOVAs, never
+  physical addresses: an IOVA is a name in that one device's domain, meaningless
+  outside it, and the IOMMU refuses any the kernel did not map. A descriptor naming
+  an unmapped IOVA faults in hardware and the DMA never lands, so a buggy or hostile
+  bound tenant reaches only the frames the kernel placed in its domain -- the
+  property the kernel-as-sole-descriptor-writer used to hold, moved to a hardware
+  boundary. The notify page is mapped into the library OS only when a bind-time check
+  proves it shares no page with the device's control registers; otherwise the
+  doorbell degrades to a syscall.
+- **Purely additive.** No existing call changes. The kernel-bridged completion rings
+  (v2.4-v2.6) are untouched; direct binding is an alternative path a device enters
+  only through `bind_device`. The bump is because the syscall table grew (nr 17) and
+  the gate gained op 7, not because any existing behaviour moved.
 
 ### v2.11 (the dropped-event count becomes readable)
 
@@ -359,6 +403,7 @@ The non-blocking calls use the `syscall`/`sysretq` instructions:
 | 14 | fb_map       | slot, va, info_ptr    | 0, or `SYS_ERR`                  |
 | 15 | cap_release  | slot                  | 0, or `SYS_ERR`                  |
 | 16 | ring_dropped | ring, user_data       | drop count, or `SYS_ERR`         |
+| 17 | bind_device  | slot, base_va, info_ptr | 0, or `SYS_ERR`                |
 
 (Nr 10, `block_read`, was retired in v2.3 -- moved to the `int 0x80` gate --
 and that gate op was itself retired in v2.4: block I/O is the ring ABI. The
@@ -427,6 +472,21 @@ Notes:
   window. The user chooses `va`, the exokernel placement contract; the kernel
   multiplexes the raw pixel region and does no drawing. `libgfx::Framebuffer::map`
   wraps this with a typed `FbInfo`.
+- **bind_device(slot, base_va, info_ptr)** exclusively binds the virtio-blk device
+  named by the `BoundDevice` capability at `slot` and maps its virtqueue into the
+  caller: six contiguous pages from the page-aligned `base_va` (notify register,
+  descriptor / available / used rings, and a header/status + data buffer region),
+  and writes a `BindInfo` -- three `u64`s: queue size, the data-buffer IOVA, the
+  header/status-buffer IOVA -- to `info_ptr` (its `[info_ptr, info_ptr+24)` range
+  must be mapped and user-accessible). The kernel gives the device a private IOMMU
+  domain, maps the virtqueue and buffers into it at kernel-assigned IOVAs, and
+  programs the device's queue registers; the caller then writes its own descriptors
+  naming those IOVAs and rings the doorbell with a plain store, the kernel off the
+  submit path. Returns 0, or `SYS_ERR` for a bad slot, a non-`BoundDevice`
+  capability, a missing `RIGHT_MAP`, a `base_va` that does not fit the Map window, or
+  a device already bound. The binding is torn down by releasing the capability with
+  `cap_release`. `libos::ring::init_bound` wraps this and drives the bound device
+  through the same reference async executor as a kernel-bridged ring. See v2.12.
 
 ## IPC interface
 
@@ -460,6 +520,7 @@ convention mirrors the syscall one:
 | 2        | call  | ep_slot, req              | status; reply word in RSI              |
 | 3        | reply | reply_slot, msg           | status                                 |
 | 6        | ring_wait  | ring                 | status (woken; reap the CQ in memory)  |
+| 7        | bind_wait  | slot, used_seen      | status (woken; drain the used ring)    |
 
 `ring_wait` is not IPC, but it shares this gate because a blocking wait needs the
 same resumable trap frame the IPC ops do. It now serves both block I/O and input,
@@ -467,6 +528,12 @@ which both ride the ring ABI. (Op 5, `block_read`, was retired in v2.4 and op 4,
 `event_recv`, in v2.5 -- both became the ring ABI; the non-blocking
 `ring_register`/`ring_submit` are on the `syscall` fast path, nr 12/13.)
 `ring_wait` is documented under "Async completion rings" below.
+
+`bind_wait` (op 7, v2.12) is the blocking wait for a **directly bound** device
+(see `bind_device`, nr 17): it parks the caller until the bound device's completion
+interrupt advances its used ring past `used_seen`, and shares this gate for the same
+reason `ring_wait` does. It is the only kernel entry a bound reactor makes to block;
+the caller drains its own used ring in memory on return.
 
 Notes:
 
@@ -516,6 +583,12 @@ batched doorbell and the completion interrupt. The kernel is the sole writer of
 the physical descriptor addresses the device DMAs from, so devices are
 multiplexed across tenants with no IOMMU; a request names capability *slots*,
 never addresses.
+
+A device can instead be **directly bound** to one library OS (v2.12,
+`bind_device`), which takes it out of this shared pool: the library OS then writes
+its own virtqueue descriptors naming IOVAs and rings the doorbell itself, with the
+kernel off the submit path and the device's IOMMU domain -- not the kernel-as-sole-
+writer -- confining its DMA. A device is one or the other, never both.
 
 - **ring_register(sq_slot, cq_slot, entries)** (`syscall` nr 12) binds the two
   frames as an SQ/CQ pair and returns a `Ring` capability slot, or `SYS_ERR`.
@@ -614,6 +687,7 @@ index into a per-process table; the records never leave the kernel. Kinds:
 | EventSource | one input device's event stream | `READ`                     |
 | Ring       | a bound SQ/CQ pair (block I/O + input) | `READ`, `WRITE`      |
 | Framebuffer | the linear framebuffer (a pixel region + geometry) | `MAP`, `WRITE` |
+| BoundDevice | a device that may be exclusively bound (v2.12) | `MAP`         |
 
 Rights are checked at use, not at transfer. `Reply` capabilities are minted by
 the kernel (on receiving a `call`) and consumed on use; you cannot create one. A

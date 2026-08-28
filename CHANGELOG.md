@@ -3,7 +3,7 @@
 All notable changes to Plinth are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to
 follow semantic versioning. The ABI (see [ABI.md](ABI.md)) is versioned; the
-current contract is **v2.11**. v2 added IPC and revised `spawn`, breaking v1 --
+current contract is **v2.12**. v2 added IPC and revised `spawn`, breaking v1 --
 the one incompatible ABI change so far; v2.1 added `spawn_from_buffer` (the
 load-from-disk path), v2.2 added console input (`event_recv` + `EventSource`),
 both additive over v2; v2.3 moved `block_read` to the `int 0x80` gate so it can
@@ -22,13 +22,60 @@ carry the landing slot; v2.10 makes that landing slot **predictable in advance**
 by reserving the slot a capability was lent from, so it comes home to where it
 left; v2.11 makes the per-subscription dropped-event count readable with the
 `ring_dropped` syscall (nr 16), so input lost to a full completion queue is a
-number a consumer can read rather than a silent gap. This paragraph said "v2.8"
+number a consumer can read rather than a silent gap; v2.12 adds direct virtqueue
+binding -- `bind_device` (nr 17) and the `bind_wait` gate op (7) let a library OS
+exclusively bind a device, map its virtqueue, write its own descriptors naming
+IOVAs, and drive it with the kernel off the submit path and the device's IOMMU
+domain confining its DMA, purely additive over v2.11. This paragraph said "v2.8"
 through the v2.9 and v2.10 bumps -- the same drift the splash hit at v2.7, caught
 here on 2026-08-13.
 
 ## [Unreleased]
 
 ### Added
+- **Direct virtqueue binding: a library OS drives a device itself (ABI v2.12).**
+  Until now a library OS submitted capability-named requests into a shared ring and
+  the kernel turned each into a physical virtqueue descriptor -- the kernel the sole
+  writer of the addresses the device DMAs from, which is what let one device be
+  multiplexed across tenants with no IOMMU. Direct binding is the textbook exokernel
+  secure binding underneath the same interface: `bind_device` (syscall nr 17) maps a
+  device's single virtqueue + its notify register (uncached, user-accessible MMIO) +
+  the DMA buffers into one library OS, gives the device a private IOMMU domain, and
+  returns the buffer IOVAs; the library OS then **writes its own descriptors naming
+  those IOVAs and rings the doorbell with a plain store, the kernel off the submit
+  path entirely**. The device is claimed exclusively (a `BoundDevice` capability,
+  `RIGHT_MAP`) and leaves the shared kernel-bridged pool -- a device is either
+  kernel-bridged or directly bound, never both.
+
+  What makes a library-OS-written descriptor safe is the IOMMU, not the kernel: the
+  library OS names an IOVA, never a physical address, and the device's domain
+  physically cannot reach a frame the kernel did not map into it. A descriptor naming
+  an unmapped IOVA faults in hardware and the DMA never lands -- the same protected-
+  DMA proof the IOMMU milestone established, now for a descriptor the kernel never
+  saw. The notify page is exposed to the library OS only when a bind-time check
+  proves it shares no page with the device's control registers; otherwise the
+  doorbell degrades to a syscall.
+
+  Completion stays a kernel interrupt that wakes a blocked tenant (no user-mode
+  interrupt delivery): a new `bind_wait` gate op (7) parks the caller until the bound
+  device advances its used ring, re-checking the device-advanced index with
+  interrupts off so a completion in the gap is never lost, and the library OS drains
+  its own used ring. Teardown is a capability release -- `cap_release` on the
+  `BoundDevice` cap resets the device to quiesce DMA, tears down the domain, and
+  frees the ring/buffer frames, returning the device to the unbound pool (a holder
+  that dies without releasing leaks its one binding until reboot, a documented v1
+  limit).
+
+  The reference `no_std` async executor in `libos` runs **unmodified** over a bound
+  device: only its `init` differs (`init_bound` instead of `init`), and the same
+  `read`/`join`/`block_on` code overlaps many reads in flight, the reactor managing
+  the descriptor-ring free list in userspace since the kernel is off the path. The
+  `bind-user` demo proves both directions through that executor -- four overlapping
+  joined reads each verified against their own sector, and an out-of-domain
+  `read_bound_poison` that the IOMMU confines (the data never arrives; the kernel
+  confirms the hardware fault from the fault-recording register after the demo
+  exits). No hand-written descriptor chain remains in the demo: the executor path
+  inherits the IOMMU defense, proven rather than assumed.
 - **Diagnostic console on serial-less machines (D11).** The kernel gains a
   framebuffer text console, used when boot finds no 16550 (most machines built in
   the last decade) or to report a panic -- until now such a machine booted mute,
