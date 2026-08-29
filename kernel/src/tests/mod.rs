@@ -233,6 +233,7 @@ const TESTS: &[TestCase] = &[
         run: scheduler::work_steal_skips_donor_current,
     },
     TestCase { name: "iommu::map_translate_roundtrip", run: iommu::map_translate_roundtrip },
+    TestCase { name: "iommu::amdvi_map_translate_roundtrip", run: iommu::amdvi_map_translate_roundtrip },
     TestCase { name: "iommu::empty_domain_translates_none", run: iommu::empty_domain_translates_none },
     TestCase { name: "iommu::rejects_bad_requests", run: iommu::rejects_bad_requests },
     TestCase { name: "iommu::teardown_frees_every_table", run: iommu::teardown_frees_every_table },

@@ -14,7 +14,7 @@
 
 use super::TestCtx;
 use crate::iommu::{
-    Domain, DomainError, IovaAllocator, TranslationTables, IOMMU_READ, IOMMU_WRITE,
+    Domain, DomainError, IovaAllocator, PteFmt, TranslationTables, IOMMU_READ, IOMMU_WRITE,
 };
 use crate::test_assert;
 
@@ -24,7 +24,7 @@ const AW: u8 = 48;
 /// map then translate is the identity on the frame, carrying the page offset;
 /// unmap makes it disappear.
 pub fn map_translate_roundtrip(ctx: &mut TestCtx) -> Result<(), &'static str> {
-    let mut d = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let mut d = Domain::new(ctx.frames, AW, PteFmt::Vtd).map_err(|_| "domain new failed")?;
 
     let iova = 0x1000u64;
     let phys = 0x00AA_0000u64;
@@ -47,10 +47,41 @@ pub fn map_translate_roundtrip(ctx: &mut TestCtx) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The AMD-Vi entry encoding round-trips the same way the VT-d one does: build a
+/// domain in the AMD-Vi format, map a page, translate it back (proving the present
+/// bit / Next Level / IR-IW encoding decodes to the right address), refuse a double
+/// map, unmap, and tear down with no leak. The radix walk is shared with VT-d; this
+/// pins the AMD-Vi per-entry encoding that forks under it.
+pub fn amdvi_map_translate_roundtrip(ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut d = Domain::new(ctx.frames, AW, PteFmt::AmdVi).map_err(|_| "amd domain new failed")?;
+
+    let iova = 0x2000u64;
+    let phys = 0x00BB_0000u64;
+    d.map(ctx.frames, iova, phys, IOMMU_READ | IOMMU_WRITE)
+        .map_err(|_| "amd map failed")?;
+
+    test_assert!(d.translate(iova) == Some(phys), "amd translate should resolve the mapped frame");
+    test_assert!(
+        d.translate(iova + 0x321) == Some(phys + 0x321),
+        "amd translate should carry the page offset"
+    );
+    test_assert!(d.translate(iova + 0x1000).is_none(), "amd neighbour page must be unmapped");
+    test_assert!(
+        d.map(ctx.frames, iova, phys, IOMMU_READ) == Err(DomainError::AlreadyMapped),
+        "amd double-map must be refused"
+    );
+
+    d.unmap(iova).map_err(|_| "amd unmap failed")?;
+    test_assert!(d.translate(iova).is_none(), "amd translate after unmap must be None");
+
+    d.teardown(ctx.frames);
+    Ok(())
+}
+
 /// A fresh domain resolves nothing, and the walk terminates cleanly at every
 /// level (no present entry anywhere).
 pub fn empty_domain_translates_none(ctx: &mut TestCtx) -> Result<(), &'static str> {
-    let mut d = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let mut d = Domain::new(ctx.frames, AW, PteFmt::Vtd).map_err(|_| "domain new failed")?;
     test_assert!(d.translate(0x0).is_none(), "zero iova unmapped in a fresh domain");
     test_assert!(d.translate(0x1000).is_none(), "low iova unmapped");
     test_assert!(d.translate(1 << 30).is_none(), "mid iova unmapped");
@@ -62,7 +93,7 @@ pub fn empty_domain_translates_none(ctx: &mut TestCtx) -> Result<(), &'static st
 /// Misaligned addresses are rejected; a double map is caught; unmapping nothing
 /// is an error. The negative space, so a bug cannot pass silently.
 pub fn rejects_bad_requests(ctx: &mut TestCtx) -> Result<(), &'static str> {
-    let mut d = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let mut d = Domain::new(ctx.frames, AW, PteFmt::Vtd).map_err(|_| "domain new failed")?;
 
     test_assert!(
         d.map(ctx.frames, 0x1001, 0x2000, IOMMU_READ) == Err(DomainError::Misaligned),
@@ -96,7 +127,7 @@ pub fn rejects_bad_requests(ctx: &mut TestCtx) -> Result<(), &'static str> {
 pub fn teardown_frees_every_table(ctx: &mut TestCtx) -> Result<(), &'static str> {
     let before = ctx.frames.free_frames();
 
-    let mut d = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let mut d = Domain::new(ctx.frames, AW, PteFmt::Vtd).map_err(|_| "domain new failed")?;
     // Three IOVAs chosen to diverge at the L4, L3, and L1 index respectively, so
     // the domain must allocate multiple separate intermediate tables (not just
     // reuse one path).
@@ -123,11 +154,11 @@ pub fn teardown_frees_every_table(ctx: &mut TestCtx) -> Result<(), &'static str>
 /// than silently building a wrong-shaped table.
 pub fn rejects_unsupported_width(ctx: &mut TestCtx) -> Result<(), &'static str> {
     test_assert!(
-        Domain::new(ctx.frames, 40).err() == Some(DomainError::UnsupportedWidth),
+        Domain::new(ctx.frames, 40, PteFmt::Vtd).err() == Some(DomainError::UnsupportedWidth),
         "40-bit is not a VT-d AGAW and must be rejected"
     );
     // 48-bit (the real unit) is accepted; clean up so the check leaves no frame held.
-    let mut d = Domain::new(ctx.frames, AW).map_err(|_| "48-bit width should be accepted")?;
+    let mut d = Domain::new(ctx.frames, AW, PteFmt::Vtd).map_err(|_| "48-bit width should be accepted")?;
     d.teardown(ctx.frames);
     Ok(())
 }
@@ -148,7 +179,7 @@ const PTR_MASK: u64 = 0x000f_ffff_ffff_f000; // [51:12] next-table / SLPTPTR poi
 /// `Domain::root()`.
 pub fn context_entry_encoding(ctx: &mut TestCtx) -> Result<(), &'static str> {
     // A real domain to point at, so the SLPTPTR under test is a live root.
-    let mut dom = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let mut dom = Domain::new(ctx.frames, AW, PteFmt::Vtd).map_err(|_| "domain new failed")?;
     let slptptr = dom.root();
 
     let mut tt = TranslationTables::new(ctx.frames).map_err(|_| "tables new failed")?;
@@ -204,7 +235,7 @@ const IOVA_BASE: u64 = 0x4000_0000; // 1 GiB
 /// `unmap_buffer` clears it. The slice-1 headline: the libOS-facing IOVA is not
 /// the physical address, unlike the slice-3 identity block map.
 pub fn iova_map_translate_roundtrip(ctx: &mut TestCtx) -> Result<(), &'static str> {
-    let mut d = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let mut d = Domain::new(ctx.frames, AW, PteFmt::Vtd).map_err(|_| "domain new failed")?;
     let mut alloc = IovaAllocator::new(IOVA_BASE, 16);
 
     let phys = 0x00AA_0000u64;
@@ -251,7 +282,7 @@ pub fn iova_allocator_reuse(_ctx: &mut TestCtx) -> Result<(), &'static str> {
 /// tear down with no leak.
 pub fn iova_exhaustion(ctx: &mut TestCtx) -> Result<(), &'static str> {
     let before = ctx.frames.free_frames();
-    let mut d = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let mut d = Domain::new(ctx.frames, AW, PteFmt::Vtd).map_err(|_| "domain new failed")?;
     let mut alloc = IovaAllocator::new(IOVA_BASE, 2); // exactly two IOVAs
 
     let i0 = d
@@ -281,7 +312,7 @@ pub fn iova_exhaustion(ctx: &mut TestCtx) -> Result<(), &'static str> {
 /// data frame freed. Non-vacuous: asserts table frames were really consumed first.
 pub fn map_buffer_teardown_no_leak(ctx: &mut TestCtx) -> Result<(), &'static str> {
     let before = ctx.frames.free_frames();
-    let mut d = Domain::new(ctx.frames, AW).map_err(|_| "domain new failed")?;
+    let mut d = Domain::new(ctx.frames, AW, PteFmt::Vtd).map_err(|_| "domain new failed")?;
     let mut alloc = IovaAllocator::new(IOVA_BASE, 8);
 
     for k in 0..4u64 {

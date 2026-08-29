@@ -221,12 +221,26 @@ const PAGE_SHIFT: usize = 12;
 /// per-entry present/permission/next-level encoding differs, and that difference is
 /// isolated to the three primitives here. Vendor selection sets a domain's format at
 /// creation; the walk in `map`/`unmap`/`translate`/`free_subtree` is format-agnostic.
+/// AMD-Vi I/O page-table entry bits (AMD IOMMU spec). Present is an explicit bit 0;
+/// the Next Level field in bits [11:9] tells the walker whether an entry is a page
+/// directory (NL 1-6, points to a table at that level) or a page (NL 0, the leaf);
+/// read/write permissions are IR (bit 61) / IW (bit 62), ANDed down the walk, so
+/// intermediate links carry both and the leaf gates the actual access. The physical
+/// address field is bits [51:12], the same `SL_ADDR_MASK` as VT-d.
+const AMD_PR: u64 = 1 << 0;
+const AMD_NL_SHIFT: u64 = 9;
+const AMD_IR: u64 = 1 << 61;
+const AMD_IW: u64 = 1 << 62;
+
 #[cfg_attr(not(feature = "tests"), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PteFmt {
     /// Intel VT-d second-level: present iff Read|Write set; no separate present bit,
     /// no next-level field. Intermediate links carry Read|Write.
     Vtd,
+    /// AMD-Vi I/O page table: explicit present bit, a Next Level field, IR/IW
+    /// permission bits ANDed down the walk.
+    AmdVi,
 }
 
 impl PteFmt {
@@ -235,6 +249,7 @@ impl PteFmt {
     fn decode(self, entry: u64) -> (bool, u64) {
         match self {
             PteFmt::Vtd => (entry & SL_PRESENT != 0, entry & SL_ADDR_MASK),
+            PteFmt::AmdVi => (entry & AMD_PR != 0, entry & SL_ADDR_MASK),
         }
     }
 
@@ -243,6 +258,17 @@ impl PteFmt {
     fn encode_leaf(self, phys: u64, perms: u64) -> u64 {
         match self {
             PteFmt::Vtd => (phys & SL_ADDR_MASK) | (perms & SL_PRESENT),
+            PteFmt::AmdVi => {
+                // Next Level 0 == a 4-KiB page (leaf); IR/IW from perms.
+                let mut e = AMD_PR | (phys & SL_ADDR_MASK);
+                if perms & IOMMU_READ != 0 {
+                    e |= AMD_IR;
+                }
+                if perms & IOMMU_WRITE != 0 {
+                    e |= AMD_IW;
+                }
+                e
+            }
         }
     }
 
@@ -250,9 +276,17 @@ impl PteFmt {
     /// number of page-table levels below the child (AMD-Vi's Next Level field); VT-d
     /// has no such field and ignores it.
     #[inline]
-    fn encode_link(self, child: u64, _next_level: u8) -> u64 {
+    fn encode_link(self, child: u64, next_level: u8) -> u64 {
         match self {
             PteFmt::Vtd => (child & SL_ADDR_MASK) | SL_PRESENT,
+            PteFmt::AmdVi => {
+                // A page directory entry: present, read+write (ANDed down the walk),
+                // the child table's level in the Next Level field.
+                AMD_PR | AMD_IR
+                    | AMD_IW
+                    | (child & SL_ADDR_MASK)
+                    | ((next_level as u64 & 0x7) << AMD_NL_SHIFT)
+            }
         }
     }
 }
@@ -313,9 +347,13 @@ fn alloc_table(frames: &mut FrameAlloc) -> Result<u64, DomainError> {
 impl Domain {
     /// Create an empty domain sized for a remapping unit of `addr_width_bits`
     /// (the DMAR host address width). QEMU's unit is 48-bit -> a 4-level table.
-    pub fn new(frames: &mut FrameAlloc, addr_width_bits: u8) -> Result<Domain, DomainError> {
-        // VT-d AGAWs are 39/48/57-bit == 3/4/5 levels; each level adds 9 bits
-        // above the 12-bit page offset.
+    pub fn new(
+        frames: &mut FrameAlloc,
+        addr_width_bits: u8,
+        fmt: PteFmt,
+    ) -> Result<Domain, DomainError> {
+        // Both VT-d AGAWs and AMD-Vi modes are 39/48/57-bit == 3/4/5 levels; each
+        // level adds 9 bits above the 12-bit page offset.
         let span = (addr_width_bits as usize).checked_sub(PAGE_SHIFT).ok_or(DomainError::UnsupportedWidth)?;
         if span == 0 || span % INDEX_BITS != 0 {
             return Err(DomainError::UnsupportedWidth);
@@ -325,9 +363,7 @@ impl Domain {
             return Err(DomainError::UnsupportedWidth);
         }
         let root = alloc_table(frames)?;
-        // VT-d is the only format until the AMD-Vi backend (Phase B2) makes this a
-        // parameter derived from the remapping unit's vendor.
-        Ok(Domain { root, levels: levels as u8, fmt: PteFmt::Vtd })
+        Ok(Domain { root, levels: levels as u8, fmt })
     }
 
     /// The table index for `iova` at walk depth `depth` (0 = top level).
@@ -741,6 +777,14 @@ impl Backend {
             Backend::Vtd(v) => v.tables.root_phys(),
         }
     }
+
+    /// The page-table entry format this backend's domains use, so a domain built for
+    /// the bound device (which shares the unit) matches the unit's vendor.
+    fn pte_fmt(&self) -> PteFmt {
+        match self {
+            Backend::Vtd(_) => PteFmt::Vtd,
+        }
+    }
 }
 
 /// The shared block-DMA IOMMU state: a vendor `Backend`, plus the neutral
@@ -791,7 +835,8 @@ impl VtdUnit {
         let (domain, tables) = {
             let mut fg = FRAME_ALLOC.lock();
             let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
-            let domain = Domain::new(fa, unit.addr_width).map_err(|_| "iommu domain alloc failed")?;
+            let domain = Domain::new(fa, unit.addr_width, PteFmt::Vtd)
+                .map_err(|_| "iommu domain alloc failed")?;
             let tables = TranslationTables::new(fa).map_err(|_| "iommu tables alloc failed")?;
             (domain, tables)
         };
@@ -1269,11 +1314,12 @@ pub fn bind_prepare(loc: pci::Location, fixed_frames: &[u64]) -> Result<[u64; 4]
     }
     let addr_width = bi.addr_width;
     let levels = bi.levels;
+    let fmt = bi.backend.pte_fmt();
     let mut iovas = [0u64; 4];
     let bound = {
         let mut fg = FRAME_ALLOC.lock();
         let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
-        let mut domain = Domain::new(fa, addr_width).map_err(|_| "bound domain alloc failed")?;
+        let mut domain = Domain::new(fa, addr_width, fmt).map_err(|_| "bound domain alloc failed")?;
         let mut iova = IovaAllocator::new(BOUND_IOVA_BASE, BOUND_IOVA_PAGES);
         for (i, &frame) in fixed_frames.iter().enumerate() {
             let page = frame & !((1 << PAGE_SHIFT) - 1);
