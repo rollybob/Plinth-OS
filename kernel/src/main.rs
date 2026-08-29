@@ -79,6 +79,13 @@ mod pci;
 // path, after PCI discovery.
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod virtio_blk;
+// xHCI (USB HID) is being built bottom-up. This first slice is the pure encoding
+// layer, exercised only by the test suite; nothing on the boot path touches it
+// yet, so the dead-code allowance is inverted -- silenced in the NON-test build
+// where it is genuinely unused. The controller bring-up slice wires it into boot
+// and removes this attribute (usb_hid.md section 4).
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+mod xhci;
 // Async completion rings are reached only from the userspace syscall path; the
 // test build stops before userspace, so silence the dead-code noise there.
 #[cfg_attr(feature = "tests", allow(dead_code))]

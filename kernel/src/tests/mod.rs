@@ -24,6 +24,7 @@ mod pci;
 mod scheduler;
 mod serial_probe;
 mod virtio_blk;
+mod xhci;
 
 use crate::frame_alloc::FrameAlloc;
 use crate::serial;
@@ -244,6 +245,22 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "iommu::iova_allocator_reuse", run: iommu::iova_allocator_reuse },
     TestCase { name: "iommu::iova_exhaustion", run: iommu::iova_exhaustion },
     TestCase { name: "iommu::map_buffer_teardown_no_leak", run: iommu::map_buffer_teardown_no_leak },
+    TestCase { name: "xhci::struct_sizes", run: xhci::struct_sizes },
+    TestCase { name: "xhci::trb_fields_and_commands", run: xhci::trb_fields_and_commands },
+    TestCase { name: "xhci::event_decode", run: xhci::event_decode },
+    TestCase {
+        name: "xhci::producer_ring_wraps_and_toggles_cycle",
+        run: xhci::producer_ring_wraps_and_toggles_cycle,
+    },
+    TestCase {
+        name: "xhci::event_ring_consumes_and_toggles",
+        run: xhci::event_ring_consumes_and_toggles,
+    },
+    TestCase { name: "xhci::erst_entry_encoding", run: xhci::erst_entry_encoding },
+    TestCase { name: "xhci::constants_and_dci", run: xhci::constants_and_dci },
+    TestCase { name: "xhci::slot_context_fields", run: xhci::slot_context_fields },
+    TestCase { name: "xhci::endpoint_context_fields", run: xhci::endpoint_context_fields },
+    TestCase { name: "xhci::input_control_context_flags", run: xhci::input_control_context_flags },
 ];
 
 /// Run every registered test. Returns true if all passed.
