@@ -1641,12 +1641,68 @@ fn no_i8042_check(uefi_path: &Path) {
     std::process::exit(1);
 }
 
+/// Probe whether this host's QEMU exposes the `dma-remap` property on the
+/// emulated `amd-iommu` device. That property is what makes QEMU actually enforce
+/// AMD-Vi DMA translation on emulated devices -- the AMD analogue of
+/// intel-iommu's `caching-mode` (see build_qemu_cmd). It was added in QEMU 10.1;
+/// older QEMU (e.g. Debian trixie's 10.0.x, which the CI container installs)
+/// realizes the amd-iommu unit but rejects the property, so booting with
+/// `dma-remap=on` dies at device init with "Property 'amd-iommu.dma-remap' not
+/// found". Dropping the property is NOT an option: without it QEMU does not
+/// enforce translation, so the AMD lane's "block reads verified" would pass
+/// whether or not the backend works -- a vacuous proof of a security property.
+/// So amd_check gates on this probe and skips (green) when the property is
+/// absent; the moment the QEMU is >= 10.1 this returns true and the real lane
+/// runs again, with no code change.
+fn amd_iommu_dma_remap_supported() -> bool {
+    match Command::new("qemu-system-x86_64")
+        .args(["-device", "amd-iommu,help"])
+        .output()
+    {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            text.contains("dma-remap")
+        }
+        // Probe could not run at all -> treat the feature as absent and let
+        // amd_check skip with a reason rather than hard-failing the caller.
+        Err(_) => false,
+    }
+}
+
+/// First line of `qemu-system-x86_64 --version`, for the skip message.
+fn qemu_version_line() -> String {
+    Command::new("qemu-system-x86_64")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Boot under QEMU's emulated AMD-Vi and assert the AMD-Vi backend end to end:
 /// the IVRS unit is discovered, translation is enabled, and both kernel-bridged
 /// block devices read correctly under AMD-Vi translation. The dual-backend lane
 /// alongside the default VT-d `smoke`. Positive-only (D6): QEMU's amd-iommu does
 /// not fault an out-of-domain virtio DMA, so there is no negative to assert here.
 fn amd_check(uefi_path: &Path) {
+    // Capability gate: this lane needs `amd-iommu,dma-remap=on` (QEMU >= 10.1).
+    // On older QEMU, skip with a reason instead of failing -- see
+    // amd_iommu_dma_remap_supported. Probe before setting PLINTH_IOMMU so a skip
+    // leaves no env state behind.
+    if !amd_iommu_dma_remap_supported() {
+        println!(
+            "amd: SKIP -- this QEMU lacks the amd-iommu 'dma-remap' property \
+             (added in QEMU 10.1); found: {}. The AMD-Vi integration lane is not \
+             run here; PteFmt::AmdVi encode/decode stays covered by the \
+             amdvi_map_translate_roundtrip unit test in `cargo xtask test`. This \
+             lane runs for real once the QEMU is >= 10.1.",
+            qemu_version_line()
+        );
+        return;
+    }
+
     // build_qemu_cmd reads PLINTH_IOMMU to pick amd-iommu and shift the virtio slots.
     std::env::set_var("PLINTH_IOMMU", "amd");
     let output = run_capture(uefi_path);

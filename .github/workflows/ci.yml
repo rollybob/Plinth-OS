@@ -25,10 +25,21 @@ jobs:
     # intel-iommu is global to the q35 root complex, so it governs even the
     # firmware's boot-time reads and there is no per-device exemption. QEMU 10.x
     # handles this correctly (validated locally on 11.0), so run the whole job
-    # in a Debian trixie container to get qemu-system-x86 10.x. Revisit this if
-    # the stock runner's QEMU moves to >= 10.
+    # in a Debian container to get a modern qemu-system-x86.
+    #
+    # Why forky (testing) and not trixie (stable):
+    # trixie's qemu is 10.0.x, which realizes `-device amd-iommu` but does NOT
+    # have its `dma-remap` property -- that was added in QEMU 10.1. The AMD-Vi
+    # lane (`cargo xtask smoke-amd`) needs `amd-iommu,dma-remap=on` for QEMU to
+    # actually enforce AMD-Vi translation on emulated devices (the AMD analogue
+    # of intel-iommu's caching-mode; without it the "block reads verified" proof
+    # is vacuous). forky ships qemu 10.1.0, so the AMD lane runs for real.
+    # Belt and braces: amd_check probes for the property and SKIPs the lane
+    # (green) if it is ever absent, so this job never hard-fails on an old qemu
+    # -- forky is what turns that skip back into a real run. Codename-pinned
+    # (not `testing`) so it stays on forky across the next testing rollover.
     container:
-      image: buildpack-deps:trixie
+      image: buildpack-deps:forky
     steps:
       - uses: actions/checkout@v4
 
@@ -60,10 +71,11 @@ jobs:
             ~/.cargo/git
             target
           # Keyed on the toolchain too: artifacts built by a different rustc must
-          # not be restored after a toolchain change. The `trixie` segment busts
-          # any cache left by the old host-runner job (different glibc, so its
-          # host-compiled xtask/proc-macro artifacts are not reusable here).
-          key: ${{ runner.os }}-cargo-trixie-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          # not be restored after a toolchain change. The `forky` segment busts
+          # any cache left by an earlier base image (trixie or the old host
+          # runner -- different glibc, so their host-compiled xtask/proc-macro
+          # artifacts are not reusable here).
+          key: ${{ runner.os }}-cargo-forky-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Clobber lint
         run: cargo xtask check
