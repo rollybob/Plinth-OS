@@ -1454,7 +1454,7 @@ pub fn fault_selftest<W: Write>(out: &mut W, phys_offset: u64, dev: usize) -> bo
     let _ = read(dev, 0, 1, POISON_IOVA);
     crate::iommu::arm_skip_map(false);
     let fault = crate::iommu::take_fault();
-    let faulted_here = fault.is_some_and(|(addr, _reason)| addr == POISON_IOVA);
+    let faulted_here = fault.is_some_and(|f| f.addr == POISON_IOVA);
 
     // Positive control: a real, mapped read must succeed AND raise no fault --
     // proving the device recovered and that the boundary, not some unrelated

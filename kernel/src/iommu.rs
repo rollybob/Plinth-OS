@@ -174,6 +174,48 @@ const ENTRIES: usize = 512;
 const INDEX_BITS: usize = 9;
 const PAGE_SHIFT: usize = 12;
 
+/// The DMA page-table entry format a `Domain` walks. Both Intel VT-d second-level
+/// tables and AMD-Vi I/O page tables are 4-KiB / 9-bit-index / 512-entry radix
+/// trees with the physical address in bits [51:12], so the walk is shared; only the
+/// per-entry present/permission/next-level encoding differs, and that difference is
+/// isolated to the three primitives here. Vendor selection sets a domain's format at
+/// creation; the walk in `map`/`unmap`/`translate`/`free_subtree` is format-agnostic.
+#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PteFmt {
+    /// Intel VT-d second-level: present iff Read|Write set; no separate present bit,
+    /// no next-level field. Intermediate links carry Read|Write.
+    Vtd,
+}
+
+impl PteFmt {
+    /// Decode a raw entry to `(present, next-table-or-page physical address)`.
+    #[inline]
+    fn decode(self, entry: u64) -> (bool, u64) {
+        match self {
+            PteFmt::Vtd => (entry & SL_PRESENT != 0, entry & SL_ADDR_MASK),
+        }
+    }
+
+    /// Encode a leaf entry mapping `phys` with `perms` (`IOMMU_READ`/`IOMMU_WRITE`).
+    #[inline]
+    fn encode_leaf(self, phys: u64, perms: u64) -> u64 {
+        match self {
+            PteFmt::Vtd => (phys & SL_ADDR_MASK) | (perms & SL_PRESENT),
+        }
+    }
+
+    /// Encode an intermediate link to a child table at `child`. `next_level` is the
+    /// number of page-table levels below the child (AMD-Vi's Next Level field); VT-d
+    /// has no such field and ignores it.
+    #[inline]
+    fn encode_link(self, child: u64, _next_level: u8) -> u64 {
+        match self {
+            PteFmt::Vtd => (child & SL_ADDR_MASK) | SL_PRESENT,
+        }
+    }
+}
+
 #[cfg_attr(not(feature = "tests"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DomainError {
@@ -203,6 +245,9 @@ pub struct Domain {
     root: u64,
     /// Walk depth: 3, 4, or 5, derived from the unit's DMA address width.
     levels: u8,
+    /// The per-entry encoding this domain's tables use (VT-d or AMD-Vi). The walk is
+    /// shared; this selects how each entry is read and written.
+    fmt: PteFmt,
 }
 
 /// The 512-entry table at physical address `phys`, via the phys-offset window.
@@ -239,7 +284,9 @@ impl Domain {
             return Err(DomainError::UnsupportedWidth);
         }
         let root = alloc_table(frames)?;
-        Ok(Domain { root, levels: levels as u8 })
+        // VT-d is the only format until the AMD-Vi backend (Phase B2) makes this a
+        // parameter derived from the remapping unit's vendor.
+        Ok(Domain { root, levels: levels as u8, fmt: PteFmt::Vtd })
     }
 
     /// The table index for `iova` at walk depth `depth` (0 = top level).
@@ -262,6 +309,7 @@ impl Domain {
         if iova % (1 << PAGE_SHIFT) != 0 || phys % (1 << PAGE_SHIFT) != 0 {
             return Err(DomainError::Misaligned);
         }
+        let fmt = self.fmt;
         let mut table_phys = self.root;
         let last = self.levels as usize - 1;
         for depth in 0..self.levels as usize {
@@ -270,19 +318,23 @@ impl Domain {
             // allocated; we hold `&mut self`, so no other walk aliases it.
             let table = unsafe { &mut *table_at(table_phys) };
             if depth == last {
-                if table[idx] & SL_PRESENT != 0 {
+                let (present, _) = fmt.decode(table[idx]);
+                if present {
                     return Err(DomainError::AlreadyMapped);
                 }
-                table[idx] = (phys & SL_ADDR_MASK) | (perms & SL_PRESENT);
+                table[idx] = fmt.encode_leaf(phys, perms);
                 return Ok(());
             }
-            if table[idx] & SL_PRESENT == 0 {
+            let (present, next) = fmt.decode(table[idx]);
+            if !present {
                 let child = alloc_table(frames)?;
                 // Intermediate links carry R+W; leaf perms gate the actual access.
-                table[idx] = (child & SL_ADDR_MASK) | SL_PRESENT;
+                // next_level = levels below the child (leaf tables are level 1).
+                let next_level = (self.levels as usize - 1 - depth) as u8;
+                table[idx] = fmt.encode_link(child, next_level);
                 table_phys = child;
             } else {
-                table_phys = table[idx] & SL_ADDR_MASK;
+                table_phys = next;
             }
         }
         unreachable!("the leaf level returns inside the loop")
@@ -295,20 +347,22 @@ impl Domain {
         if iova % (1 << PAGE_SHIFT) != 0 {
             return Err(DomainError::Misaligned);
         }
+        let fmt = self.fmt;
         let mut table_phys = self.root;
         let last = self.levels as usize - 1;
         for depth in 0..self.levels as usize {
             let idx = self.index(iova, depth);
             // SAFETY: as in `map`.
             let table = unsafe { &mut *table_at(table_phys) };
-            if table[idx] & SL_PRESENT == 0 {
+            let (present, next) = fmt.decode(table[idx]);
+            if !present {
                 return Err(DomainError::NotMapped);
             }
             if depth == last {
                 table[idx] = 0;
                 return Ok(());
             }
-            table_phys = table[idx] & SL_ADDR_MASK;
+            table_phys = next;
         }
         unreachable!("the leaf level returns inside the loop")
     }
@@ -317,20 +371,21 @@ impl Domain {
     /// if unmapped. The unit-test oracle for `map`/`unmap`; also the shape a
     /// fault check reasons about in slice 4.
     pub fn translate(&self, iova: u64) -> Option<u64> {
+        let fmt = self.fmt;
         let mut table_phys = self.root;
         let last = self.levels as usize - 1;
         for depth in 0..self.levels as usize {
             let idx = self.index(iova, depth);
             // SAFETY: read-only walk over this domain's own table frames.
             let table = unsafe { &*table_at(table_phys) };
-            let entry = table[idx];
-            if entry & SL_PRESENT == 0 {
+            let (present, next) = fmt.decode(table[idx]);
+            if !present {
                 return None;
             }
             if depth == last {
-                return Some((entry & SL_ADDR_MASK) | (iova & ((1 << PAGE_SHIFT) - 1)));
+                return Some(next | (iova & ((1 << PAGE_SHIFT) - 1)));
             }
-            table_phys = entry & SL_ADDR_MASK;
+            table_phys = next;
         }
         None
     }
@@ -340,7 +395,7 @@ impl Domain {
     /// After this the domain's `root` is 0.
     pub fn teardown(&mut self, frames: &mut FrameAlloc) {
         if self.root != 0 {
-            free_subtree(frames, self.root, self.levels);
+            free_subtree(frames, self.root, self.levels, self.fmt);
             self.root = 0;
         }
     }
@@ -357,15 +412,16 @@ impl Domain {
 /// the leaf inclusive (root == `Domain::levels`, leaf table == 1). Leaf-table
 /// entries point at caller-owned data frames, so they are never freed -- only the
 /// table frames are.
-fn free_subtree(frames: &mut FrameAlloc, table_phys: u64, level: u8) {
+fn free_subtree(frames: &mut FrameAlloc, table_phys: u64, level: u8, fmt: PteFmt) {
     if level > 1 {
         // SAFETY: `table_phys` is a table frame this domain allocated; the walk
         // is read-only and dealloc only flips allocator bitmap bits, not table
         // memory, so the reference stays valid across the recursion.
         let table = unsafe { &*table_at(table_phys) };
         for &entry in table.iter() {
-            if entry & SL_PRESENT != 0 {
-                free_subtree(frames, entry & SL_ADDR_MASK, level - 1);
+            let (present, child) = fmt.decode(entry);
+            if present {
+                free_subtree(frames, child, level - 1, fmt);
             }
         }
     }
@@ -560,31 +616,212 @@ unsafe fn reg_w64(va: u64, off: usize, val: u64) {
     write_volatile((va + off as u64) as *mut u64, val)
 }
 
-/// The shared block-DMA IOMMU state: the mapped register window, the per-unit
-/// root/context tables, and the one identity domain both block devices use.
-struct BlockIommu {
+/// A DMA fault reported by a remapping unit: the faulting page address and the
+/// vendor fault-reason code. The neutral shape both backends' fault paths return
+/// (VT-d reads it from the FRCD register; an AMD-Vi backend reads its event log).
+#[derive(Clone, Copy)]
+pub struct Fault {
+    pub addr: u64,
+    /// Vendor fault-reason code. Recorded for diagnostics and forward use (the
+    /// AMD-Vi event log carries one too); no caller reads it yet, so it is a
+    /// forward-API field like `RemappingUnit`'s.
+    #[allow(dead_code)]
+    pub reason: u32,
+}
+
+/// The vendor-specific half of a remapping unit -- the register window, the
+/// device->domain tables, and the fault/invalidation machinery that differ between
+/// VT-d and AMD-Vi. Chosen once at bring-up and dispatched by match, exactly as
+/// `irq` selects PIC-vs-APIC (no `dyn`, no allocator). The neutral orchestration
+/// (`BlockIommu`, the shared `Domain`, `IovaAllocator`) sits outside this enum.
+enum Backend {
+    Vtd(VtdUnit),
+}
+
+/// Intel VT-d's per-unit state: the mapped register window, the root/context
+/// tables, and the FRCD / IOTLB register offsets derived from CAP/ECAP.
+struct VtdUnit {
     regs_va: u64,
     tables: TranslationTables,
-    domain: Domain,
-    levels: u8,
-    /// The unit's DMA address width in bits (48 under QEMU), kept so a second
-    /// domain (the bound device's, direct-binding slice 2) can be sized for the
-    /// same unit without re-reading CAP.
-    addr_width: u8,
-    prepared: usize,
-    enabled: bool,
     /// Byte offset of the first fault-recording register (FRCD) from the register
-    /// base, derived from CAP.FRO. Slice 4 reads it to confirm a forced fault.
+    /// base, derived from CAP.FRO -- read to confirm a forced fault.
     fault_off: usize,
     /// Byte offset of the IOTLB invalidate register (IOTLB_REG) from the register
     /// base, derived from ECAP.IRO. Under caching-mode a mapping change is only
     /// seen after invalidating here.
     iotlb_off: usize,
+}
+
+impl Backend {
+    /// Point the device `loc` at the domain rooted at `slptptr` (depth `levels`,
+    /// domain id `did`).
+    fn attach_device(&mut self, loc: pci::Location, slptptr: u64, levels: u8, did: u16) {
+        match self {
+            Backend::Vtd(v) => v.tables.set_device(loc.slot, loc.func, slptptr, levels, did),
+        }
+    }
+
+    /// Make `loc`'s source-id absent so it stops routing (teardown).
+    fn detach_device(&mut self, loc: pci::Location) {
+        match self {
+            Backend::Vtd(v) => v.tables.clear_device(loc.slot, loc.func),
+        }
+    }
+
+    /// Drop the unit's cached translations so a mapping change is seen.
+    fn invalidate_all(&mut self) {
+        match self {
+            // SAFETY: regs_va/iotlb_off are this unit's mapped registers.
+            Backend::Vtd(v) => unsafe { invalidate_all(v.regs_va, v.iotlb_off) },
+        }
+    }
+
+    /// Read and clear the first recorded DMA fault, if any.
+    fn take_fault(&mut self) -> Option<Fault> {
+        match self {
+            Backend::Vtd(v) => v.take_fault(),
+        }
+    }
+
+    /// Point the unit at its device tables and enable DMA translation, reporting
+    /// the unit's capabilities on `out`.
+    fn enable<W: Write>(&mut self, out: &mut W) -> Result<(), &'static str> {
+        match self {
+            Backend::Vtd(v) => v.enable(out),
+        }
+    }
+
+    /// The device-table root a `set_device`/context entry lives in (VT-d: RTADDR).
+    /// Only used internally by `enable`, kept here for symmetry with a future AMD
+    /// device-table base.
+    #[allow(dead_code)]
+    fn tables_root(&self) -> u64 {
+        match self {
+            Backend::Vtd(v) => v.tables.root_phys(),
+        }
+    }
+}
+
+/// The shared block-DMA IOMMU state: a vendor `Backend`, plus the neutral
+/// orchestration -- the one identity domain both block devices use, its depth, and
+/// the optional directly-bound device's private domain.
+struct BlockIommu {
+    /// The vendor-specific unit (registers, device tables, fault/invalidation).
+    backend: Backend,
+    /// The shared identity domain both kernel-bridged block devices use.
+    domain: Domain,
+    levels: u8,
+    /// The unit's DMA address width in bits (48 under QEMU), kept so the bound
+    /// device's domain can be sized for the same unit without re-reading CAP.
+    addr_width: u8,
+    prepared: usize,
+    enabled: bool,
     /// The one directly-bound device's private non-identity domain, if any
-    /// (direct-binding slice 2). It shares this unit's registers and root/context
-    /// tables but has its own domain + opaque IOVA allocator and a distinct
-    /// domain id, so it is confined separately from the shared block domain (D9).
+    /// (direct-binding). It shares this unit's registers and device tables but has
+    /// its own domain + opaque IOVA allocator and a distinct domain id, so it is
+    /// confined separately from the shared block domain (D9).
     bound: Option<BoundDomain>,
+}
+
+impl VtdUnit {
+    /// Bring up the VT-d unit `unit`: map its register window, validate it supports
+    /// the required address width (SAGAW), derive the FRCD/IOTLB offsets, and build
+    /// the shared identity `Domain` + the root/context tables. Returns the unit, the
+    /// shared domain, and the page-table depth. Maps the registers BEFORE taking
+    /// FRAME_ALLOC (map_kernel_mmio locks it internally), preserving the lock order.
+    fn bring_up(unit: RemappingUnit) -> Result<(VtdUnit, Domain, u8), &'static str> {
+        let regs_va = memory::map_kernel_mmio(unit.register_base, 0x1000)?;
+        // SAFETY: regs_va is the freshly mapped, uncached VT-d register window.
+        let cap = unsafe { reg_r64(regs_va, VTD_CAP) };
+        let sagaw = ((cap >> 8) & 0x1f) as u32;
+        let levels = levels_for(unit.addr_width)?;
+        // SAGAW bit index is the AGAW value (levels - 2): bit0=30/2lvl, bit1=39/3lvl,
+        // bit2=48/4lvl, bit3=57/5lvl -- the same encoding the context AW field uses.
+        if sagaw & (1 << (levels - 2)) == 0 {
+            return Err("unit does not support the required address width");
+        }
+        // CAP.FRO (bits [33:24]) is the fault-recording register offset in 16-byte
+        // units; the fault probe reads FRCD there.
+        let fault_off = (((cap >> 24) & 0x3ff) as usize) * 16;
+        // ECAP.IRO (bits [17:8]) is the IOTLB register block offset in 16-byte units;
+        // IOTLB_REG (what we write to invalidate) is 8 bytes past it.
+        let ecap = unsafe { reg_r64(regs_va, VTD_ECAP) };
+        let iotlb_off = (((ecap >> 8) & 0x3ff) as usize) * 16 + 8;
+        let (domain, tables) = {
+            let mut fg = FRAME_ALLOC.lock();
+            let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
+            let domain = Domain::new(fa, unit.addr_width).map_err(|_| "iommu domain alloc failed")?;
+            let tables = TranslationTables::new(fa).map_err(|_| "iommu tables alloc failed")?;
+            (domain, tables)
+        };
+        Ok((VtdUnit { regs_va, tables, fault_off, iotlb_off }, domain, levels))
+    }
+
+    /// Point RTADDR at the root table and enable translation, reporting CAP/ECAP.
+    fn enable<W: Write>(&mut self, out: &mut W) -> Result<(), &'static str> {
+        let regs = self.regs_va;
+        let root = self.tables.root_phys();
+        // SAFETY: `regs` is the mapped, uncached VT-d register window; the writes
+        // below are the spec's root-table-pointer + translation-enable sequence, and
+        // each is confirmed by polling its status bit before proceeding.
+        unsafe {
+            let cap = reg_r64(regs, VTD_CAP);
+            let ecap = reg_r64(regs, VTD_ECAP);
+            let caching_mode = (cap >> 7) & 1;
+            let _ = writeln!(
+                out,
+                "plinth:   iommu cap {cap:#018x} ecap {ecap:#018x} caching_mode {caching_mode}"
+            );
+
+            // Root table pointer, TTM=00 (legacy) since root is 4-KiB aligned.
+            reg_w64(regs, VTD_RTADDR, root);
+            reg_w32(regs, VTD_GCMD, GCMD_SRTP);
+            let mut spun = 0;
+            while reg_r32(regs, VTD_GSTS) & GSTS_RTPS == 0 {
+                spun += 1;
+                if spun >= GSTS_POLL_LIMIT {
+                    return Err("iommu: root table pointer never acknowledged");
+                }
+                core::hint::spin_loop();
+            }
+
+            reg_w32(regs, VTD_GCMD, GCMD_TE);
+            let mut spun = 0;
+            while reg_r32(regs, VTD_GSTS) & GSTS_TES == 0 {
+                spun += 1;
+                if spun >= GSTS_POLL_LIMIT {
+                    return Err("iommu: translation enable never acknowledged");
+                }
+                core::hint::spin_loop();
+            }
+
+            // Flush any stale context/IOTLB state so the device sees the context
+            // entries and fixed-frame mappings established before enable.
+            invalidate_all(regs, self.iotlb_off);
+        }
+        Ok(())
+    }
+
+    /// Read and clear the first fault-recording register. `None` if no fault. The
+    /// reason for a not-present second-level mapping is 0x05 under VT-d.
+    fn take_fault(&mut self) -> Option<Fault> {
+        // SAFETY: regs_va + fault_off is the mapped FRCD register for this unit.
+        unsafe {
+            let hi = reg_r64(self.regs_va, self.fault_off + 8);
+            if hi & FRCD_HI_FAULT == 0 {
+                return None;
+            }
+            let lo = reg_r64(self.regs_va, self.fault_off);
+            let addr = lo & SL_ADDR_MASK;
+            let reason = ((hi >> 32) & 0xff) as u32;
+            // FRCD.F is RW1C: writing the F bit back clears the record.
+            reg_w64(self.regs_va, self.fault_off + 8, FRCD_HI_FAULT);
+            // FSTS pending bits are RW1C: write back what we read to clear them.
+            let fsts = reg_r32(self.regs_va, VTD_FSTS);
+            reg_w32(self.regs_va, VTD_FSTS, fsts);
+            Some(Fault { addr, reason })
+        }
+    }
 }
 
 /// A directly-bound device's private DMA state (direct-binding slice 2): its own
@@ -685,45 +922,17 @@ pub fn block_prepare_device(loc: pci::Location, fixed_frames: &[u64]) -> Result<
             return Err("no remapping unit to bind block DMA to");
         }
         let unit = units[0];
-        let regs_va = memory::map_kernel_mmio(unit.register_base, 0x1000)?;
-        // Validate the unit supports the AGAW we will program. SAGAW bit
-        // (levels-1) is set for a supported depth (bit1=39/3lvl, bit2=48/4lvl,
-        // bit3=57/5lvl).
-        let cap = unsafe { reg_r64(regs_va, VTD_CAP) };
-        let sagaw = ((cap >> 8) & 0x1f) as u32;
-        let levels = levels_for(unit.addr_width)?;
-        // SAGAW bit index is the AGAW value (levels - 2): bit0=30/2lvl,
-        // bit1=39/3lvl, bit2=48/4lvl, bit3=57/5lvl -- the same encoding the
-        // context entry's AW field uses.
-        if sagaw & (1 << (levels - 2)) == 0 {
-            return Err("unit does not support the required address width");
-        }
-        // CAP.FRO (bits [33:24]) is the fault-recording register offset in
-        // 16-byte units; the fault probe (slice 4) reads FRCD there.
-        let fault_off = (((cap >> 24) & 0x3ff) as usize) * 16;
-        // ECAP.IRO (bits [17:8]) is the IOTLB register block offset in 16-byte
-        // units; IOTLB_REG (what we write to invalidate) is 8 bytes past it.
-        let ecap = unsafe { reg_r64(regs_va, VTD_ECAP) };
-        let iotlb_off = (((ecap >> 8) & 0x3ff) as usize) * 16 + 8;
-        // Build the shared domain + per-unit tables.
-        let (domain, tables) = {
-            let mut fg = FRAME_ALLOC.lock();
-            let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
-            let domain =
-                Domain::new(fa, unit.addr_width).map_err(|_| "iommu domain alloc failed")?;
-            let tables = TranslationTables::new(fa).map_err(|_| "iommu tables alloc failed")?;
-            (domain, tables)
-        };
+        // VT-d is the only backend today; Phase B selects VtdUnit vs an AMD-Vi unit
+        // by the remapping unit's vendor. bring_up maps registers, validates, and
+        // builds the shared domain + device tables.
+        let (vtd, domain, levels) = VtdUnit::bring_up(unit)?;
         *BLOCK_IOMMU.lock() = Some(BlockIommu {
-            regs_va,
-            tables,
+            backend: Backend::Vtd(vtd),
             domain,
             levels,
             addr_width: unit.addr_width,
             prepared: 0,
             enabled: false,
-            fault_off,
-            iotlb_off,
             bound: None,
         });
     }
@@ -741,7 +950,8 @@ pub fn block_prepare_device(loc: pci::Location, fixed_frames: &[u64]) -> Result<
             }
         }
     }
-    bi.tables.set_device(loc.slot, loc.func, bi.domain.root(), bi.levels, BLOCK_DID);
+    let (root, levels) = (bi.domain.root(), bi.levels);
+    bi.backend.attach_device(loc, root, levels, BLOCK_DID);
     bi.prepared += 1;
     Ok(())
 }
@@ -776,8 +986,7 @@ pub fn block_map_dma(data_phys: u64) -> Result<(), &'static str> {
     // (and a not-present entry it already touched stays cached until then). Only
     // needed when we actually added a mapping.
     if added {
-        // SAFETY: regs_va/iotlb_off are this unit's mapped registers.
-        unsafe { invalidate_all(bi.regs_va, bi.iotlb_off) };
+        bi.backend.invalidate_all();
     }
     Ok(())
 }
@@ -794,48 +1003,7 @@ pub fn block_enable<W: Write>(out: &mut W) -> Result<(), &'static str> {
     if bi.enabled {
         return Ok(());
     }
-    let regs = bi.regs_va;
-    let root = bi.tables.root_phys();
-
-    // SAFETY: `regs` is the mapped, uncached VT-d register window; the writes
-    // below are the spec's root-table-pointer + translation-enable sequence, and
-    // each is confirmed by polling its status bit before proceeding.
-    unsafe {
-        let cap = reg_r64(regs, VTD_CAP);
-        let ecap = reg_r64(regs, VTD_ECAP);
-        let caching_mode = (cap >> 7) & 1;
-        let _ = writeln!(
-            out,
-            "plinth:   iommu cap {cap:#018x} ecap {ecap:#018x} caching_mode {caching_mode}"
-        );
-
-        // Root table pointer, TTM=00 (legacy) since root is 4-KiB aligned.
-        reg_w64(regs, VTD_RTADDR, root);
-        reg_w32(regs, VTD_GCMD, GCMD_SRTP);
-        let mut spun = 0;
-        while reg_r32(regs, VTD_GSTS) & GSTS_RTPS == 0 {
-            spun += 1;
-            if spun >= GSTS_POLL_LIMIT {
-                return Err("iommu: root table pointer never acknowledged");
-            }
-            core::hint::spin_loop();
-        }
-
-        reg_w32(regs, VTD_GCMD, GCMD_TE);
-        let mut spun = 0;
-        while reg_r32(regs, VTD_GSTS) & GSTS_TES == 0 {
-            spun += 1;
-            if spun >= GSTS_POLL_LIMIT {
-                return Err("iommu: translation enable never acknowledged");
-            }
-            core::hint::spin_loop();
-        }
-
-        // Flush any stale context/IOTLB state so the device sees the context
-        // entries and fixed-frame mappings established before enable.
-        invalidate_all(regs, bi.iotlb_off);
-    }
-
+    bi.backend.enable(out)?;
     bi.enabled = true;
     let _ = writeln!(
         out,
@@ -859,29 +1027,13 @@ pub fn arm_skip_map(on: bool) {
     SKIP_MAP.store(on, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Read and clear the first fault-recording register. Returns `(faulting page
-/// address, fault reason)` if a fault was recorded, else `None`. Used by the
-/// slice-4 probe to confirm an out-of-domain access actually faulted; the reason
-/// for a not-present second-level mapping is 0x05 under VT-d.
-pub fn take_fault() -> Option<(u64, u32)> {
-    let g = BLOCK_IOMMU.lock();
-    let bi = g.as_ref()?;
-    // SAFETY: regs_va + fault_off is the mapped FRCD register for this unit.
-    unsafe {
-        let hi = reg_r64(bi.regs_va, bi.fault_off + 8);
-        if hi & FRCD_HI_FAULT == 0 {
-            return None;
-        }
-        let lo = reg_r64(bi.regs_va, bi.fault_off);
-        let addr = lo & SL_ADDR_MASK;
-        let reason = ((hi >> 32) & 0xff) as u32;
-        // FRCD.F is RW1C: writing the F bit back clears the record.
-        reg_w64(bi.regs_va, bi.fault_off + 8, FRCD_HI_FAULT);
-        // FSTS pending bits are RW1C: write back what we read to clear them.
-        let fsts = reg_r32(bi.regs_va, VTD_FSTS);
-        reg_w32(bi.regs_va, VTD_FSTS, fsts);
-        Some((addr, reason))
-    }
+/// Read and clear the first recorded DMA fault, if any -- used by the fault probe
+/// to confirm an out-of-domain access actually faulted. Returns a neutral `Fault`
+/// (the backend reads it from VT-d's FRCD register or an AMD-Vi event log).
+pub fn take_fault() -> Option<Fault> {
+    let mut g = BLOCK_IOMMU.lock();
+    let bi = g.as_mut()?;
+    bi.backend.take_fault()
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,7 +1234,8 @@ pub fn bind_prepare(loc: pci::Location, fixed_frames: &[u64]) -> Result<[u64; 4]
     };
     // Context entry -> the bound domain, with the distinct bound domain id.
     // Present before block_enable turns translation on for the whole unit.
-    bi.tables.set_device(loc.slot, loc.func, bound.domain.root(), levels, BOUND_DID);
+    let root = bound.domain.root();
+    bi.backend.attach_device(loc, root, levels, BOUND_DID);
     bi.bound = Some(bound);
     Ok(iovas)
 }
@@ -1095,12 +1248,10 @@ pub fn bind_prepare(loc: pci::Location, fixed_frames: &[u64]) -> Result<[u64; 4]
 pub fn bind_map_dma(data_phys: u64) -> Result<u64, &'static str> {
     let mut g = BLOCK_IOMMU.lock();
     let bi = g.as_mut().ok_or("no remapping unit")?;
-    let regs = bi.regs_va;
-    let iotlb_off = bi.iotlb_off;
     let enabled = bi.enabled;
-    let bound = bi.bound.as_mut().ok_or("no bound device")?;
     let page = data_phys & !((1 << PAGE_SHIFT) - 1);
     let iova = {
+        let bound = bi.bound.as_mut().ok_or("no bound device")?;
         let mut fg = FRAME_ALLOC.lock();
         let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
         bound
@@ -1111,8 +1262,7 @@ pub fn bind_map_dma(data_phys: u64) -> Result<u64, &'static str> {
     // Under caching-mode a not-present -> present change is only seen after
     // invalidation; pre-enable this is skipped (block_enable flushes at enable).
     if enabled {
-        // SAFETY: regs/iotlb_off are the mapped registers of the shared unit.
-        unsafe { invalidate_all(regs, iotlb_off) };
+        bi.backend.invalidate_all();
     }
     Ok(iova)
 }
@@ -1127,13 +1277,12 @@ pub fn bind_map_dma(data_phys: u64) -> Result<u64, &'static str> {
 pub fn bind_teardown() {
     let mut g = BLOCK_IOMMU.lock();
     let Some(bi) = g.as_mut() else { return };
-    let regs = bi.regs_va;
-    let iotlb_off = bi.iotlb_off;
     let enabled = bi.enabled;
     let Some(mut bound) = bi.bound.take() else { return };
     // Stop routing the source-id before freeing the page tables it points at: an
     // access from a now-absent device faults instead of walking freed memory.
-    bi.tables.clear_device(bound.loc.slot, bound.loc.func);
+    let loc = bound.loc;
+    bi.backend.detach_device(loc);
     {
         let mut fg = FRAME_ALLOC.lock();
         if let Some(fa) = fg.as_mut() {
@@ -1143,7 +1292,6 @@ pub fn bind_teardown() {
     // Drop the unit's cached context/IOTLB state so the cleared entry and freed
     // domain leave nothing stale behind.
     if enabled {
-        // SAFETY: regs/iotlb_off are the mapped registers of the shared unit.
-        unsafe { invalidate_all(regs, iotlb_off) };
+        bi.backend.invalidate_all();
     }
 }

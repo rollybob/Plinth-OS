@@ -679,7 +679,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // library OS wrote itself. The demo's own signal is that the data
                 // never arrived; this is the hardware fault behind it.
                 match iommu::take_fault() {
-                    Some((addr, _)) => {
+                    Some(fault) => {
+                        let addr = fault.addr;
                         let _ = writeln!(
                             serial,
                             "plinth: iommu: bind fault control: PASS (fault at 0x{addr:x})"
