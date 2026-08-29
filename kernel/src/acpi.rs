@@ -153,6 +153,23 @@ impl Drhd {
     const EMPTY: Drhd = Drhd { register_base: 0, segment: 0, include_pci_all: false };
 }
 
+/// The parsed AMD-Vi **IVRS** table (its first IVHD): the IOMMU's MMIO register
+/// base, the PCI segment it covers, and the IOMMU's own PCI BDF. The AMD-Vi
+/// analogue of `Dmar`; consumed by the IOMMU seam (`iommu`). Pure discovery --
+/// nothing here enables translation.
+#[derive(Clone, Copy)]
+pub struct Ivrs {
+    /// MMIO base of the IOMMU's AMD-Vi register set (from the IVHD).
+    pub mmio_base: u64,
+    /// PCI segment (domain) number this IOMMU covers (0 on single-segment PCs).
+    pub segment: u16,
+    /// The IOMMU function's own PCI BDF, so `pci.rs` can recognize and skip it (D9).
+    pub iommu_bdf: u16,
+    /// Host DMA address width in bits. Not carried in the IVRS; defaulted to 48
+    /// (QEMU's AMD-Vi) and refined from the Extended Feature Register at bring-up.
+    pub host_addr_width: u8,
+}
+
 /// The parsed DMAR table: the VT-d DMA-remapping units and the host DMA address
 /// width. Returned by `find_dmar`; consumed by the IOMMU seam (`iommu`). Pure
 /// discovery -- nothing here enables translation.
@@ -475,6 +492,46 @@ const MAX_DMAR_STRUCTS: usize = 256;
 /// `{ type: u16, length: u16 }`. A DRHD (type 0) carries Flags (u8) at +4,
 /// Segment (u16) at +6, and the 64-bit Register Base at +8; its device-scope
 /// entries follow but are not needed to name the unit.
+/// Discover the AMD-Vi IOMMU from the ACPI **IVRS** table -- the AMD analogue of
+/// `find_dmar`. Walks RSDP -> XSDT -> IVRS -> the first IVHD and returns its MMIO
+/// base, PCI segment, and the IOMMU's own BDF. `None` if there is no IVRS (a VT-d
+/// or no-IOMMU platform). Pure discovery: reads only, bounded walk, no MMIO and no
+/// translation enabled -- the `find_dmar` pattern.
+///
+/// IVRS layout (AMD IOMMU spec): a 36-byte SDT header, then IVinfo (u32) + reserved
+/// (u64) = 48 bytes, then a sequence of IVHD blocks. An IVHD (type 0x10/0x11/0x40)
+/// carries `length` (u16) at +2, the IOMMU's own DeviceID (u16) at +4, the 64-bit
+/// IOMMU **Base Address** at +8, and the PCI Segment (u16) at +16. The host DMA
+/// address width is not in the IVRS -- it is read from the IOMMU's Extended Feature
+/// Register at bring-up; discovery defaults it to 48 (QEMU's AMD-Vi, a 4-level
+/// I/O page table).
+pub fn find_ivrs(rsdp: Option<u64>, phys_offset: u64) -> Option<Ivrs> {
+    let rsdp_phys = rsdp?;
+    // SAFETY: rsdp_phys is BootInfo's firmware RSDP physical address, mapped at
+    // phys_offset. We only read, and every access below is bounded against the
+    // table's own length field.
+    unsafe {
+        let (sdt, entry_size) = sdt_from_rsdp(phys_offset, rsdp_phys)?;
+        let ivrs_phys = find_table(phys_offset, sdt, entry_size, b"IVRS")?;
+        let p = ptr_at(phys_offset, ivrs_phys);
+        let length = rd_u32(p, 4) as usize;
+        // 36-byte SDT header + IVinfo(4) + reserved(8); the first IVHD follows.
+        const IVRS_HEADER: usize = 48;
+        // Need at least the IVHD fixed fields (through the segment at +16).
+        if length < IVRS_HEADER + 24 {
+            return None;
+        }
+        let ivhd = IVRS_HEADER;
+        let iommu_bdf = rd_u16(p, ivhd + 4);
+        let mmio_base = rd_u64(p, ivhd + 8);
+        let segment = rd_u16(p, ivhd + 16);
+        if mmio_base == 0 {
+            return None;
+        }
+        Some(Ivrs { mmio_base, segment, iommu_bdf, host_addr_width: 48 })
+    }
+}
+
 pub fn find_dmar(rsdp: Option<u64>, phys_offset: u64) -> Option<Dmar> {
     let rsdp_phys = rsdp?;
     // SAFETY: rsdp_phys is BootInfo's firmware RSDP physical address, mapped at

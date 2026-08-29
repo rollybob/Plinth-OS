@@ -635,7 +635,21 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
     // faulted -- the positive "DMA still works" would be vacuous); it also makes
     // IOTLB invalidation mandatory after a mapping change, which the kernel does
     // (Design/iommu.md D4).
-    cmd.args(["-device", "intel-iommu,caching-mode=on"]);
+    // The vIOMMU device is selectable so the AMD-Vi backend can run against QEMU's
+    // emulated AMD-Vi (PLINTH_IOMMU=amd) as well as the Intel VT-d default. AMD-Vi
+    // is itself a PCI device that auto-takes the lowest free slot (3), so the
+    // virtio-blk devices below shift to 6/7/8 in amd mode (order preserved, so
+    // device indices stay 0/1/2). dma-remap=on is the AMD analogue of intel-iommu's
+    // caching-mode=on: without it QEMU presents the unit but does not enforce
+    // translation (a vacuous proof). Default is unchanged, so smoke/CI stay green.
+    match std::env::var("PLINTH_IOMMU").as_deref() {
+        Ok("amd") => {
+            cmd.args(["-device", "amd-iommu,dma-remap=on"]);
+        }
+        _ => {
+            cmd.args(["-device", "intel-iommu,caching-mode=on"]);
+        }
+    }
 
     if exit_on_debug {
         // isa-debug-exit: the kernel writes N to port 0xF4 and QEMU exits with
@@ -652,6 +666,14 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
     let smp = std::env::var("PLINTH_SMP").unwrap_or_else(|_| "1".to_string());
     cmd.args(["-smp", &smp]);
 
+    // virtio-blk base slot: 3 normally, or 6 under AMD-Vi (whose AMDVI-PCI device
+    // takes slot 3). Kept contiguous so PCI-slot-order enumeration still yields
+    // device indices 0/1/2 for blk0/blk1/blk2.
+    let blk_base = if std::env::var("PLINTH_IOMMU").as_deref() == Ok("amd") { 6 } else { 3 };
+    let blk0_addr = format!("virtio-blk-pci,drive=blk0,addr=0x{:x},disable-legacy=on,iommu_platform=on", blk_base);
+    let blk1_addr = format!("virtio-blk-pci,drive=blk1,addr=0x{:x},disable-legacy=on,iommu_platform=on", blk_base + 1);
+    let blk2_addr = format!("virtio-blk-pci,drive=blk2,addr=0x{:x},disable-legacy=on,iommu_platform=on", blk_base + 2);
+
     // Stage 1 storage: a deterministic raw disk behind a modern virtio-blk-pci
     // device, pinned to slot 3 so discovery output is stable across runs.
     // disable-legacy=on forces the modern (MMIO-capability) device the driver
@@ -664,7 +686,7 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
         // iommu_platform=on routes this device's DMA through the vIOMMU (it then
         // offers VIRTIO_F_ACCESS_PLATFORM); without it QEMU's virtio bypasses the
         // IOMMU and the domain enforcement would be vacuous.
-        "virtio-blk-pci,drive=blk0,addr=0x3,disable-legacy=on,iommu_platform=on",
+        &blk0_addr,
     ]);
 
     // Storage device 1: the read-only boot archive. Pinned to slot 4 (just past
@@ -675,7 +697,7 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
         "-drive",
         &format!("if=none,format=raw,file={},id=blk1", archive.display()),
         "-device",
-        "virtio-blk-pci,drive=blk1,addr=0x4,disable-legacy=on,iommu_platform=on",
+        &blk1_addr,
     ]);
 
     // Storage device 2: the directly-bound device (direct-binding slice 2),
@@ -688,7 +710,7 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
         "-drive",
         &format!("if=none,format=raw,file={},id=blk2", bind_disk.display()),
         "-device",
-        "virtio-blk-pci,drive=blk2,addr=0x5,disable-legacy=on,iommu_platform=on",
+        &blk2_addr,
     ]);
 
     // Log CPU resets and exceptions for post-mortem debugging.

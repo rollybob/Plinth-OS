@@ -39,16 +39,22 @@ use crate::pci;
 /// becomes one unit, so this matches `acpi::MAX_DRHD`.
 pub const MAX_UNITS: usize = acpi::MAX_DRHD;
 
+/// Which IOMMU vendor a remapping unit is, chosen at discovery from the ACPI table
+/// present (VT-d's DMAR or AMD-Vi's IVRS). Selects which `Backend` bring-up and
+/// `PteFmt` a unit uses; a device with neither table stays kernel-bridged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Vendor {
+    Vtd,
+    AmdVi,
+}
+
 /// One remapping unit, platform-agnostic: the MMIO register base a backend
-/// programs and the PCI segment it covers. The VT-d backend fills this from a
-/// DRHD; an AMD-Vi backend would fill it from an IVHD. Slice 1 stores it and
-/// stops -- slice 2 hangs a domain (a per-device page table over the frame
-/// allocator) off each unit.
+/// programs, the PCI segment it covers, and its vendor. The VT-d backend fills this
+/// from a DRHD; the AMD-Vi backend fills it from an IVHD.
 ///
-/// `allow(dead_code)`: the fields are populated by `discover` (slice 1) and first
-/// read by the domain build (slice 2, via `units`). Kept as a forward API rather
-/// than re-plumbed later, mirroring how `acpi::Topology` was defined ahead of its
-/// consumer.
+/// `allow(dead_code)`: some fields are populated by `discover` and first read by the
+/// backend bring-up, kept as a forward API rather than re-plumbed later, mirroring
+/// how `acpi::Topology` was defined ahead of its consumer.
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct RemappingUnit {
@@ -60,14 +66,21 @@ pub struct RemappingUnit {
     /// (VT-d INCLUDE_PCI_ALL). When false, it covers only the devices its DMAR
     /// device-scope names -- which is what QEMU's `intel-iommu` reports.
     pub covers_all: bool,
-    /// Host DMA address width in bits (from the DMAR), the page-table depth is
-    /// derived from it when a domain is built for this unit.
+    /// Host DMA address width in bits, the page-table depth is derived from it when
+    /// a domain is built for this unit.
     pub addr_width: u8,
+    /// VT-d or AMD-Vi -- which backend and page-table format this unit uses.
+    pub vendor: Vendor,
 }
 
 impl RemappingUnit {
-    const EMPTY: RemappingUnit =
-        RemappingUnit { register_base: 0, segment: 0, covers_all: false, addr_width: 0 };
+    const EMPTY: RemappingUnit = RemappingUnit {
+        register_base: 0,
+        segment: 0,
+        covers_all: false,
+        addr_width: 0,
+        vendor: Vendor::Vtd,
+    };
 }
 
 /// The remapping units discovered at boot. Filled once by `discover`; read by the
@@ -89,45 +102,73 @@ static UNIT_COUNT: Mutex<usize> = Mutex::new(0);
 /// base and the address width ride unasserted detail lines (they can shift across
 /// QEMU versions, exactly like the MADT LAPIC base and the PCI BARs).
 pub fn discover<W: Write>(out: &mut W, rsdp: Option<u64>, phys_offset: u64) -> usize {
-    let Some(dmar) = acpi::find_dmar(rsdp, phys_offset) else {
-        // No VT-d DMAR: a plain q35 with no `-device intel-iommu`, or an AMD-Vi
-        // platform (IVRS, not yet a backend). Not an error -- DMA stays
-        // kernel-bridged, which needs no IOMMU to be safe.
-        let _ = writeln!(out, "plinth: iommu: no remapping unit (no VT-d DMAR)");
-        return 0;
-    };
-
-    let mut units = UNITS.lock();
-    let mut count = 0usize;
-    for i in 0..dmar.drhd_count.min(MAX_UNITS) {
-        let d = dmar.drhds[i];
-        units[count] = RemappingUnit {
-            register_base: d.register_base,
-            segment: d.segment,
-            covers_all: d.include_pci_all,
-            addr_width: dmar.host_addr_width,
-        };
-        count += 1;
-        // Detail line -- the register base is not asserted (allow-listed).
+    // VT-d first (DMAR), then AMD-Vi (IVRS); a platform has one or the other (D7).
+    if let Some(dmar) = acpi::find_dmar(rsdp, phys_offset) {
+        let mut units = UNITS.lock();
+        let mut count = 0usize;
+        for i in 0..dmar.drhd_count.min(MAX_UNITS) {
+            let d = dmar.drhds[i];
+            units[count] = RemappingUnit {
+                register_base: d.register_base,
+                segment: d.segment,
+                covers_all: d.include_pci_all,
+                addr_width: dmar.host_addr_width,
+                vendor: Vendor::Vtd,
+            };
+            count += 1;
+            // Detail line -- the register base is not asserted (allow-listed).
+            let _ = writeln!(
+                out,
+                "plinth:   iommu unit: base 0x{:x} segment {} covers_all {}",
+                d.register_base, d.segment, d.include_pci_all as u8
+            );
+        }
+        *UNIT_COUNT.lock() = count;
+        drop(units);
+        // The one asserted line is the stable count PREFIX; the address-width tail is
+        // not asserted (aw-bits varies by QEMU version). "translation off" is the
+        // whole claim: the unit is found, not yet driving anything.
         let _ = writeln!(
             out,
-            "plinth:   iommu unit: base 0x{:x} segment {} covers_all {}",
-            d.register_base, d.segment, d.include_pci_all as u8
+            "plinth: iommu: {} dma remapping unit(s), {}-bit DMA addressing (translation off)",
+            count, dmar.host_addr_width
         );
+        return count;
     }
-    *UNIT_COUNT.lock() = count;
-    drop(units);
 
-    // The one asserted line is the stable count PREFIX; the address-width tail is
-    // not asserted (VT-d aw-bits varies by QEMU version). "translation off" is
-    // stated because that is the whole claim of slice 1: the unit is found, not
-    // yet driving anything.
-    let _ = writeln!(
-        out,
-        "plinth: iommu: {} dma remapping unit(s), {}-bit DMA addressing (translation off)",
-        count, dmar.host_addr_width
-    );
-    count
+    if let Some(ivrs) = acpi::find_ivrs(rsdp, phys_offset) {
+        *UNITS.lock() = {
+            let mut u = [RemappingUnit::EMPTY; MAX_UNITS];
+            u[0] = RemappingUnit {
+                register_base: ivrs.mmio_base,
+                segment: ivrs.segment,
+                // The IVHD's device scope covers its whole segment for our purposes.
+                covers_all: true,
+                addr_width: ivrs.host_addr_width,
+                vendor: Vendor::AmdVi,
+            };
+            u
+        };
+        *UNIT_COUNT.lock() = 1;
+        // Detail line (allow-listed): the IOMMU BDF is what pci.rs skips (D9).
+        let _ = writeln!(
+            out,
+            "plinth:   iommu unit: base 0x{:x} segment {} vendor amd-vi bdf 0x{:04x}",
+            ivrs.mmio_base, ivrs.segment, ivrs.iommu_bdf
+        );
+        // Same asserted prefix as the VT-d path, so the count line is vendor-neutral.
+        let _ = writeln!(
+            out,
+            "plinth: iommu: 1 dma remapping unit(s), {}-bit DMA addressing (translation off)",
+            ivrs.host_addr_width
+        );
+        return 1;
+    }
+
+    // Neither table: a plain q35 with no vIOMMU. Not an error -- DMA stays
+    // kernel-bridged, which needs no IOMMU to be safe.
+    let _ = writeln!(out, "plinth: iommu: no remapping unit (no VT-d DMAR or AMD-Vi IVRS)");
+    0
 }
 
 /// The remapping units discovered at boot, copied out with their count. Empty
@@ -922,12 +963,22 @@ pub fn block_prepare_device(loc: pci::Location, fixed_frames: &[u64]) -> Result<
             return Err("no remapping unit to bind block DMA to");
         }
         let unit = units[0];
-        // VT-d is the only backend today; Phase B selects VtdUnit vs an AMD-Vi unit
-        // by the remapping unit's vendor. bring_up maps registers, validates, and
-        // builds the shared domain + device tables.
-        let (vtd, domain, levels) = VtdUnit::bring_up(unit)?;
+        // Select the backend by the unit's vendor. bring_up maps registers,
+        // validates, and builds the shared domain + device tables.
+        let (backend, domain, levels) = match unit.vendor {
+            Vendor::Vtd => {
+                let (vtd, domain, levels) = VtdUnit::bring_up(unit)?;
+                (Backend::Vtd(vtd), domain, levels)
+            }
+            Vendor::AmdVi => {
+                // Discovery found an AMD-Vi unit (Phase B1) but the backend is not
+                // built yet (Phase B3). Fall back to kernel-bridged DMA, which needs
+                // no IOMMU to be safe -- the caller surfaces this as a prepare skip.
+                return Err("AMD-Vi backend not yet built (staying kernel-bridged)");
+            }
+        };
         *BLOCK_IOMMU.lock() = Some(BlockIommu {
-            backend: Backend::Vtd(vtd),
+            backend,
             domain,
             levels,
             addr_width: unit.addr_width,
