@@ -33,6 +33,26 @@ here on 2026-08-13.
 ## [Unreleased]
 
 ### Added
+- **A vendor-portable IOMMU: Intel VT-d and AMD-Vi.** The protected-DMA and
+  direct-binding work was written against one chipset (Intel VT-d). It now runs on
+  either vendor, chosen at boot from the ACPI table the machine presents -- VT-d's
+  DMAR or AMD-Vi's IVRS. The `iommu` module grew a backend seam: the radix page-table
+  walk and the domain / IOVA machinery stay neutral, while the per-entry encoding
+  (a `PteFmt` tag), the device-to-domain tables, register programming, invalidation,
+  and fault reporting are dispatched to a `Backend` enum -- VT-d (root/context tables,
+  register-poke invalidation, fault-recording register) or AMD-Vi (a flat Device
+  Table, an in-memory command buffer, an event log). A machine with neither IOMMU
+  stays kernel-bridged, so the IOMMU is an enhancement, never a requirement -- the
+  portability floor for running on someone else's machine. Both backends are proven
+  under QEMU on every push (`smoke` for VT-d, the new `smoke-amd` for AMD-Vi). No ABI
+  change: this is entirely kernel-internal, and no program or library OS sees it.
+
+  One gap is documented rather than hidden: QEMU's emulated amd-iommu does not fault
+  an out-of-domain DMA (unlike intel-iommu with caching-mode), so the AMD lane proves
+  translation positively while the forced-fault negative stays on the VT-d lane. The
+  fault-reading code is written for both; a real AMD platform or a future QEMU needs
+  no change. This is the first structural step toward booting on real hardware, which
+  is as likely to be AMD as Intel.
 - **Direct virtqueue binding: a library OS drives a device itself (ABI v2.12).**
   Until now a library OS submitted capability-named requests into a shared ring and
   the kernel turned each into a physical virtqueue descriptor -- the kernel the sole

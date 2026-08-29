@@ -448,7 +448,10 @@ xtask/       build orchestration: user binaries, disk images, QEMU,
   its own virtqueue descriptors naming IOVAs and rings the doorbell itself, the
   kernel off the submit path entirely and the hardware -- not the kernel-as-sole-
   writer -- confining the device's DMA (`bind_device`, ABI v2.12). The same
-  executor drives a bound device unmodified.
+  executor drives a bound device unmodified. The IOMMU itself is vendor-portable:
+  the same domains and bindings run on Intel VT-d or AMD-Vi, chosen at boot from the
+  machine's ACPI table, and a machine with neither stays kernel-bridged -- so the
+  IOMMU is an enhancement, not a requirement.
 - **Status is split from payload on every blocking call.** IPC returns a
   *status* word separate from its message (the message in `RSI`), and a ring
   block completion separates its status from the disk data (which lands in the

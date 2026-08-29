@@ -120,6 +120,20 @@ against the cost to determinism rather than taken for granted.
   direction -- one owner, its own domain; a device is either kernel-bridged or
   directly bound, never both, and releasing the `BoundDevice` capability tears the
   binding down and returns the device to the shared pool.
+- [x] **A vendor-portable IOMMU (Intel VT-d and AMD-Vi).** The protected-DMA work
+  above is written against a vendor seam, not one chipset: the shared radix walk and
+  domain machinery are neutral, and the per-entry page-table encoding, the
+  device-to-domain tables, register programming, cache invalidation, and fault
+  reporting are chosen at boot from whichever ACPI table the machine presents --
+  VT-d's DMAR or AMD-Vi's IVRS. The VT-d backend uses root/context tables and
+  register-poke invalidation; the AMD-Vi backend uses a flat Device Table plus an
+  in-memory command buffer and event log. Both are proven under QEMU on every push
+  (the `smoke` and `smoke-amd` CI lanes), and a machine with neither IOMMU stays
+  safely kernel-bridged. This is the first structural step off QEMU toward booting on
+  real hardware, which is as likely to be AMD as Intel. (One honest gap, documented
+  rather than papered over: QEMU's emulated amd-iommu does not fault an out-of-domain
+  DMA, so the AMD lane proves translation positively while the forced-fault negative
+  stays on the VT-d lane.)
 - [x] **Console input.** The i8042 keyboard's IRQ feeds raw scancodes behind an
   interrupt-controller seam; an `EventSource` capability multiplexes the device.
   Input rides the **same completion rings as block I/O**: a keystroke answers no
