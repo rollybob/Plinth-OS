@@ -74,6 +74,9 @@ jobs:
       - name: Boot smoke test (in QEMU)
         run: cargo xtask smoke
 
+      - name: AMD-Vi boot test (in QEMU, emulated amd-iommu)
+        run: cargo xtask smoke-amd
+
       - name: Multi-core smoke test (in QEMU)
         run: cargo xtask smoke-smp
 

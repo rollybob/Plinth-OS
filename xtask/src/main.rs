@@ -42,6 +42,10 @@ fn main() {
         "run-gdb" => { let img = build_interactive(); run(&img, true); }
         "smoke"   => { let img = build_all(); smoke(&img); }
         "smoke-smp" => { let img = build_all(); smoke_smp(&img); }
+        // Boot under QEMU's emulated AMD-Vi (PLINTH_IOMMU=amd) and assert the
+        // AMD-Vi backend translates block DMA -- the dual-backend lane. Positive-only
+        // (D6): QEMU's amd-iommu does not fault an out-of-domain virtio DMA.
+        "smoke-amd" => { let img = build_all(); amd_check(&img); }
         "bench"   => { let img = build_bench(); bench(&img); }
         "test"    => { let img = build_test(); run_tests(&img); }
         "console" => { let img = build_force_console(); console_check(&img); }
@@ -50,7 +54,7 @@ fn main() {
         other     => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, bench, test, console, no-i8042, check"
+                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, smoke-amd, bench, test, console, no-i8042, check"
             );
             std::process::exit(1);
         }
@@ -1631,6 +1635,42 @@ fn no_i8042_check(uefi_path: &Path) {
     eprintln!("  \"i8042 absent, input disabled\" present: {reported_absent} (want true)");
     eprintln!("  \"boot ok\" present:                      {booted} (want true)");
     eprintln!("  \"keyboard ready\" present:               {armed_keyboard} (want false)");
+    eprintln!("--- captured output ---");
+    eprintln!("{output}");
+    eprintln!("--- end output ---");
+    std::process::exit(1);
+}
+
+/// Boot under QEMU's emulated AMD-Vi and assert the AMD-Vi backend end to end:
+/// the IVRS unit is discovered, translation is enabled, and both kernel-bridged
+/// block devices read correctly under AMD-Vi translation. The dual-backend lane
+/// alongside the default VT-d `smoke`. Positive-only (D6): QEMU's amd-iommu does
+/// not fault an out-of-domain virtio DMA, so there is no negative to assert here.
+fn amd_check(uefi_path: &Path) {
+    // build_qemu_cmd reads PLINTH_IOMMU to pick amd-iommu and shift the virtio slots.
+    std::env::set_var("PLINTH_IOMMU", "amd");
+    let output = run_capture(uefi_path);
+
+    let discovered = output.contains("vendor amd-vi");
+    let one_unit = output.contains("1 dma remapping unit(s)");
+    let enabled = output.contains("plinth: iommu: translation enabled");
+    let blk0 = output.contains("virtio-blk[0] sector 0 read ok");
+    let blk1 = output.contains("virtio-blk[1] sector 0 read ok");
+    let booted = output.contains("shell: quit");
+
+    if discovered && one_unit && enabled && blk0 && blk1 && booted {
+        println!(
+            "amd: ok (AMD-Vi discovered, translation enabled, block reads verified under amd-iommu)"
+        );
+        return;
+    }
+    eprintln!("amd: FAIL");
+    eprintln!("  amd-vi discovered:     {discovered} (want true)");
+    eprintln!("  1 remapping unit:      {one_unit} (want true)");
+    eprintln!("  translation enabled:   {enabled} (want true)");
+    eprintln!("  blk0 read ok:          {blk0} (want true)");
+    eprintln!("  blk1 read ok:          {blk1} (want true)");
+    eprintln!("  booted to shell quit:  {booted} (want true)");
     eprintln!("--- captured output ---");
     eprintln!("{output}");
     eprintln!("--- end output ---");
