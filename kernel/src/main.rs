@@ -377,7 +377,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // translation on, force one out-of-domain DMA and confirm the unit
         // faults, then that the same read succeeds once mapped. Only meaningful
         // when translation is actually enabled.
-        if iommu::block_translation_enabled() && virtio_blk::ready(0) {
+        // The forced-fault negative reads the fault-recording register, which is
+        // VT-d-specific; the AMD-Vi event-log fault path lands in a later slice
+        // (D6), so gate the negative to VT-d for now. The positive (block reads
+        // under translation) runs for both vendors above.
+        if iommu::block_translation_enabled()
+            && iommu::active_vendor() == Some(iommu::Vendor::Vtd)
+            && virtio_blk::ready(0)
+        {
             virtio_blk::fault_selftest(&mut serial, phys_offset, 0);
         }
         // Direct-binding slice 2: prove the bound device works driven through its

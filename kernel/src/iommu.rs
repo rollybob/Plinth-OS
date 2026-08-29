@@ -713,6 +713,7 @@ pub struct Fault {
 /// (`BlockIommu`, the shared `Domain`, `IovaAllocator`) sits outside this enum.
 enum Backend {
     Vtd(VtdUnit),
+    AmdVi(AmdViUnit),
 }
 
 /// Intel VT-d's per-unit state: the mapped register window, the root/context
@@ -735,6 +736,7 @@ impl Backend {
     fn attach_device(&mut self, loc: pci::Location, slptptr: u64, levels: u8, did: u16) {
         match self {
             Backend::Vtd(v) => v.tables.set_device(loc.slot, loc.func, slptptr, levels, did),
+            Backend::AmdVi(v) => v.set_device(loc, slptptr, levels, did),
         }
     }
 
@@ -742,6 +744,7 @@ impl Backend {
     fn detach_device(&mut self, loc: pci::Location) {
         match self {
             Backend::Vtd(v) => v.tables.clear_device(loc.slot, loc.func),
+            Backend::AmdVi(v) => v.clear_device(loc),
         }
     }
 
@@ -750,6 +753,7 @@ impl Backend {
         match self {
             // SAFETY: regs_va/iotlb_off are this unit's mapped registers.
             Backend::Vtd(v) => unsafe { invalidate_all(v.regs_va, v.iotlb_off) },
+            Backend::AmdVi(v) => v.invalidate_all(),
         }
     }
 
@@ -757,6 +761,7 @@ impl Backend {
     fn take_fault(&mut self) -> Option<Fault> {
         match self {
             Backend::Vtd(v) => v.take_fault(),
+            Backend::AmdVi(v) => v.take_fault(),
         }
     }
 
@@ -765,16 +770,17 @@ impl Backend {
     fn enable<W: Write>(&mut self, out: &mut W) -> Result<(), &'static str> {
         match self {
             Backend::Vtd(v) => v.enable(out),
+            Backend::AmdVi(v) => v.enable(out),
         }
     }
 
-    /// The device-table root a `set_device`/context entry lives in (VT-d: RTADDR).
-    /// Only used internally by `enable`, kept here for symmetry with a future AMD
-    /// device-table base.
+    /// The device-table root a `set_device`/context entry lives in (VT-d: RTADDR;
+    /// AMD-Vi: the Device Table base). Only used internally, kept for symmetry.
     #[allow(dead_code)]
     fn tables_root(&self) -> u64 {
         match self {
             Backend::Vtd(v) => v.tables.root_phys(),
+            Backend::AmdVi(v) => v.devtab_phys,
         }
     }
 
@@ -783,6 +789,7 @@ impl Backend {
     fn pte_fmt(&self) -> PteFmt {
         match self {
             Backend::Vtd(_) => PteFmt::Vtd,
+            Backend::AmdVi(_) => PteFmt::AmdVi,
         }
     }
 }
@@ -910,6 +917,252 @@ impl VtdUnit {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AMD-Vi backend (Phase B3).
+//
+// AMD-Vi differs from VT-d in every mechanism below discovery: an explicit
+// Device Table (flat, indexed by BDF) instead of root/context tables, an
+// in-memory command buffer for invalidation instead of register pokes, and an
+// in-memory event log for faults instead of a fault-recording register. The
+// IOMMU accesses these structures with PHYSICAL addresses (it does not translate
+// its own structures), so they are reachable before translation is enabled. The
+// Device Table is one frame -- 128 entries, BDF 0..127 (bus 0, dev 0..15) -- which
+// covers every device QEMU's q35 places (D3: bus 0 only).
+// ---------------------------------------------------------------------------
+
+/// AMD-Vi MMIO register offsets from the IOMMU base.
+const AMD_REG_DEV_TAB_BASE: usize = 0x00;
+const AMD_REG_CMD_BUF_BASE: usize = 0x08;
+const AMD_REG_EVT_LOG_BASE: usize = 0x10;
+const AMD_REG_CONTROL: usize = 0x18;
+const AMD_REG_EXT_FEATURE: usize = 0x30;
+const AMD_REG_CMD_BUF_HEAD: usize = 0x2000;
+const AMD_REG_CMD_BUF_TAIL: usize = 0x2008;
+const AMD_REG_EVT_LOG_HEAD: usize = 0x2010;
+const AMD_REG_EVT_LOG_TAIL: usize = 0x2018;
+
+/// Control register bits.
+const AMD_CTRL_IOMMU_EN: u64 = 1 << 0;
+const AMD_CTRL_EVT_LOG_EN: u64 = 1 << 2;
+const AMD_CTRL_CMD_BUF_EN: u64 = 1 << 12;
+
+/// Device Table Entry qword-0 bits.
+const AMD_DTE_V: u64 = 1 << 0; // entry valid
+const AMD_DTE_TV: u64 = 1 << 1; // translation (page-table) valid
+const AMD_DTE_IR: u64 = 1 << 61; // device-level read permission
+const AMD_DTE_IW: u64 = 1 << 62; // device-level write permission
+/// The Mode (page-table level count) field starts at bit 9 of DTE qword 0.
+const AMD_DTE_MODE_SHIFT: u64 = 9;
+
+/// Command opcode field, in command dword 1 bits [31:28].
+const AMD_CMD_OPCODE_SHIFT: u32 = 28;
+const AMD_CMD_COMPLETION_WAIT: u32 = 0x01;
+const AMD_CMD_INV_ALL: u32 = 0x08;
+/// COMPLETION_WAIT dword-0 store flag (write the completion value to memory).
+const AMD_COMPL_STORE: u32 = 1 << 0;
+
+/// One 4-KiB Device Table frame holds 128 32-byte entries (BDF 0..127).
+const AMD_DEVTAB_ENTRIES: usize = 128;
+/// Command buffer / event log are 4 KiB = 256 16-byte entries; the size field in
+/// the base register is log2(entries) = 8.
+const AMD_RING_LEN_FIELD: u64 = 8;
+const AMD_CMDBUF_BYTES: u32 = 4096;
+
+/// AMD-Vi per-unit state: the mapped register window and the physical structures
+/// the IOMMU DMAs into (Device Table, command buffer, event log, completion
+/// semaphore), plus the software copy of the command-buffer tail.
+struct AmdViUnit {
+    regs_va: u64,
+    devtab_va: u64,
+    devtab_phys: u64,
+    cmdbuf_va: u64,
+    cmdbuf_tail: u32,
+    /// Event log physical base -- programmed into the unit; the log is read by
+    /// `take_fault` (Phase B4), stubbed to `None` here.
+    #[allow(dead_code)]
+    evtlog_phys: u64,
+    /// Completion-wait semaphore: the IOMMU stores `sem_val` here when it finishes
+    /// a COMPLETION_WAIT; we poll it. Accessed physically by the IOMMU.
+    sem_va: u64,
+    sem_phys: u64,
+    sem_val: u64,
+}
+
+impl AmdViUnit {
+    /// Bring up the AMD-Vi unit: map its registers, allocate and zero the Device
+    /// Table, command buffer, event log, and completion semaphore, build the shared
+    /// AMD-format `Domain`, and program the base registers. Does NOT set IOMMUEN --
+    /// `enable` does that after every device's DTE is written (like the VT-d flow).
+    fn bring_up(unit: RemappingUnit) -> Result<(AmdViUnit, Domain, u8), &'static str> {
+        // Map enough to reach the command/event head-tail registers at 0x2000+.
+        let regs_va = memory::map_kernel_mmio(unit.register_base, 0x3000)?;
+        let levels = levels_for(unit.addr_width)?;
+        let (devtab_phys, cmdbuf_phys, evtlog_phys, sem_phys, domain) = {
+            let mut fg = FRAME_ALLOC.lock();
+            let fa = fg.as_mut().ok_or("frame allocator not initialised")?;
+            let devtab = fa.alloc().map_err(|_| "amd devtab alloc failed")?;
+            let cmdbuf = fa.alloc().map_err(|_| "amd cmdbuf alloc failed")?;
+            let evtlog = fa.alloc().map_err(|_| "amd evtlog alloc failed")?;
+            let sem = fa.alloc().map_err(|_| "amd sem alloc failed")?;
+            let domain = Domain::new(fa, unit.addr_width, PteFmt::AmdVi)
+                .map_err(|_| "amd domain alloc failed")?;
+            (devtab, cmdbuf, evtlog, sem, domain)
+        };
+        let po = memory::phys_offset();
+        let devtab_va = po + devtab_phys;
+        let cmdbuf_va = po + cmdbuf_phys;
+        let sem_va = po + sem_phys;
+        // SAFETY: the four frames were just allocated and are mapped at phys_offset;
+        // zeroing makes every DTE invalid and both rings empty before enable.
+        unsafe {
+            core::ptr::write_bytes(devtab_va as *mut u8, 0, 4096);
+            core::ptr::write_bytes(cmdbuf_va as *mut u8, 0, 4096);
+            core::ptr::write_bytes((po + evtlog_phys) as *mut u8, 0, 4096);
+            write_volatile(sem_va as *mut u64, 0);
+            // Program the base registers. Device Table size field (bits [8:0]) = 0
+            // means one 4-KiB page. Command buffer / event log size = log2(256) = 8
+            // in bits [59:56]. Reset both rings' head and tail.
+            reg_w64(regs_va, AMD_REG_DEV_TAB_BASE, devtab_phys & SL_ADDR_MASK);
+            reg_w64(regs_va, AMD_REG_CMD_BUF_BASE, (cmdbuf_phys & SL_ADDR_MASK) | (AMD_RING_LEN_FIELD << 56));
+            reg_w64(regs_va, AMD_REG_EVT_LOG_BASE, (evtlog_phys & SL_ADDR_MASK) | (AMD_RING_LEN_FIELD << 56));
+            reg_w64(regs_va, AMD_REG_CMD_BUF_HEAD, 0);
+            reg_w64(regs_va, AMD_REG_CMD_BUF_TAIL, 0);
+            reg_w64(regs_va, AMD_REG_EVT_LOG_HEAD, 0);
+            reg_w64(regs_va, AMD_REG_EVT_LOG_TAIL, 0);
+        }
+        Ok((
+            AmdViUnit {
+                regs_va,
+                devtab_va,
+                devtab_phys,
+                cmdbuf_va,
+                cmdbuf_tail: 0,
+                evtlog_phys,
+                sem_va,
+                sem_phys,
+                sem_val: 0,
+            },
+            domain,
+            levels,
+        ))
+    }
+
+    /// Write the Device Table Entry for `loc`: valid + translation-valid, the page
+    /// table root, the level count in the Mode field, read+write, and the domain id.
+    fn set_device(&mut self, loc: pci::Location, slptptr: u64, levels: u8, did: u16) {
+        // BDF for a bus-0 device: (dev << 3) | func.
+        let bdf = ((loc.slot as usize & 0x1f) << 3) | (loc.func as usize & 0x7);
+        if bdf >= AMD_DEVTAB_ENTRIES {
+            return; // beyond the single-frame table (bus 0, dev 0..15)
+        }
+        let mode = (levels as u64) & 0x7;
+        let d0 = AMD_DTE_V
+            | AMD_DTE_TV
+            | (mode << AMD_DTE_MODE_SHIFT)
+            | (slptptr & SL_ADDR_MASK)
+            | AMD_DTE_IR
+            | AMD_DTE_IW;
+        let d1 = did as u64; // domain id in the low bits of qword 1
+        // SAFETY: bdf < 128, so the 32-byte entry is within the mapped Device Table
+        // frame; the IOMMU is not yet enabled (or is flushed after), so a plain
+        // write is safe.
+        unsafe {
+            let e = (self.devtab_va + (bdf as u64) * 32) as *mut u64;
+            write_volatile(e, d0);
+            write_volatile(e.add(1), d1);
+            write_volatile(e.add(2), 0);
+            write_volatile(e.add(3), 0);
+        }
+    }
+
+    /// Clear `loc`'s Device Table Entry so it stops routing (teardown).
+    fn clear_device(&mut self, loc: pci::Location) {
+        let bdf = ((loc.slot as usize & 0x1f) << 3) | (loc.func as usize & 0x7);
+        if bdf >= AMD_DEVTAB_ENTRIES {
+            return;
+        }
+        // SAFETY: bdf < 128, within the mapped Device Table frame.
+        unsafe {
+            let e = (self.devtab_va + (bdf as u64) * 32) as *mut u64;
+            for i in 0..4 {
+                write_volatile(e.add(i), 0);
+            }
+        }
+    }
+
+    /// Post one 16-byte command (four dwords) at the tail and advance the tail
+    /// register. Requires the command buffer to be enabled (set in `enable`).
+    fn post_command(&mut self, cmd: [u32; 4]) {
+        // SAFETY: cmdbuf_tail < 4096 and 16-aligned, so the four dwords are within
+        // the mapped command-buffer frame.
+        unsafe {
+            let p = (self.cmdbuf_va + self.cmdbuf_tail as u64) as *mut u32;
+            write_volatile(p, cmd[0]);
+            write_volatile(p.add(1), cmd[1]);
+            write_volatile(p.add(2), cmd[2]);
+            write_volatile(p.add(3), cmd[3]);
+        }
+        self.cmdbuf_tail = (self.cmdbuf_tail + 16) % AMD_CMDBUF_BYTES;
+        // SAFETY: the tail register is at a fixed offset in the mapped window.
+        unsafe { reg_w64(self.regs_va, AMD_REG_CMD_BUF_TAIL, self.cmdbuf_tail as u64) };
+    }
+
+    /// Post a COMPLETION_WAIT with a memory store and spin until the IOMMU writes
+    /// the completion value -- the barrier that a prior invalidation has retired.
+    fn completion_wait(&mut self) {
+        self.sem_val = self.sem_val.wrapping_add(1);
+        let target = self.sem_val;
+        // SAFETY: sem_va is our mapped semaphore frame.
+        unsafe { write_volatile(self.sem_va as *mut u64, 0) };
+        let paddr = self.sem_phys;
+        let cmd = [
+            (paddr as u32 & 0xffff_fff8) | AMD_COMPL_STORE,
+            ((paddr >> 32) as u32) | (AMD_CMD_COMPLETION_WAIT << AMD_CMD_OPCODE_SHIFT),
+            target as u32,
+            (target >> 32) as u32,
+        ];
+        self.post_command(cmd);
+        let mut spun = 0u32;
+        // SAFETY: sem_va is our mapped semaphore frame; the IOMMU stores `target`.
+        while unsafe { read_volatile(self.sem_va as *const u64) } != target {
+            spun += 1;
+            if spun >= INVAL_POLL_LIMIT {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Flush every cached translation and DTE (INVALIDATE_IOMMU_ALL), then wait for
+    /// completion -- the AMD analogue of VT-d's context + IOTLB invalidation.
+    fn invalidate_all(&mut self) {
+        let cmd = [0u32, AMD_CMD_INV_ALL << AMD_CMD_OPCODE_SHIFT, 0, 0];
+        self.post_command(cmd);
+        self.completion_wait();
+    }
+
+    /// Enable the IOMMU, command buffer, and event log, then flush all caches so the
+    /// Device Table entries written before enable take effect.
+    fn enable<W: Write>(&mut self, out: &mut W) -> Result<(), &'static str> {
+        // SAFETY: regs_va is the mapped AMD-Vi register window.
+        unsafe {
+            let efr = reg_r64(self.regs_va, AMD_REG_EXT_FEATURE);
+            let _ = writeln!(out, "plinth:   iommu amd-vi efr {efr:#018x}");
+            let mut ctrl = reg_r64(self.regs_va, AMD_REG_CONTROL);
+            ctrl |= AMD_CTRL_IOMMU_EN | AMD_CTRL_CMD_BUF_EN | AMD_CTRL_EVT_LOG_EN;
+            reg_w64(self.regs_va, AMD_REG_CONTROL, ctrl);
+        }
+        self.invalidate_all();
+        Ok(())
+    }
+
+    /// Read a recorded DMA fault from the event log. Stubbed to `None` in Phase B3;
+    /// the event-log ring parse is Phase B4 (D5/D6).
+    fn take_fault(&mut self) -> Option<Fault> {
+        None
+    }
+}
+
 /// A directly-bound device's private DMA state (direct-binding slice 2): its own
 /// non-identity `Domain` and the opaque IOVA allocator that names frames in it.
 /// Lives inside `BlockIommu` because it shares that unit's registers and
@@ -1016,10 +1269,8 @@ pub fn block_prepare_device(loc: pci::Location, fixed_frames: &[u64]) -> Result<
                 (Backend::Vtd(vtd), domain, levels)
             }
             Vendor::AmdVi => {
-                // Discovery found an AMD-Vi unit (Phase B1) but the backend is not
-                // built yet (Phase B3). Fall back to kernel-bridged DMA, which needs
-                // no IOMMU to be safe -- the caller surfaces this as a prepare skip.
-                return Err("AMD-Vi backend not yet built (staying kernel-bridged)");
+                let (amd, domain, levels) = AmdViUnit::bring_up(unit)?;
+                (Backend::AmdVi(amd), domain, levels)
             }
         };
         *BLOCK_IOMMU.lock() = Some(BlockIommu {
@@ -1114,6 +1365,16 @@ pub fn block_enable<W: Write>(out: &mut W) -> Result<(), &'static str> {
 /// nothing to fault.
 pub fn block_translation_enabled() -> bool {
     BLOCK_IOMMU.lock().as_ref().is_some_and(|bi| bi.enabled)
+}
+
+/// The active backend's vendor, or `None` if no unit is bound. Used to gate the
+/// forced-fault negative proof to VT-d until the AMD-Vi event-log fault path lands
+/// (Phase B4 / D6).
+pub fn active_vendor() -> Option<Vendor> {
+    BLOCK_IOMMU.lock().as_ref().map(|bi| match &bi.backend {
+        Backend::Vtd(_) => Vendor::Vtd,
+        Backend::AmdVi(_) => Vendor::AmdVi,
+    })
 }
 
 /// Arm/disarm the fault probe: while armed, the next `block_map_dma` calls do NOT
