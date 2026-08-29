@@ -377,10 +377,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // translation on, force one out-of-domain DMA and confirm the unit
         // faults, then that the same read succeeds once mapped. Only meaningful
         // when translation is actually enabled.
-        // The forced-fault negative reads the fault-recording register, which is
-        // VT-d-specific; the AMD-Vi event-log fault path lands in a later slice
-        // (D6), so gate the negative to VT-d for now. The positive (block reads
-        // under translation) runs for both vendors above.
+        // The forced-fault negative runs on VT-d only. AMD-Vi's fault path (event
+        // log) is wired through `take_fault`, but QEMU's emulated amd-iommu does not
+        // fault an out-of-domain virtio DMA even with dma-remap=on (verified: no
+        // event is logged, unlike intel-iommu+caching-mode). So the AMD lane is
+        // positive-only -- translation is proven, the negative stays on VT-d (D6).
         if iommu::block_translation_enabled()
             && iommu::active_vendor() == Some(iommu::Vendor::Vtd)
             && virtio_blk::ready(0)

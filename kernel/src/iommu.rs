@@ -977,9 +977,7 @@ struct AmdViUnit {
     devtab_phys: u64,
     cmdbuf_va: u64,
     cmdbuf_tail: u32,
-    /// Event log physical base -- programmed into the unit; the log is read by
-    /// `take_fault` (Phase B4), stubbed to `None` here.
-    #[allow(dead_code)]
+    /// Event log physical base -- programmed into the unit and read by `take_fault`.
     evtlog_phys: u64,
     /// Completion-wait semaphore: the IOMMU stores `sem_val` here when it finishes
     /// a COMPLETION_WAIT; we poll it. Accessed physically by the IOMMU.
@@ -1156,10 +1154,30 @@ impl AmdViUnit {
         Ok(())
     }
 
-    /// Read a recorded DMA fault from the event log. Stubbed to `None` in Phase B3;
-    /// the event-log ring parse is Phase B4 (D5/D6).
+    /// Read one recorded DMA fault from the event log, if any. The IOMMU DMAs event
+    /// records (16 bytes) into the log and advances the tail; we consume from the
+    /// head. An IO_PAGE_FAULT record carries its event code in dword-1 bits [31:28]
+    /// and the faulting address in dwords 2/3. `None` when the log is empty.
     fn take_fault(&mut self) -> Option<Fault> {
-        None
+        // SAFETY: regs_va is the mapped register window; evtlog is our mapped frame.
+        unsafe {
+            // Head/Tail pointers are byte offsets in bits [18:4].
+            let head = reg_r64(self.regs_va, AMD_REG_EVT_LOG_HEAD) & 0x0007_fff0;
+            let tail = reg_r64(self.regs_va, AMD_REG_EVT_LOG_TAIL) & 0x0007_fff0;
+            if head == tail {
+                return None;
+            }
+            let e = (memory::phys_offset() + self.evtlog_phys + head) as *const u32;
+            let dw1 = read_volatile(e.add(1));
+            let dw2 = read_volatile(e.add(2));
+            let dw3 = read_volatile(e.add(3));
+            let reason = (dw1 >> 28) & 0xf;
+            let addr = (((dw3 as u64) << 32) | dw2 as u64) & !0xfff;
+            // Consume this entry: advance the head one 16-byte record, wrapping 4 KiB.
+            let new_head = (head + 16) % 4096;
+            reg_w64(self.regs_va, AMD_REG_EVT_LOG_HEAD, new_head);
+            Some(Fault { addr, reason })
+        }
     }
 }
 
