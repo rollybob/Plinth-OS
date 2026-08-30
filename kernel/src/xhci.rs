@@ -655,11 +655,28 @@ pub struct Xhci {
     db: u64,
     ir0: u64,
     erseg_phys: u64,
+    dcbaa_va: u64,
+    port: u8,
     max_slots: u8,
     max_ports: u8,
     csz: bool,
     cmd: Option<ProducerRing>,
     event: Option<EventRing>,
+    dev: Option<Device>,
+}
+
+/// The single enumerated device (v1 handles one boot keyboard). Holds its slot,
+/// root-hub port and speed, its EP0 control transfer ring, and its Input + output
+/// Device Context frames.
+struct Device {
+    slot: u8,
+    port: u8,
+    speed: u8,
+    ep0: ProducerRing,
+    dev_ctx_phys: u64,
+    dev_ctx_va: u64,
+    input_ctx_phys: u64,
+    input_ctx_va: u64,
 }
 
 impl Xhci {
@@ -758,6 +775,7 @@ impl Xhci {
             unsafe { core::ptr::write_volatile(dcbaa_va as *mut u64, arr_phys) };
         }
         w64(self.op + OP_DCBAAP, dcbaa_phys);
+        self.dcbaa_va = dcbaa_va; // kept so Address Device can set DCBAA[slot]
 
         // Command ring: build the producer ring over the frame (this writes the
         // Link TRB), store it on the controller, then point CRCR at it with the
@@ -828,6 +846,7 @@ impl Xhci {
             w32(addr, base | PORTSC_PR | PORTSC_PP);
             if let Some(ev) = self.poll_event(TrbType::PortStatusChange as u8) {
                 port = Some(ev.port_id());
+                self.port = p; // the connected, now-reset port -- Address Device targets it
                 break;
             }
         }
@@ -898,6 +917,122 @@ impl Xhci {
         let _ = writeln!(out, "plinth: xhci: enable slot ok -> slot id {slot}");
         Some(slot)
     }
+
+    /// Port speed field from PORTSC[port] (bits 10-13); valid after the port is
+    /// reset/enabled.
+    fn port_speed(&self, port: u8) -> u8 {
+        ((r32(self.op + 0x400 + (port as u64 - 1) * 0x10) >> 10) & 0xF) as u8
+    }
+
+    /// Address Device (step 2): give the enumerated slot a Device Context and an
+    /// EP0 control-transfer ring, hand the controller an Input Context describing
+    /// the slot + EP0, and issue the command (BSR=0, so it also sends the USB
+    /// SET_ADDRESS). Records the device on success. This is the last command-only
+    /// enumeration step; reading descriptors over EP0 is the next slice.
+    fn address_device<W: Write>(&mut self, slot: u8, out: &mut W) -> bool {
+        let trbs_per_frame = (crate::frame_alloc::FRAME_SIZE / 16) as usize;
+        // Context stride: 64 bytes if the controller uses large contexts (CSZ=1),
+        // else 32. QEMU is 32; computed so the layout is right either way.
+        let cs = if self.csz { 0x40u64 } else { 0x20u64 };
+
+        let port = self.port;
+        let speed = self.port_speed(port);
+        let mps = ep0_mps(speed);
+
+        // Output Device Context (the controller writes it), the Input Context (we
+        // write it), and the EP0 transfer ring -- one zeroed frame each.
+        let (dev_ctx_phys, dev_ctx_va) = match alloc_zeroed() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = writeln!(out, "plinth: xhci: device context alloc: {e}");
+                return false;
+            }
+        };
+        let (input_ctx_phys, input_ctx_va) = match alloc_zeroed() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = writeln!(out, "plinth: xhci: input context alloc: {e}");
+                return false;
+            }
+        };
+        let (ep0_phys, ep0_va) = match alloc_zeroed() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = writeln!(out, "plinth: xhci: ep0 ring alloc: {e}");
+                return false;
+            }
+        };
+        // Safety: ep0_va is a mapped page-sized frame; trbs_per_frame TRBs fit.
+        let ep0 = unsafe { ProducerRing::new(ep0_va as *mut Trb, trbs_per_frame, ep0_phys) };
+
+        // Input Control Context (offset 0): add the slot (A0) and EP0 (A1).
+        let mut icc = InputControlContext::zeroed();
+        icc.add_context(0);
+        icc.add_context(dci(0, true));
+        write_context(input_ctx_va, &icc.dwords);
+
+        // Slot Context (offset cs): root-hub-attached, one context entry (EP0).
+        let mut sc = SlotContext::zeroed();
+        sc.set_route_string(0);
+        sc.set_speed(speed);
+        sc.set_context_entries(1);
+        sc.set_root_hub_port(port);
+        write_context(input_ctx_va + cs, &sc.dwords);
+
+        // EP0 Endpoint Context (offset cs*2 = DCI 1): control endpoint, its TR
+        // dequeue pointer = the EP0 ring, DCS matching the ring's initial PCS.
+        let mut ep = EndpointContext::zeroed();
+        ep.set_ep_type(EpType::Control);
+        ep.set_max_packet_size(mps);
+        ep.set_error_count(3);
+        ep.set_tr_dequeue(ep0_phys, true);
+        ep.set_avg_trb_len(8);
+        write_context(input_ctx_va + cs * 2, &ep.dwords);
+
+        // DCBAA[slot] -> the output Device Context.
+        unsafe {
+            core::ptr::write_volatile((self.dcbaa_va + slot as u64 * 8) as *mut u64, dev_ctx_phys)
+        };
+
+        // Issue the command and await completion.
+        if let Some(c) = self.cmd.as_mut() {
+            c.push(Trb::address_device(input_ctx_phys, slot, false));
+        }
+        w32(self.db, 0);
+        let ev = match self.poll_event(TrbType::CommandCompletion as u8) {
+            Some(e) => e,
+            None => {
+                let _ = writeln!(out, "plinth: xhci: address device: no completion event");
+                return false;
+            }
+        };
+        if ev.completion_code() != 1 {
+            let _ = writeln!(
+                out,
+                "plinth: xhci: address device failed (completion code {})",
+                ev.completion_code()
+            );
+            return false;
+        }
+        // The assigned USB address lands in the output slot context (dword3 bits 0-7).
+        let usb_addr = unsafe { core::ptr::read_volatile((dev_ctx_va + 0x0C) as *const u32) } & 0xFF;
+        let _ = writeln!(
+            out,
+            "plinth: xhci: address device ok (slot {slot}, port {port}, speed {speed}, usb addr {usb_addr})"
+        );
+
+        self.dev = Some(Device {
+            slot,
+            port,
+            speed,
+            ep0,
+            dev_ctx_phys,
+            dev_ctx_va,
+            input_ctx_phys,
+            input_ctx_va,
+        });
+        true
+    }
 }
 
 /// Poll `cond` up to a fixed bound with a relaxed spin. There is no fine-grained
@@ -905,6 +1040,24 @@ impl Xhci {
 /// TCG QEMU, and a real controller readies in microseconds. Returns false if the
 /// condition never held (a real controller/firmware fault), so the caller reports
 /// and moves on instead of hanging (first_metal_boot.md D3).
+/// Write a 32-byte context (8 dwords) into a DMA frame at `dst_va`, volatile.
+fn write_context(dst_va: u64, dwords: &[u32; 8]) {
+    for (i, w) in dwords.iter().enumerate() {
+        // Safety: dst_va is inside a mapped context frame with room for 8 dwords.
+        unsafe { core::ptr::write_volatile((dst_va + (i as u64) * 4) as *mut u32, *w) };
+    }
+}
+
+/// Initial EP0 max packet size by port speed. Full/Low speed start at 8 (the real
+/// value is read from the device descriptor later); High is 64, Super 512.
+fn ep0_mps(speed: u8) -> u16 {
+    match speed {
+        SPEED_HIGH => 64,
+        SPEED_SUPER => 512,
+        _ => 8, // low/full (and unknown): the safe minimum
+    }
+}
+
 fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
     for _ in 0..50_000_000u64 {
         if cond() {
@@ -956,11 +1109,14 @@ pub fn init<W: Write>(out: &mut W) -> Option<Xhci> {
         db: mmio + dboff,
         ir0: mmio + rtsoff + IR0,
         erseg_phys: 0,
+        dcbaa_va: 0,
+        port: 0,
         max_slots,
         max_ports,
         csz,
         cmd: None,
         event: None,
+        dev: None,
     };
 
     let _ = writeln!(
@@ -980,8 +1136,9 @@ pub fn init<W: Write>(out: &mut W) -> Option<Xhci> {
     if !x.program_and_run(out) {
         return None;
     }
-    // Step 2 (first slice): Enable Slot over the command ring -- the first device
-    // enumeration step, proving the command ring + doorbell + completion path.
-    x.enable_slot(out);
+    // Step 2: enumerate the device -- Enable Slot, then Address Device.
+    if let Some(slot) = x.enable_slot(out) {
+        x.address_device(slot, out);
+    }
     Some(x)
 }
