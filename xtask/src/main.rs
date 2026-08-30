@@ -1864,6 +1864,9 @@ fn usb_key_check(uefi_path: &Path) {
     }
 
     // Inject through the monitor: Down selects icon 2 (CRASH), Enter launches it.
+    // NOTE: headless QEMU has no active pointer, so this exercises the keyboard
+    // path in isolation (it cannot reproduce the mouse-vs-keyboard interaction --
+    // that needs a real windowed session).
     let mut mon = match TcpStream::connect(("127.0.0.1", port)) {
         Ok(m) => m,
         Err(e) => fail(&mut child, &buf, &format!("could not connect to the QEMU monitor: {e}")),
