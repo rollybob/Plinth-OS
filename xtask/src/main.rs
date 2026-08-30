@@ -46,6 +46,10 @@ fn main() {
         // AMD-Vi backend translates block DMA -- the dual-backend lane. Positive-only
         // (D6): QEMU's amd-iommu does not fault an out-of-domain virtio DMA.
         "smoke-amd" => { let img = build_all(); amd_check(&img); }
+        // Boot with an emulated xHCI controller + USB keyboard (PLINTH_USB=1) and
+        // assert the USB HID controller bring-up (discover, map, reset). Step 1b of
+        // the USB HID milestone; enumeration + input come in later slices.
+        "smoke-usb" => { let img = build_all(); usb_check(&img); }
         "bench"   => { let img = build_bench(); bench(&img); }
         "test"    => { let img = build_test(); run_tests(&img); }
         "console" => { let img = build_force_console(); console_check(&img); }
@@ -54,7 +58,7 @@ fn main() {
         other     => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, smoke-amd, bench, test, console, no-i8042, check"
+                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, smoke-amd, smoke-usb, bench, test, console, no-i8042, check"
             );
             std::process::exit(1);
         }
@@ -716,6 +720,16 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
         "-device",
         &blk2_addr,
     ]);
+
+    // Optional USB stack (PLINTH_USB=1) for the USB HID bring-up lane
+    // (`cargo xtask smoke-usb`): an xHCI controller with a boot keyboard behind
+    // it. Added after the virtio-blk devices so the controller auto-assigns a
+    // later PCI slot; the kernel finds it by class scan, not by slot. Default
+    // lanes leave it off, so their PCI topology and smoke output are unchanged.
+    if std::env::var("PLINTH_USB").as_deref() == Ok("1") {
+        cmd.args(["-device", "qemu-xhci,id=xhci"]);
+        cmd.args(["-device", "usb-kbd,bus=xhci.0"]);
+    }
 
     // Log CPU resets and exceptions for post-mortem debugging.
     cmd.args(["-D", "qemu_debug.log", "-d", "cpu_reset,int"]);
@@ -1727,6 +1741,36 @@ fn amd_check(uefi_path: &Path) {
     eprintln!("  blk0 read ok:          {blk0} (want true)");
     eprintln!("  blk1 read ok:          {blk1} (want true)");
     eprintln!("  booted to shell quit:  {booted} (want true)");
+    eprintln!("--- captured output ---");
+    eprintln!("{output}");
+    eprintln!("--- end output ---");
+    std::process::exit(1);
+}
+
+/// Boot with an emulated xHCI controller + USB keyboard (PLINTH_USB=1) and assert
+/// the USB HID controller bring-up (usb_hid.md section 4, step 1b): the PCI class
+/// scan finds the controller, its BAR maps, the capability registers parse, and
+/// the controller resets (CNR clears). Device enumeration and keystroke input are
+/// later slices; this lane pins that the controller comes up at all.
+fn usb_check(uefi_path: &Path) {
+    // build_qemu_cmd reads PLINTH_USB to add the xHCI controller + boot keyboard.
+    std::env::set_var("PLINTH_USB", "1");
+    let output = run_capture(uefi_path);
+
+    let found = output.contains("xhci: controller at");
+    let params = output.contains("xhci: caplen");
+    let reset = output.contains("xhci: reset ok");
+    let booted = output.contains("shell: quit");
+
+    if found && params && reset && booted {
+        println!("usb: ok (xhci discovered, mapped, capabilities parsed, controller reset)");
+        return;
+    }
+    eprintln!("usb: FAIL");
+    eprintln!("  xhci discovered:      {found} (want true)");
+    eprintln!("  capabilities parsed:  {params} (want true)");
+    eprintln!("  controller reset:     {reset} (want true)");
+    eprintln!("  booted to shell quit: {booted} (want true)");
     eprintln!("--- captured output ---");
     eprintln!("{output}");
     eprintln!("--- end output ---");

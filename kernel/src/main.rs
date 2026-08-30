@@ -79,12 +79,14 @@ mod pci;
 // path, after PCI discovery.
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod virtio_blk;
-// xHCI (USB HID) is being built bottom-up. This first slice is the pure encoding
-// layer, exercised only by the test suite; nothing on the boot path touches it
-// yet, so the dead-code allowance is inverted -- silenced in the NON-test build
-// where it is genuinely unused. The controller bring-up slice wires it into boot
-// and removes this attribute (usb_hid.md section 4).
-#[cfg_attr(not(feature = "tests"), allow(dead_code))]
+// xHCI (USB HID) is being built bottom-up (usb_hid.md section 4). The module
+// straddles two builds mid-construction: the encoding layer is exercised by the
+// test suite (dead on the boot path), while the controller bring-up is exercised
+// on the boot path (dead in the test build, which stops before userspace). Rather
+// than gate each half against the opposite build, allow dead code across the
+// module until the driver is fully wired (input flowing to an EventSource), at
+// which point real use covers it and this comes off.
+#[allow(dead_code)]
 mod xhci;
 // Async completion rings are reached only from the userspace syscall path; the
 // test build stops before userspace, so silence the dead-code noise there.
@@ -403,6 +405,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 virtio_blk::bind_selftest_read(&mut serial, phys_offset, bd);
             }
         }
+        // USB HID bring-up (step 1b): discover, map, and reset an xHCI controller
+        // if one is present. Absent by default (no qemu-xhci device) -> init returns
+        // before mapping anything, so the default boot and its mmio-page count are
+        // unchanged; the `smoke-usb` lane adds the controller and exercises this.
+        let _ = xhci::init(&mut serial);
         // Every device is mapped by now (interrupt controllers in irq::init, BARs
         // and MSI-X tables in virtio_blk::init), so this count is final. It is
         // asserted in the smoke as the standing check that device registers go

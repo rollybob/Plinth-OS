@@ -19,6 +19,9 @@
 //! contexts (HCCPARAMS1 CSZ = 0). Field coverage is what an Address Device (EP0)
 //! and a boot interrupt-IN keyboard endpoint need, not the whole 1.2 spec.
 
+use crate::{memory, pci};
+use core::fmt::Write;
+
 /// Extract a `width`-bit field at `shift` from a dword. `width` must be < 32.
 #[inline]
 fn field(word: u32, shift: u32, width: u32) -> u32 {
@@ -525,4 +528,189 @@ impl InputControlContext {
     pub fn drop_flags(&self) -> u32 {
         self.dwords[0]
     }
+}
+
+// -------------------------------------------------------------------------
+// Controller bring-up (step 1b): discover, map, read capabilities, reset.
+//
+// This is the MMIO half of step 1 (usb_hid.md section 4). It finds the xHCI
+// controller by PCI class, sizes and maps its register BAR, reads and reports the
+// capability registers, and resets the controller. Programming the DCBAA +
+// command/event rings and setting Run/Stop (so a port-connect posts a Port Status
+// Change event on the event ring, decoded with the EventRing/Trb accessors above)
+// is the next increment.
+// -------------------------------------------------------------------------
+
+// MMIO accessors. All controller registers are read/written volatile.
+#[inline]
+fn r8(a: u64) -> u8 {
+    // Safety: `a` is inside the mapped xHCI register BAR (map_kernel_mmio).
+    unsafe { core::ptr::read_volatile(a as *const u8) }
+}
+#[inline]
+fn r16(a: u64) -> u16 {
+    unsafe { core::ptr::read_volatile(a as *const u16) }
+}
+#[inline]
+fn r32(a: u64) -> u32 {
+    unsafe { core::ptr::read_volatile(a as *const u32) }
+}
+#[inline]
+fn w32(a: u64, v: u32) {
+    unsafe { core::ptr::write_volatile(a as *mut u32, v) }
+}
+
+// Capability registers, offsets from the MMIO base (xHCI 5.3).
+const CAP_CAPLENGTH: u64 = 0x00;
+const CAP_HCIVERSION: u64 = 0x02;
+const CAP_HCSPARAMS1: u64 = 0x04;
+const CAP_HCCPARAMS1: u64 = 0x10;
+const CAP_DBOFF: u64 = 0x14;
+const CAP_RTSOFF: u64 = 0x18;
+
+// Operational registers, offsets from the operational base (MMIO + CAPLENGTH).
+const OP_USBCMD: u64 = 0x00;
+const OP_USBSTS: u64 = 0x04;
+
+const USBCMD_RS: u32 = 1 << 0; // Run/Stop
+const USBCMD_HCRST: u32 = 1 << 1; // Host Controller Reset
+const USBSTS_HCH: u32 = 1 << 0; // HCHalted
+const USBSTS_CNR: u32 = 1 << 11; // Controller Not Ready
+
+/// A brought-up xHCI controller: the mapped register bases and the parsed
+/// capability parameters. The ring/DCBAA fields arrive with the next increment.
+pub struct Xhci {
+    mmio: u64,
+    op: u64,
+    rt: u64,
+    db: u64,
+    max_slots: u8,
+    max_ports: u8,
+    csz: bool,
+}
+
+impl Xhci {
+    pub fn max_slots(&self) -> u8 {
+        self.max_slots
+    }
+    pub fn max_ports(&self) -> u8 {
+        self.max_ports
+    }
+    pub fn context_size(&self) -> usize {
+        if self.csz {
+            64
+        } else {
+            32
+        }
+    }
+    /// Runtime-register base (interrupters live here); used when the event ring is
+    /// programmed in the next increment.
+    pub fn runtime_base(&self) -> u64 {
+        self.rt
+    }
+    /// Doorbell-array base; used to ring the command/endpoint doorbells later.
+    pub fn doorbell_base(&self) -> u64 {
+        self.db
+    }
+
+    /// Halt (if running) then reset the controller: assert HCRST, wait for it to
+    /// self-clear, then wait for CNR (Controller Not Ready) to clear. Returns
+    /// false on timeout rather than hanging the boot.
+    fn reset<W: Write>(&mut self, out: &mut W) -> bool {
+        let cmd = r32(self.op + OP_USBCMD);
+        if cmd & USBCMD_RS != 0 {
+            w32(self.op + OP_USBCMD, cmd & !USBCMD_RS);
+            if !wait_until(|| r32(self.op + OP_USBSTS) & USBSTS_HCH != 0) {
+                let _ = writeln!(out, "plinth: xhci: halt timed out");
+                return false;
+            }
+        }
+        w32(self.op + OP_USBCMD, USBCMD_HCRST);
+        if !wait_until(|| r32(self.op + OP_USBCMD) & USBCMD_HCRST == 0) {
+            let _ = writeln!(out, "plinth: xhci: reset (HCRST) did not clear");
+            return false;
+        }
+        if !wait_until(|| r32(self.op + OP_USBSTS) & USBSTS_CNR == 0) {
+            let _ = writeln!(out, "plinth: xhci: controller not ready (CNR set)");
+            return false;
+        }
+        let _ = writeln!(out, "plinth: xhci: reset ok (halted, cnr clear)");
+        true
+    }
+}
+
+/// Poll `cond` up to a fixed bound with a relaxed spin. There is no fine-grained
+/// timer on this path, so the wait is bounded by iteration count -- generous for
+/// TCG QEMU, and a real controller readies in microseconds. Returns false if the
+/// condition never held (a real controller/firmware fault), so the caller reports
+/// and moves on instead of hanging (first_metal_boot.md D3).
+fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
+    for _ in 0..50_000_000u64 {
+        if cond() {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Discover, map, and reset the xHCI controller. Returns None (quietly) when no
+/// xHCI is present, so a build with no USB controller boots unchanged; returns
+/// None (with a reported reason) when a present controller fails to map or reset.
+pub fn init<W: Write>(out: &mut W) -> Option<Xhci> {
+    // xHCI = PCI class 0x0C (serial bus), subclass 0x03 (USB), prog-if 0x30.
+    let loc = pci::find_class(0x0C, 0x03, 0x30)?;
+
+    // BAR0 is the register file (a 64-bit memory BAR on QEMU). Size it rather than
+    // assume a QEMU-specific extent (first_metal_boot.md D6: no hardcoded layout).
+    let bar = pci::read_bar(loc, 0);
+    let size = pci::bar_size(loc, 0);
+    let mmio = match memory::map_kernel_mmio(bar, size) {
+        Ok(va) => va,
+        Err(e) => {
+            let _ = writeln!(out, "plinth: xhci: BAR map failed: {e}");
+            return None;
+        }
+    };
+
+    // Memory-space decode + bus mastering: the controller DMAs its own rings.
+    pci::enable_bus_master(loc);
+
+    let cap_len = r8(mmio + CAP_CAPLENGTH) as u64;
+    let hciversion = r16(mmio + CAP_HCIVERSION);
+    let hcs1 = r32(mmio + CAP_HCSPARAMS1);
+    let hcc1 = r32(mmio + CAP_HCCPARAMS1);
+    // DBOFF is dword-aligned (low 2 bits reserved); RTSOFF 32-byte-aligned (low 5).
+    let dboff = (r32(mmio + CAP_DBOFF) & !0x3) as u64;
+    let rtsoff = (r32(mmio + CAP_RTSOFF) & !0x1F) as u64;
+
+    let max_slots = (hcs1 & 0xFF) as u8;
+    let max_ports = ((hcs1 >> 24) & 0xFF) as u8;
+    let csz = hcc1 & (1 << 2) != 0; // Context Size: 1 => 64-byte contexts
+
+    let mut x = Xhci {
+        mmio,
+        op: mmio + cap_len,
+        rt: mmio + rtsoff,
+        db: mmio + dboff,
+        max_slots,
+        max_ports,
+        csz,
+    };
+
+    let _ = writeln!(
+        out,
+        "plinth: xhci: controller at {:02x}:{:02x} bar 0x{:x} size 0x{:x}",
+        loc.bus, loc.slot, bar, size
+    );
+    let _ = writeln!(
+        out,
+        "plinth: xhci: caplen {} hciversion 0x{:04x} slots {} ports {} csz {}",
+        cap_len, hciversion, max_slots, max_ports, csz as u8
+    );
+
+    if !x.reset(out) {
+        return None;
+    }
+    Some(x)
 }

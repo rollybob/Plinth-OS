@@ -118,6 +118,71 @@ pub fn read_bar(loc: Location, index: u8) -> u64 {
     }
 }
 
+/// Find the first PCI function matching a (class, subclass, prog-if) triple, in
+/// ascending (bus, slot) order. Scans function 0 only -- like the virtio scan,
+/// and the xHCI QEMU exposes is single-function. Returns None if absent, so the
+/// caller degrades gracefully when the device is not present (first_metal_boot.md
+/// D3: an absent device must never hang the boot).
+pub fn find_class(class: u8, subclass: u8, prog_if: u8) -> Option<Location> {
+    for bus in 0u16..256 {
+        let bus = bus as u8;
+        for slot in 0u8..32 {
+            if read16(bus, slot, 0, 0x00) == 0xFFFF {
+                continue; // no device in this slot
+            }
+            // Class code lives in the dword at 0x08: class [31:24], subclass
+            // [23:16], prog-if [15:8], revision [7:0].
+            let cc = read32(bus, slot, 0, 0x08);
+            if (cc >> 24) as u8 == class
+                && (cc >> 16) as u8 == subclass
+                && (cc >> 8) as u8 == prog_if
+            {
+                return Some(Location { bus, slot, func: 0 });
+            }
+        }
+    }
+    None
+}
+
+/// Size a memory BAR with the write-all-ones probe (PCI 3.0, 6.2.5.1): writing
+/// all ones and reading back yields a mask of the writable address bits, so the
+/// region size is `!mask + 1`. Memory-space decode is disabled across the probe
+/// (so the transient all-ones base is never decoded) and restored after. Handles
+/// 32- and 64-bit memory BARs; returns 0 for an I/O BAR.
+pub fn bar_size(loc: Location, index: u8) -> u64 {
+    let off = 0x10 + index * 4;
+    let lo = read32(loc.bus, loc.slot, loc.func, off);
+    if lo & 1 == 1 {
+        return 0; // I/O BAR -- not sized here
+    }
+    let is_64 = (lo >> 1) & 0x3 == 0x2;
+
+    // Disable memory-space decode (command bit 1) during the probe.
+    let cmd = read16(loc.bus, loc.slot, loc.func, 0x04);
+    write16(loc.bus, loc.slot, loc.func, 0x04, cmd & !(1 << 1));
+
+    write32(loc.bus, loc.slot, loc.func, off, 0xFFFF_FFFF);
+    let mask_lo = read32(loc.bus, loc.slot, loc.func, off);
+    write32(loc.bus, loc.slot, loc.func, off, lo);
+
+    let size = if is_64 {
+        let hi = read32(loc.bus, loc.slot, loc.func, off + 4);
+        write32(loc.bus, loc.slot, loc.func, off + 4, 0xFFFF_FFFF);
+        let mask_hi = read32(loc.bus, loc.slot, loc.func, off + 4);
+        write32(loc.bus, loc.slot, loc.func, off + 4, hi);
+        let mask = ((mask_hi as u64) << 32) | (mask_lo & 0xFFFF_FFF0) as u64;
+        (!mask).wrapping_add(1)
+    } else {
+        // 32-bit BAR: pin the upper mask to ones so the size stays 32-bit.
+        let mask = (mask_lo & 0xFFFF_FFF0) as u64 | 0xFFFF_FFFF_0000_0000;
+        (!mask).wrapping_add(1)
+    };
+
+    // Restore the original command register (memory decode as it was).
+    write16(loc.bus, loc.slot, loc.func, 0x04, cmd);
+    size
+}
+
 /// Enable memory-space decoding and bus mastering in the command register --
 /// required before the device can respond to MMIO and before it may DMA.
 /// Enumeration needs neither; the virtqueue needs both.
