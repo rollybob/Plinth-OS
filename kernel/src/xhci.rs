@@ -1433,6 +1433,12 @@ impl Xhci {
         if !self.control_in(0x21, 0x0B, 0, iface as u16, 0, 0, out) {
             return false;
         }
+        // SET_IDLE(0): report only on CHANGE, not on every interrupt poll. Without
+        // it QEMU completes the armed read with the unchanged report on every poll,
+        // and re-arming immediately turns that into a busy storm that eventually
+        // desyncs the rings. Best-effort: a device that STALLs it still works, just
+        // chattier. (bmRequestType 0x21 class/interface, bRequest 0x0A, wValue 0.)
+        let _ = self.control_in(0x21, 0x0A, 0, iface as u16, 0, 0, out);
 
         // The interrupt endpoint's transfer ring.
         let (ring_phys, ring_va) = match alloc_zeroed() {
@@ -1548,8 +1554,6 @@ impl Xhci {
     /// the keyboard EventSource (D4 -- the same sink the i8042 uses), and re-arm the
     /// next read. Called from the scheduler's idle-on-input path.
     fn poll_keyboard(&mut self) {
-        let ir0 = self.ir0;
-        let erseg_phys = self.erseg_phys;
         let (slot, int_dci) = match self.dev.as_ref() {
             Some(d) if d.int_ring.is_some() && d.int_ep_num != 0 => {
                 (d.slot, dci(d.int_ep_num, true))
@@ -1557,6 +1561,12 @@ impl Xhci {
             _ => return,
         };
 
+        // Drain the event ring; a Transfer Event for our interrupt endpoint means
+        // a new report landed in the buffer. The reactor drains its whole CQ per
+        // wake, so posting a report's scancodes as a batch is correct (an
+        // E0-prefixed arrow's two bytes are read in order within one wake).
+        let ir0 = self.ir0;
+        let erseg_phys = self.erseg_phys;
         let mut got_report = false;
         {
             let event = match self.event.as_mut() {
@@ -1574,16 +1584,16 @@ impl Xhci {
             let erdp = erseg_phys + (event.dequeue_index() as u64) * 16;
             w64(ir0 + IR_ERDP, erdp | ERDP_EHB);
         }
-
         if !got_report {
             return;
         }
 
-        // Read the 8-byte boot report, diff against the previous, post scancodes.
+        // Read the 8-byte boot report, diff against the previous, post scancodes,
+        // then re-arm the next read.
         let buf_va = self.dev.as_ref().map(|d| d.report_buf_va).unwrap_or(0);
         let mut cur = [0u8; 8];
         for (i, b) in cur.iter_mut().enumerate() {
-            // Safety: report_buf_va is a mapped 8-byte-plus report frame.
+            // Safety: report_buf_va is a mapped report frame of at least 8 bytes.
             *b = unsafe { core::ptr::read_volatile((buf_va + i as u64) as *const u8) };
         }
         let prev = self.dev.as_ref().map(|d| d.prev_report).unwrap_or([0; 8]);
@@ -1595,7 +1605,6 @@ impl Xhci {
         if let Some(d) = self.dev.as_mut() {
             d.prev_report = cur;
         }
-        // Re-arm for the next report.
         self.arm_report_read();
     }
 }

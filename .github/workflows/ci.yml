@@ -94,3 +94,9 @@ jobs:
 
       - name: No-i8042 boot test (in QEMU)
         run: cargo xtask no-i8042
+
+      - name: USB HID bring-up (in QEMU, emulated xHCI + boot keyboard)
+        run: cargo xtask smoke-usb
+
+      - name: USB keyboard end-to-end (QEMU monitor sendkey -> shell)
+        run: cargo xtask usb-key

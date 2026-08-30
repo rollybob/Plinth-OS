@@ -50,6 +50,9 @@ fn main() {
         // assert the USB HID controller bring-up (discover, map, reset). Step 1b of
         // the USB HID milestone; enumeration + input come in later slices.
         "smoke-usb" => { let img = build_all(); usb_check(&img); }
+        // Deterministic live-keystroke test: inject Down+Enter via the QEMU monitor
+        // into the interactive build and assert the CRASH icon launches.
+        "usb-key" => { let img = build_interactive(); usb_key_check(&img); }
         "bench"   => { let img = build_bench(); bench(&img); }
         "test"    => { let img = build_test(); run_tests(&img); }
         "console" => { let img = build_force_console(); console_check(&img); }
@@ -1798,6 +1801,89 @@ fn usb_check(uefi_path: &Path) {
     eprintln!("{output}");
     eprintln!("--- end output ---");
     std::process::exit(1);
+}
+
+/// Deterministic live-keystroke test: boot the interactive build with an emulated
+/// USB keyboard, wait for the home screen, then inject Down + Enter through the
+/// QEMU monitor. Down moves the selection to icon 2 (CRASH); Enter launches it, so
+/// a working keyboard produces the CRASH app's distinctive "holding the screen"
+/// line. This closes the D7/Q2 gap -- the live path was manual-only before.
+fn usb_key_check(uefi_path: &Path) {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    std::env::set_var("PLINTH_USB", "1");
+    std::env::set_var("PLINTH_IOMMU", "none");
+    let port: u16 = 45454;
+
+    let mut cmd = build_qemu_cmd(uefi_path, false, true, "");
+    cmd.args(["-display", "none"]);
+    cmd.args(["-monitor", &format!("tcp:127.0.0.1:{port},server,nowait")]);
+    cmd.stdout(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to launch qemu-system-x86_64");
+    let mut stdout = child.stdout.take().expect("no stdout handle");
+
+    let buf = Arc::new(Mutex::new(String::new()));
+    let buf2 = Arc::clone(&buf);
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf2.lock().unwrap().push_str(&String::from_utf8_lossy(&chunk[..n])),
+            }
+        }
+    });
+
+    let wait_for = |needle: &str, secs: u64| -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if buf.lock().unwrap().contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    };
+
+    let fail = |child: &mut std::process::Child, buf: &Arc<Mutex<String>>, msg: &str| -> ! {
+        let _ = child.kill();
+        eprintln!("usb-key: FAIL -- {msg}");
+        eprintln!("--- serial ---\n{}\n--- end ---", buf.lock().unwrap());
+        std::process::exit(1);
+    };
+
+    // Generous: booting through every demo under TCG in a CI container is slow
+    // (the smoke lanes allow PLINTH_QEMU_TIMEOUT=300). Returns as soon as the
+    // marker appears, so this is a ceiling, not a fixed wait.
+    if !wait_for("home hash", 300) {
+        fail(&mut child, &buf, "never reached the home screen");
+    }
+
+    // Inject through the monitor: Down selects icon 2 (CRASH), Enter launches it.
+    let mut mon = match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(m) => m,
+        Err(e) => fail(&mut child, &buf, &format!("could not connect to the QEMU monitor: {e}")),
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = mon.write_all(b"sendkey down\n");
+    std::thread::sleep(Duration::from_millis(400));
+    let _ = mon.write_all(b"sendkey ret\n");
+
+    let ok = wait_for("fbreclaimchild: holding the screen", 20);
+    let _ = child.kill();
+    let _ = reader.join();
+
+    if ok {
+        println!("usb-key: ok (Down arrow moved the selection to CRASH; Enter launched it)");
+    } else {
+        eprintln!("usb-key: FAIL -- Down+Enter did not launch CRASH (arrow keys not reaching the shell)");
+        eprintln!("--- serial ---\n{}\n--- end ---", buf.lock().unwrap());
+        std::process::exit(1);
+    }
 }
 
 /// Build the kernel with the framebuffer console forced on (D11 `force_console`
