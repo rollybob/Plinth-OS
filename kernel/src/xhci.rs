@@ -21,6 +21,25 @@
 
 use crate::{memory, pci};
 use core::fmt::Write;
+use spin::Mutex;
+
+/// The single brought-up controller, kept alive so the running kernel can poll its
+/// interrupt endpoint for keystrokes (`poll_input`).
+static CONTROLLER: Mutex<Option<Xhci>> = Mutex::new(None);
+
+// Safety: Xhci holds raw pointers into DMA frames (the command/event/transfer
+// rings). They are only ever accessed through CONTROLLER's lock, on the
+// BKL-guarded input path -- never concurrently -- so there is no data race.
+unsafe impl Send for Xhci {}
+
+/// Poll the USB keyboard for input and deliver any keystrokes. Called from the
+/// scheduler's idle-on-input path alongside `input::deliver_synthetic`. No-op when
+/// no xHCI controller / boot keyboard is present.
+pub fn poll_input() {
+    if let Some(x) = CONTROLLER.lock().as_mut() {
+        x.poll_keyboard();
+    }
+}
 
 /// Extract a `width`-bit field at `shift` from a dword. `width` must be < 32.
 #[inline]
@@ -604,6 +623,128 @@ impl InputControlContext {
 }
 
 // -------------------------------------------------------------------------
+// Boot keyboard report decode (step 4): USB HID -> Set-1 scancodes.
+//
+// The boot keyboard sends fixed 8-byte reports: byte 0 a modifier bitmap, bytes
+// 2-7 up to six pressed USB HID usage codes. We diff consecutive reports into the
+// same raw Set-1 scancode byte stream the i8042 keyboard posts (press = code,
+// release = code | 0x80; E0-extended keys emit 0xE0 first), so a USB keyboard is
+// "just another EventSource" and libOS keymaps are unchanged (usb_hid.md D3/D4).
+// Pure logic, unit-tested -- the deterministic proof; the live keystroke path is a
+// manual run-lane check (D7).
+// -------------------------------------------------------------------------
+
+/// Map a USB HID usage code to its Set-1 scancode as `(extended, base)` --
+/// `extended` true means the byte is preceded by 0xE0 (arrows). None for keys not
+/// in the boot-shell set. Covers letters, digits, the common punctuation, Enter/
+/// Esc/Space/Tab/Backspace, CapsLock, and the arrow keys.
+pub fn usage_to_set1(usage: u8) -> Option<(bool, u8)> {
+    let base = match usage {
+        0x04 => 0x1E, 0x05 => 0x30, 0x06 => 0x2E, 0x07 => 0x20, 0x08 => 0x12, // a-e
+        0x09 => 0x21, 0x0A => 0x22, 0x0B => 0x23, 0x0C => 0x17, 0x0D => 0x24, // f-j
+        0x0E => 0x25, 0x0F => 0x26, 0x10 => 0x32, 0x11 => 0x31, 0x12 => 0x18, // k-o
+        0x13 => 0x19, 0x14 => 0x10, 0x15 => 0x13, 0x16 => 0x1F, 0x17 => 0x14, // p-t
+        0x18 => 0x16, 0x19 => 0x2F, 0x1A => 0x11, 0x1B => 0x2D, 0x1C => 0x15, // u-y
+        0x1D => 0x2C, // z
+        0x1E => 0x02, 0x1F => 0x03, 0x20 => 0x04, 0x21 => 0x05, 0x22 => 0x06, // 1-5
+        0x23 => 0x07, 0x24 => 0x08, 0x25 => 0x09, 0x26 => 0x0A, 0x27 => 0x0B, // 6-0
+        0x28 => 0x1C, // Enter
+        0x29 => 0x01, // Esc
+        0x2A => 0x0E, // Backspace
+        0x2B => 0x0F, // Tab
+        0x2C => 0x39, // Space
+        0x2D => 0x0C, // -
+        0x2E => 0x0D, // =
+        0x2F => 0x1A, // [
+        0x30 => 0x1B, // ]
+        0x31 => 0x2B, // backslash
+        0x33 => 0x27, // ;
+        0x34 => 0x28, // '
+        0x35 => 0x29, // `
+        0x36 => 0x33, // ,
+        0x37 => 0x34, // .
+        0x38 => 0x35, // /
+        0x39 => 0x3A, // CapsLock
+        0x4F => return Some((true, 0x4D)), // Right arrow (E0 4D)
+        0x50 => return Some((true, 0x4B)), // Left arrow  (E0 4B)
+        0x51 => return Some((true, 0x50)), // Down arrow  (E0 50)
+        0x52 => return Some((true, 0x48)), // Up arrow    (E0 48)
+        _ => return None,
+    };
+    Some((false, base))
+}
+
+/// Modifier-bitmap bit (report byte 0) to its Set-1 scancode as `(extended, base)`.
+fn modifier_to_set1(bit: u8) -> Option<(bool, u8)> {
+    Some(match bit {
+        0 => (false, 0x1D), // Left Ctrl
+        1 => (false, 0x2A), // Left Shift
+        2 => (false, 0x38), // Left Alt
+        3 => (true, 0x5B),  // Left GUI
+        4 => (true, 0x1D),  // Right Ctrl
+        5 => (false, 0x36), // Right Shift
+        6 => (true, 0x38),  // Right Alt
+        7 => (true, 0x5C),  // Right GUI
+        _ => return None,
+    })
+}
+
+/// Diff two boot-keyboard reports into Set-1 scancode bytes written to `out`
+/// (bounded by its length); returns the count. Modifier transitions first, then
+/// key releases, then key presses. Usage 0 (none) and 1 (roll-over error) are
+/// ignored. An E0-extended key emits 0xE0 then the base byte.
+pub fn decode_report(prev: &[u8; 8], cur: &[u8; 8], out: &mut [u8]) -> usize {
+    let mut n = 0usize;
+    {
+        let mut push = |b: u8| {
+            if n < out.len() {
+                out[n] = b;
+                n += 1;
+            }
+        };
+        // Modifier changes (byte 0 bitmap).
+        if prev[0] != cur[0] {
+            for bit in 0..8u8 {
+                let mask = 1u8 << bit;
+                let was = prev[0] & mask != 0;
+                let now = cur[0] & mask != 0;
+                if was != now {
+                    if let Some((ext, base)) = modifier_to_set1(bit) {
+                        if ext {
+                            push(0xE0);
+                        }
+                        push(if now { base } else { base | 0x80 });
+                    }
+                }
+            }
+        }
+        // Releases: usages present in prev but not cur.
+        for &u in &prev[2..8] {
+            if u > 1 && !cur[2..8].contains(&u) {
+                if let Some((ext, base)) = usage_to_set1(u) {
+                    if ext {
+                        push(0xE0);
+                    }
+                    push(base | 0x80);
+                }
+            }
+        }
+        // Presses: usages present in cur but not prev.
+        for &u in &cur[2..8] {
+            if u > 1 && !prev[2..8].contains(&u) {
+                if let Some((ext, base)) = usage_to_set1(u) {
+                    if ext {
+                        push(0xE0);
+                    }
+                    push(base);
+                }
+            }
+        }
+    }
+    n
+}
+
+// -------------------------------------------------------------------------
 // Controller bring-up (step 1b): discover, map, read capabilities, reset.
 //
 // This is the MMIO half of step 1 (usb_hid.md section 4). It finds the xHCI
@@ -739,6 +880,11 @@ struct Device {
     int_ep_mps: u16,
     int_ep_interval: u8,
     int_ring: Option<ProducerRing>,
+    // Report DMA buffer the interrupt endpoint writes into, and the last report
+    // seen (for press/release diffing).
+    report_buf_phys: u64,
+    report_buf_va: u64,
+    prev_report: [u8; 8],
 }
 
 impl Xhci {
@@ -1097,6 +1243,9 @@ impl Xhci {
             int_ep_mps: 0,
             int_ep_interval: 0,
             int_ring: None,
+            report_buf_phys: 0,
+            report_buf_va: 0,
+            prev_report: [0; 8],
         });
         true
     }
@@ -1353,7 +1502,101 @@ impl Xhci {
             out,
             "plinth: xhci: interrupt endpoint configured (ep {ep_num}, dci {d}, mps {mps})"
         );
+
+        // Allocate the report buffer and arm the first interrupt-IN read. A real
+        // keystroke completes it -> Transfer Event, drained by poll_keyboard.
+        match alloc_zeroed() {
+            Ok((rb_phys, rb_va)) => {
+                if let Some(dev) = self.dev.as_mut() {
+                    dev.report_buf_phys = rb_phys;
+                    dev.report_buf_va = rb_va;
+                }
+                self.arm_report_read();
+            }
+            Err(e) => {
+                // The endpoint is configured; input just will not flow. Not fatal.
+                let _ = writeln!(out, "plinth: xhci: report buffer alloc: {e}");
+            }
+        }
         true
+    }
+
+    /// Queue one Normal TRB on the interrupt endpoint's ring pointing at the report
+    /// buffer, and ring that endpoint's doorbell -- arming a single report read.
+    fn arm_report_read(&mut self) {
+        let db = self.db;
+        let (buf_phys, mps, slot, target) = match self.dev.as_ref() {
+            Some(d) if d.int_ring.is_some() && d.report_buf_phys != 0 => (
+                d.report_buf_phys,
+                d.int_ep_mps.max(8) as u32,
+                d.slot,
+                dci(d.int_ep_num, true) as u32,
+            ),
+            _ => return,
+        };
+        if let Some(d) = self.dev.as_mut() {
+            if let Some(ring) = d.int_ring.as_mut() {
+                ring.push(Trb::normal(buf_phys, mps, true));
+            }
+        }
+        // Endpoint doorbell: doorbell[slot], target = the interrupt endpoint DCI.
+        w32(db + slot as u64 * 4, target);
+    }
+
+    /// Non-blocking: drain any pending events; on a Transfer Event for the boot
+    /// interrupt endpoint, decode the new report into Set-1 scancodes, post them to
+    /// the keyboard EventSource (D4 -- the same sink the i8042 uses), and re-arm the
+    /// next read. Called from the scheduler's idle-on-input path.
+    fn poll_keyboard(&mut self) {
+        let ir0 = self.ir0;
+        let erseg_phys = self.erseg_phys;
+        let (slot, int_dci) = match self.dev.as_ref() {
+            Some(d) if d.int_ring.is_some() && d.int_ep_num != 0 => {
+                (d.slot, dci(d.int_ep_num, true))
+            }
+            _ => return,
+        };
+
+        let mut got_report = false;
+        {
+            let event = match self.event.as_mut() {
+                Some(e) => e,
+                None => return,
+            };
+            while let Some(ev) = event.poll() {
+                if ev.trb_type() == TrbType::TransferEvent as u8
+                    && ev.event_slot_id() == slot
+                    && ev.event_endpoint_id() == int_dci
+                {
+                    got_report = true;
+                }
+            }
+            let erdp = erseg_phys + (event.dequeue_index() as u64) * 16;
+            w64(ir0 + IR_ERDP, erdp | ERDP_EHB);
+        }
+
+        if !got_report {
+            return;
+        }
+
+        // Read the 8-byte boot report, diff against the previous, post scancodes.
+        let buf_va = self.dev.as_ref().map(|d| d.report_buf_va).unwrap_or(0);
+        let mut cur = [0u8; 8];
+        for (i, b) in cur.iter_mut().enumerate() {
+            // Safety: report_buf_va is a mapped 8-byte-plus report frame.
+            *b = unsafe { core::ptr::read_volatile((buf_va + i as u64) as *const u8) };
+        }
+        let prev = self.dev.as_ref().map(|d| d.prev_report).unwrap_or([0; 8]);
+        let mut sc = [0u8; 16];
+        let n = decode_report(&prev, &cur, &mut sc);
+        for &code in &sc[..n] {
+            crate::input::record(crate::input::SOURCE_KEYBOARD, crate::input::Event::key(code));
+        }
+        if let Some(d) = self.dev.as_mut() {
+            d.prev_report = cur;
+        }
+        // Re-arm for the next report.
+        self.arm_report_read();
     }
 }
 
@@ -1411,9 +1654,12 @@ fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
 /// Discover, map, and reset the xHCI controller. Returns None (quietly) when no
 /// xHCI is present, so a build with no USB controller boots unchanged; returns
 /// None (with a reported reason) when a present controller fails to map or reset.
-pub fn init<W: Write>(out: &mut W) -> Option<Xhci> {
+pub fn init<W: Write>(out: &mut W) {
     // xHCI = PCI class 0x0C (serial bus), subclass 0x03 (USB), prog-if 0x30.
-    let loc = pci::find_class(0x0C, 0x03, 0x30)?;
+    let loc = match pci::find_class(0x0C, 0x03, 0x30) {
+        Some(l) => l,
+        None => return, // no controller -> boot unchanged
+    };
 
     // BAR0 is the register file (a 64-bit memory BAR on QEMU). Size it rather than
     // assume a QEMU-specific extent (first_metal_boot.md D6: no hardcoded layout).
@@ -1423,7 +1669,7 @@ pub fn init<W: Write>(out: &mut W) -> Option<Xhci> {
         Ok(va) => va,
         Err(e) => {
             let _ = writeln!(out, "plinth: xhci: BAR map failed: {e}");
-            return None;
+            return;
         }
     };
 
@@ -1471,17 +1717,19 @@ pub fn init<W: Write>(out: &mut W) -> Option<Xhci> {
     );
 
     if !x.reset(out) {
-        return None;
+        return;
     }
     if !x.program_and_run(out) {
-        return None;
+        return;
     }
     // Step 2-3: enumerate the device -- Enable Slot, Address Device, descriptors,
-    // then bring the boot interrupt-IN endpoint into service.
+    // then bring the boot interrupt-IN endpoint into service (which arms the first
+    // report read).
     if let Some(slot) = x.enable_slot(out) {
         if x.address_device(slot, out) && x.describe_device(out) {
             x.configure_interrupt_endpoint(out);
         }
     }
-    Some(x)
+    // Keep the controller alive so the running kernel can poll it for keystrokes.
+    *CONTROLLER.lock() = Some(x);
 }

@@ -261,6 +261,8 @@ const TESTS: &[TestCase] = &[
     TestCase { name: "xhci::slot_context_fields", run: xhci::slot_context_fields },
     TestCase { name: "xhci::endpoint_context_fields", run: xhci::endpoint_context_fields },
     TestCase { name: "xhci::input_control_context_flags", run: xhci::input_control_context_flags },
+    TestCase { name: "xhci::usage_to_set1_mapping", run: xhci::usage_to_set1_mapping },
+    TestCase { name: "xhci::decode_report_press_release", run: xhci::decode_report_press_release },
 ];
 
 /// Run every registered test. Returns true if all passed.

@@ -1132,6 +1132,10 @@ unsafe fn switch_to_next(cur_pos: usize, on_idle: NoWorkAction) -> ! {
             if input_waiter {
                 crate::input::deliver_synthetic();
                 crate::input::deliver_synthetic_mouse();
+                // Real USB keyboard input: drain any interrupt-endpoint report and
+                // post its keystrokes to the same EventSource (no-op if no xHCI
+                // keyboard is present).
+                crate::xhci::poll_input();
             }
             // Returns once nothing is blocked on input or disk any more (the
             // waiter it was idling for can be claimed, run and exited by

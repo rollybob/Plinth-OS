@@ -12,8 +12,9 @@
 use super::TestCtx;
 use crate::test_assert;
 use crate::xhci::{
-    dci, EndpointContext, EpType, ErstEntry, EventRing, InputControlContext, ProducerRing,
-    SlotContext, Trb, TrbType, SPEED_FULL, SPEED_HIGH, SPEED_LOW, SPEED_SUPER,
+    dci, decode_report, usage_to_set1, EndpointContext, EpType, ErstEntry, EventRing,
+    InputControlContext, ProducerRing, SlotContext, Trb, TrbType, SPEED_FULL, SPEED_HIGH,
+    SPEED_LOW, SPEED_SUPER,
 };
 use core::mem::size_of;
 
@@ -303,5 +304,54 @@ pub fn input_control_context_flags(_ctx: &mut TestCtx) -> Result<(), &'static st
     // Dropping an endpoint sets its bit in the drop flags.
     ic2.drop_context(dci(2, false)); // DCI 4
     test_assert!(ic2.drop_flags() == (1 << 4), "drop flag for DCI 4");
+    Ok(())
+}
+
+/// USB HID usage codes map to the right Set-1 scancodes, arrows as E0-extended.
+pub fn usage_to_set1_mapping(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    test_assert!(usage_to_set1(0x04) == Some((false, 0x1E)), "a -> 0x1E");
+    test_assert!(usage_to_set1(0x14) == Some((false, 0x10)), "q -> 0x10");
+    test_assert!(usage_to_set1(0x28) == Some((false, 0x1C)), "Enter -> 0x1C");
+    test_assert!(usage_to_set1(0x2C) == Some((false, 0x39)), "Space -> 0x39");
+    test_assert!(usage_to_set1(0x1E) == Some((false, 0x02)), "1 -> 0x02");
+    test_assert!(usage_to_set1(0x52) == Some((true, 0x48)), "Up arrow -> E0 0x48");
+    test_assert!(usage_to_set1(0x4F) == Some((true, 0x4D)), "Right arrow -> E0 0x4D");
+    test_assert!(usage_to_set1(0x00).is_none(), "usage 0 is no key");
+    test_assert!(usage_to_set1(0x01).is_none(), "usage 1 (rollover) unmapped");
+    Ok(())
+}
+
+/// Report diffing emits the right press/release scancode stream, matching the
+/// i8042 byte order (E0 prefix for arrows; release = code | 0x80).
+pub fn decode_report_press_release(_ctx: &mut TestCtx) -> Result<(), &'static str> {
+    let mut out = [0u8; 16];
+
+    // Press 'a'.
+    let n = decode_report(&[0; 8], &[0, 0, 0x04, 0, 0, 0, 0, 0], &mut out);
+    test_assert!(n == 1 && out[0] == 0x1E, "press a -> 0x1E");
+
+    // Release 'a'.
+    let n = decode_report(&[0, 0, 0x04, 0, 0, 0, 0, 0], &[0; 8], &mut out);
+    test_assert!(n == 1 && out[0] == 0x9E, "release a -> 0x9E");
+
+    // Holding 'a', add 'b' -> only b's press emitted.
+    let n = decode_report(&[0, 0, 0x04, 0, 0, 0, 0, 0], &[0, 0, 0x04, 0x05, 0, 0, 0, 0], &mut out);
+    test_assert!(n == 1 && out[0] == 0x30, "adding b -> only b press 0x30");
+
+    // Up arrow press -> E0 48, release -> E0 C8.
+    let n = decode_report(&[0; 8], &[0, 0, 0x52, 0, 0, 0, 0, 0], &mut out);
+    test_assert!(n == 2 && out[0] == 0xE0 && out[1] == 0x48, "up press -> E0 48");
+    let n = decode_report(&[0, 0, 0x52, 0, 0, 0, 0, 0], &[0; 8], &mut out);
+    test_assert!(n == 2 && out[0] == 0xE0 && out[1] == 0xC8, "up release -> E0 C8");
+
+    // Left Shift modifier down (byte 0 bit 1) -> 0x2A; up -> 0xAA.
+    let n = decode_report(&[0; 8], &[0x02, 0, 0, 0, 0, 0, 0, 0], &mut out);
+    test_assert!(n == 1 && out[0] == 0x2A, "lshift down -> 0x2A");
+    let n = decode_report(&[0x02, 0, 0, 0, 0, 0, 0, 0], &[0; 8], &mut out);
+    test_assert!(n == 1 && out[0] == 0xAA, "lshift up -> 0xAA");
+
+    // No change -> nothing.
+    let n = decode_report(&[0, 0, 0x04, 0, 0, 0, 0, 0], &[0, 0, 0x04, 0, 0, 0, 0, 0], &mut out);
+    test_assert!(n == 0, "no change -> no bytes");
     Ok(())
 }

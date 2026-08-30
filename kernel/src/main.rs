@@ -405,11 +405,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 virtio_blk::bind_selftest_read(&mut serial, phys_offset, bd);
             }
         }
-        // USB HID bring-up (step 1b): discover, map, and reset an xHCI controller
-        // if one is present. Absent by default (no qemu-xhci device) -> init returns
-        // before mapping anything, so the default boot and its mmio-page count are
-        // unchanged; the `smoke-usb` lane adds the controller and exercises this.
-        let _ = xhci::init(&mut serial);
+        // USB HID bring-up: discover/reset an xHCI controller if present, enumerate
+        // a boot keyboard, and keep the controller alive for keystroke polling.
+        // Absent by default (no qemu-xhci device) -> init returns before mapping
+        // anything, so the default boot and its mmio-page count are unchanged; the
+        // `smoke-usb` lane adds the controller and exercises this.
+        xhci::init(&mut serial);
         // Every device is mapped by now (interrupt controllers in irq::init, BARs
         // and MSI-X tables in virtio_blk::init), so this count is final. It is
         // asserted in the smoke as the standing check that device registers go
