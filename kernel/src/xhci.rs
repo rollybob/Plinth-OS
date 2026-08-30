@@ -40,12 +40,15 @@ fn set_field(word: &mut u32, shift: u32, width: u32, val: u32) {
 // TRB
 // -------------------------------------------------------------------------
 
-/// TRB type codes (xHCI 1.2, table 6-91) -- the subset this slice builds or reads.
-/// Commands and events share the field; the values do not collide. The transfer
-/// TRBs (Normal, Setup/Data/Status Stage) arrive with the control-transfer slice.
+/// TRB type codes (xHCI 1.2, table 6-91) -- the subset this driver builds or reads.
+/// Commands and events share the field; the values do not collide.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum TrbType {
+    Normal = 1,
+    SetupStage = 2,
+    DataStage = 3,
+    StatusStage = 4,
     Link = 6,
     EnableSlot = 9,
     AddressDevice = 11,
@@ -63,6 +66,12 @@ const TRB_CYCLE: u32 = 1 << 0;
 const TRB_LINK_TOGGLE: u32 = 1 << 1;
 /// Block Set Address Request (BSR), Address Device control bit 9.
 const TRB_BSR: u32 = 1 << 9;
+/// Interrupt On Completion (IOC), transfer-TRB control bit 5.
+const TRB_IOC: u32 = 1 << 5;
+/// Immediate Data (IDT), Setup Stage control bit 6.
+const TRB_IDT: u32 = 1 << 6;
+/// Direction (DIR), Data/Status Stage control bit 16 (1 = IN).
+const TRB_DIR: u32 = 1 << 16;
 
 /// A Transfer Request Block: 16 bytes, four little-endian dwords. `param` is the
 /// combined dword0/dword1 (a pointer or an immediate setup payload), `status` is
@@ -142,6 +151,53 @@ impl Trb {
         let mut t = Trb { param: input_ctx_phys, status: 0, control: 0 };
         t.set_trb_type(TrbType::ConfigureEndpoint);
         set_field(&mut t.control, 24, 8, slot_id as u32);
+        t
+    }
+
+    /// Setup Stage TRB of a control transfer: the 8-byte setup packet rides inline
+    /// (IDT). `trt` is the Transfer Type (0 = no data, 2 = OUT data, 3 = IN data).
+    pub fn setup_stage(setup_packet: u64, trt: u8) -> Self {
+        let mut t = Trb { param: setup_packet, status: 8, control: 0 };
+        t.set_trb_type(TrbType::SetupStage);
+        t.control |= TRB_IDT;
+        set_field(&mut t.control, 16, 2, trt as u32);
+        t
+    }
+
+    /// Data Stage TRB: `buf_phys` is the data buffer, `len` its byte count,
+    /// `dir_in` true for a device-to-host (IN) transfer.
+    pub fn data_stage(buf_phys: u64, len: u32, dir_in: bool) -> Self {
+        let mut t = Trb { param: buf_phys, status: len & 0x1_FFFF, control: 0 };
+        t.set_trb_type(TrbType::DataStage);
+        if dir_in {
+            t.control |= TRB_DIR;
+        }
+        t
+    }
+
+    /// Status Stage TRB: the zero-length handshake that ends a control transfer.
+    /// `dir_in` is the status direction (opposite the data direction); `ioc`
+    /// requests a Transfer Event on completion.
+    pub fn status_stage(dir_in: bool, ioc: bool) -> Self {
+        let mut t = Trb::zeroed();
+        t.set_trb_type(TrbType::StatusStage);
+        if dir_in {
+            t.control |= TRB_DIR;
+        }
+        if ioc {
+            t.control |= TRB_IOC;
+        }
+        t
+    }
+
+    /// Normal TRB: a single data buffer on a transfer ring (the boot interrupt-IN
+    /// endpoint's report reads).
+    pub fn normal(buf_phys: u64, len: u32, ioc: bool) -> Self {
+        let mut t = Trb { param: buf_phys, status: len & 0x1_FFFF, control: 0 };
+        t.set_trb_type(TrbType::Normal);
+        if ioc {
+            t.control |= TRB_IOC;
+        }
         t
     }
 
@@ -1033,6 +1089,134 @@ impl Xhci {
         });
         true
     }
+
+    /// Issue a control transfer on the device's EP0 ring (Setup [+ Data] + Status),
+    /// ring the EP0 doorbell, and await the Transfer Event. `req_type/req/value/
+    /// index` are the USB setup fields; `buf_phys`/`len` the data buffer (`len` 0
+    /// for a no-data request). Only IN-data and no-data requests are issued here.
+    /// Returns true on Success or Short Packet.
+    fn control_in<W: Write>(
+        &mut self,
+        req_type: u8,
+        req: u8,
+        value: u16,
+        index: u16,
+        buf_phys: u64,
+        len: u16,
+        out: &mut W,
+    ) -> bool {
+        let slot = match self.dev.as_ref() {
+            Some(d) => d.slot,
+            None => return false,
+        };
+        let setup = (req_type as u64)
+            | ((req as u64) << 8)
+            | ((value as u64) << 16)
+            | ((index as u64) << 32)
+            | ((len as u64) << 48);
+        // TRT: 3 = IN data, 0 = no data.
+        let trt = if len > 0 { 3 } else { 0 };
+        match self.dev.as_mut() {
+            Some(dev) => {
+                dev.ep0.push(Trb::setup_stage(setup, trt));
+                if len > 0 {
+                    dev.ep0.push(Trb::data_stage(buf_phys, len as u32, true));
+                }
+                // Status direction is opposite the data: OUT after IN data, IN for
+                // a no-data request. IOC so exactly one Transfer Event fires.
+                dev.ep0.push(Trb::status_stage(len == 0, true));
+            }
+            None => return false,
+        }
+        // Ring the EP0 doorbell: doorbell[slot], target = EP0 DCI (1).
+        w32(self.db + slot as u64 * 4, dci(0, true) as u32);
+        let ev = match self.poll_event(TrbType::TransferEvent as u8) {
+            Some(e) => e,
+            None => {
+                let _ = writeln!(out, "plinth: xhci: control transfer: no completion");
+                return false;
+            }
+        };
+        let code = ev.completion_code();
+        // 1 = Success, 13 = Short Packet (a device may legitimately return fewer bytes).
+        if code != 1 && code != 13 {
+            let _ = writeln!(out, "plinth: xhci: control transfer failed (code {code})");
+            return false;
+        }
+        true
+    }
+
+    /// Read the device + configuration descriptors over EP0 and set the
+    /// configuration -- the descriptor half of step 2. Reports VID/PID and whether
+    /// the device is a boot-protocol HID keyboard (interface class 3 / sub 1 /
+    /// protocol 1).
+    fn describe_device<W: Write>(&mut self, out: &mut W) -> bool {
+        let (buf_phys, buf_va) = match alloc_zeroed() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = writeln!(out, "plinth: xhci: descriptor buffer alloc: {e}");
+                return false;
+            }
+        };
+        // Safety: buf_va is a mapped frame; all reads below are within its 64 bytes.
+        let rd8 = |off: u64| -> u8 { unsafe { core::ptr::read_volatile((buf_va + off) as *const u8) } };
+        let rd16 = |off: u64| -> u16 { (rd8(off) as u16) | ((rd8(off + 1) as u16) << 8) };
+
+        // Device descriptor (18 bytes): GET_DESCRIPTOR, type 1 (device).
+        if !self.control_in(0x80, 6, 1 << 8, 0, buf_phys, 18, out) {
+            return false;
+        }
+        let vid = rd16(8);
+        let pid = rd16(10);
+        let dev_class = rd8(4);
+        let _ = writeln!(
+            out,
+            "plinth: xhci: device descriptor: vid {vid:#06x} pid {pid:#06x} class {dev_class}"
+        );
+
+        // Configuration descriptor: read up to 64 bytes (config + interface + ...).
+        // Zero the buffer first so a short read leaves no stale bytes behind.
+        unsafe { core::ptr::write_bytes(buf_va as *mut u8, 0, 64) };
+        if !self.control_in(0x80, 6, 2 << 8, 0, buf_phys, 64, out) {
+            return false;
+        }
+        let total = (rd16(2) as u64).min(64);
+        let config_value = rd8(5);
+        // Walk the descriptor chain for the first interface descriptor (type 4).
+        let mut off = rd8(0) as u64; // skip the 9-byte config descriptor
+        let mut iface = None;
+        while off + 2 <= total {
+            let blen = rd8(off) as u64;
+            if blen == 0 {
+                break;
+            }
+            if rd8(off + 1) == 4 && off + 8 <= total {
+                iface = Some((rd8(off + 5), rd8(off + 6), rd8(off + 7)));
+                break;
+            }
+            off += blen;
+        }
+        match iface {
+            Some((c, s, p)) => {
+                let boot_kbd = c == 3 && s == 1 && p == 1;
+                let _ = writeln!(
+                    out,
+                    "plinth: xhci: interface class {c} subclass {s} protocol {p}{}",
+                    if boot_kbd { " (boot keyboard)" } else { "" }
+                );
+            }
+            None => {
+                let _ = writeln!(out, "plinth: xhci: no interface descriptor found");
+            }
+        }
+
+        // Set Configuration (no-data control transfer).
+        if !self.control_in(0x00, 9, config_value as u16, 0, 0, 0, out) {
+            return false;
+        }
+        let _ = writeln!(out, "plinth: xhci: configured (config value {config_value})");
+        true
+    }
 }
 
 /// Poll `cond` up to a fixed bound with a relaxed spin. There is no fine-grained
@@ -1136,9 +1320,11 @@ pub fn init<W: Write>(out: &mut W) -> Option<Xhci> {
     if !x.program_and_run(out) {
         return None;
     }
-    // Step 2: enumerate the device -- Enable Slot, then Address Device.
+    // Step 2: enumerate the device -- Enable Slot, Address Device, descriptors.
     if let Some(slot) = x.enable_slot(out) {
-        x.address_device(slot, out);
+        if x.address_device(slot, out) {
+            x.describe_device(out);
+        }
     }
     Some(x)
 }
