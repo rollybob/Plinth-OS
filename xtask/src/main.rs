@@ -654,6 +654,10 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
         Ok("amd") => {
             cmd.args(["-device", "amd-iommu,dma-remap=on"]);
         }
+        // No vIOMMU: the USB HID bring-up lane runs xHCI untranslated (usb_hid.md
+        // D9), and an active vIOMMU would block the un-contexted controller's DMA.
+        // The virtio-blk devices fall back to their identity/no-IOMMU path.
+        Ok("none") => {}
         _ => {
             cmd.args(["-device", "intel-iommu,caching-mode=on"]);
         }
@@ -1754,22 +1758,31 @@ fn amd_check(uefi_path: &Path) {
 /// later slices; this lane pins that the controller comes up at all.
 fn usb_check(uefi_path: &Path) {
     // build_qemu_cmd reads PLINTH_USB to add the xHCI controller + boot keyboard.
+    // PLINTH_IOMMU=none: xHCI runs untranslated in v1 (D9), so no vIOMMU to block
+    // the controller's DMA into its rings.
     std::env::set_var("PLINTH_USB", "1");
+    std::env::set_var("PLINTH_IOMMU", "none");
     let output = run_capture(uefi_path);
 
     let found = output.contains("xhci: controller at");
     let params = output.contains("xhci: caplen");
     let reset = output.contains("xhci: reset ok");
+    let running = output.contains("xhci: running");
+    let port = output.contains("xhci: port status change");
     let booted = output.contains("shell: quit");
 
-    if found && params && reset && booted {
-        println!("usb: ok (xhci discovered, mapped, capabilities parsed, controller reset)");
+    if found && params && reset && running && port && booted {
+        println!(
+            "usb: ok (xhci discovered, mapped, reset, running; port status change from the keyboard seen)"
+        );
         return;
     }
     eprintln!("usb: FAIL");
     eprintln!("  xhci discovered:      {found} (want true)");
     eprintln!("  capabilities parsed:  {params} (want true)");
     eprintln!("  controller reset:     {reset} (want true)");
+    eprintln!("  controller running:   {running} (want true)");
+    eprintln!("  port status change:   {port} (want true)");
     eprintln!("  booted to shell quit: {booted} (want true)");
     eprintln!("--- captured output ---");
     eprintln!("{output}");

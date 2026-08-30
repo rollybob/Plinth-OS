@@ -559,6 +559,33 @@ fn r32(a: u64) -> u32 {
 fn w32(a: u64, v: u32) {
     unsafe { core::ptr::write_volatile(a as *mut u32, v) }
 }
+/// Write a 64-bit controller register as two 32-bit stores (low then high). The
+/// 64-bit xHCI registers are defined for 32-bit access, and a split write cannot
+/// be dropped the way a single 64-bit MMIO store can be on some paths -- the same
+/// guard virtio-blk uses for its ring-address registers.
+#[inline]
+fn w64(a: u64, v: u64) {
+    w32(a, v as u32);
+    w32(a + 4, (v >> 32) as u32);
+}
+
+/// Allocate one frame, zero it, and return (physical, virtual) addresses. DMA
+/// structures (DCBAA, rings, ERST, scratchpad) live in these; the controller sees
+/// the physical address, the kernel accesses the frame at `phys + PHYS_OFFSET`.
+/// v1 runs xHCI untranslated (usb_hid.md D9), so the physical address is what the
+/// controller uses directly.
+fn alloc_zeroed() -> Result<(u64, u64), &'static str> {
+    let phys = {
+        let mut g = crate::frame_alloc::FRAME_ALLOC.lock();
+        let fa = g.as_mut().ok_or("frame allocator not initialised")?;
+        fa.alloc().map_err(|_| "out of frames for xhci")?
+    };
+    let va = memory::phys_offset() + phys;
+    // Safety: the frame is freshly allocated and mapped at phys_offset; nothing
+    // else aliases it.
+    unsafe { core::ptr::write_bytes(va as *mut u8, 0, crate::frame_alloc::FRAME_SIZE as usize) };
+    Ok((phys, va))
+}
 
 // Capability registers, offsets from the MMIO base (xHCI 5.3).
 const CAP_CAPLENGTH: u64 = 0x00;
@@ -568,14 +595,36 @@ const CAP_HCCPARAMS1: u64 = 0x10;
 const CAP_DBOFF: u64 = 0x14;
 const CAP_RTSOFF: u64 = 0x18;
 
+const CAP_HCSPARAMS2: u64 = 0x08;
+
 // Operational registers, offsets from the operational base (MMIO + CAPLENGTH).
 const OP_USBCMD: u64 = 0x00;
 const OP_USBSTS: u64 = 0x04;
+const OP_CRCR: u64 = 0x18; // Command Ring Control (64-bit)
+const OP_DCBAAP: u64 = 0x30; // Device Context Base Address Array Pointer (64-bit)
+const OP_CONFIG: u64 = 0x38; // Configure (MaxSlotsEn in bits 0-7)
 
 const USBCMD_RS: u32 = 1 << 0; // Run/Stop
 const USBCMD_HCRST: u32 = 1 << 1; // Host Controller Reset
 const USBSTS_HCH: u32 = 1 << 0; // HCHalted
+const USBSTS_EINT: u32 = 1 << 3; // Event Interrupt (write-1-to-clear)
 const USBSTS_CNR: u32 = 1 << 11; // Controller Not Ready
+
+const CRCR_RCS: u64 = 1 << 0; // Ring Cycle State (initial producer cycle)
+
+// Interrupter 0 register set, offset from the runtime base.
+const IR0: u64 = 0x20;
+const IR_ERSTSZ: u64 = 0x08; // Event Ring Segment Table Size
+const IR_ERSTBA: u64 = 0x10; // ERST Base Address (64-bit)
+const IR_ERDP: u64 = 0x18; // Event Ring Dequeue Pointer (64-bit)
+const ERDP_EHB: u64 = 1 << 3; // Event Handler Busy (write-1-to-clear)
+
+// Port status/control register (PORTSC) bits (xHCI 5.4.8).
+const PORTSC_CCS: u32 = 1 << 0; // Current Connect Status
+const PORTSC_PED: u32 = 1 << 1; // Port Enabled/Disabled (RW1CS)
+const PORTSC_PR: u32 = 1 << 4; // Port Reset
+const PORTSC_PP: u32 = 1 << 9; // Port Power
+const PORTSC_CHANGE_BITS: u32 = 0x7F << 17; // CSC/PEC/WRC/OCC/PRC/PLC/CEC (RW1C)
 
 /// A brought-up xHCI controller: the mapped register bases and the parsed
 /// capability parameters. The ring/DCBAA fields arrive with the next increment.
@@ -635,6 +684,160 @@ impl Xhci {
             return false;
         }
         let _ = writeln!(out, "plinth: xhci: reset ok (halted, cnr clear)");
+        true
+    }
+
+    /// Program the controller and start it, then wait for the first Port Status
+    /// Change Event (a device connected at a root port posts one on Run). Sets up
+    /// the DCBAA (+ scratchpad if required), the command ring (CRCR), and a
+    /// one-segment event ring on interrupter 0 (polled -- no MSI-X yet, D5's
+    /// bring-up fallback), then sets Run/Stop. Returns false on a fatal setup
+    /// failure; a missing port event is reported but not fatal.
+    fn program_and_run<W: Write>(&mut self, out: &mut W) -> bool {
+        let trbs_per_frame = (crate::frame_alloc::FRAME_SIZE / 16) as usize;
+
+        // Enable device slots (CONFIG.MaxSlotsEn).
+        let slots = self.max_slots.max(1);
+        w32(self.op + OP_CONFIG, slots as u32);
+
+        // Device Context Base Address Array, plus scratchpad buffers if the
+        // controller demands any (HCSPARAMS2 Max Scratchpad Bufs Hi[25:21] Lo[31:27]).
+        let (dcbaa_phys, dcbaa_va) = match alloc_zeroed() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = writeln!(out, "plinth: xhci: dcbaa alloc: {e}");
+                return false;
+            }
+        };
+        let hcs2 = r32(self.mmio + CAP_HCSPARAMS2);
+        let scratch = (((hcs2 >> 21) & 0x1F) << 5) | ((hcs2 >> 27) & 0x1F);
+        if scratch > 0 {
+            let (arr_phys, arr_va) = match alloc_zeroed() {
+                Ok(x) => x,
+                Err(e) => {
+                    let _ = writeln!(out, "plinth: xhci: scratchpad array alloc: {e}");
+                    return false;
+                }
+            };
+            for i in 0..scratch as u64 {
+                let (buf_phys, _) = match alloc_zeroed() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        let _ = writeln!(out, "plinth: xhci: scratchpad buffer alloc: {e}");
+                        return false;
+                    }
+                };
+                // Safety: arr_va is a mapped, page-sized frame; i < scratch fits.
+                unsafe { core::ptr::write_volatile((arr_va + i * 8) as *mut u64, buf_phys) };
+            }
+            // DCBAA[0] points at the scratchpad buffer array (xHCI 6.1).
+            unsafe { core::ptr::write_volatile(dcbaa_va as *mut u64, arr_phys) };
+        }
+        w64(self.op + OP_DCBAAP, dcbaa_phys);
+
+        // Command ring: initialise the producer ring (this writes the Link TRB
+        // into the frame), then point CRCR at it with the initial cycle state.
+        let (cr_phys, cr_va) = match alloc_zeroed() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = writeln!(out, "plinth: xhci: command ring alloc: {e}");
+                return false;
+            }
+        };
+        {
+            // Safety: cr_va is a mapped page-sized frame; trbs_per_frame TRBs fit.
+            let cr = unsafe { core::slice::from_raw_parts_mut(cr_va as *mut Trb, trbs_per_frame) };
+            let _ring = ProducerRing::new(cr, cr_phys); // sets the Link TRB; memory persists
+        }
+        w64(self.op + OP_CRCR, cr_phys | CRCR_RCS);
+
+        // Event ring: one segment + a one-entry ERST on interrupter 0.
+        let (erseg_phys, erseg_va) = match alloc_zeroed() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = writeln!(out, "plinth: xhci: event ring alloc: {e}");
+                return false;
+            }
+        };
+        let (erst_phys, erst_va) = match alloc_zeroed() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = writeln!(out, "plinth: xhci: erst alloc: {e}");
+                return false;
+            }
+        };
+        let entry = ErstEntry { base_phys: erseg_phys, size: trbs_per_frame as u16 }.encode();
+        for (i, word) in entry.iter().enumerate() {
+            // Safety: erst_va is a mapped frame; the ERST entry is 16 bytes.
+            unsafe { core::ptr::write_volatile((erst_va + (i as u64) * 4) as *mut u32, *word) };
+        }
+        let ir0 = self.rt + IR0;
+        // Order per xHCI 4.9.4: size, then dequeue, then base (the base write arms it).
+        w32(ir0 + IR_ERSTSZ, 1);
+        w64(ir0 + IR_ERDP, erseg_phys);
+        w64(ir0 + IR_ERSTBA, erst_phys);
+
+        // Run.
+        let cmd = r32(self.op + OP_USBCMD);
+        w32(self.op + OP_USBCMD, cmd | USBCMD_RS);
+        if !wait_until(|| r32(self.op + OP_USBSTS) & USBSTS_HCH == 0) {
+            let _ = writeln!(out, "plinth: xhci: run failed (controller stayed halted)");
+            return false;
+        }
+        let _ = writeln!(out, "plinth: xhci: running (slots enabled {slots})");
+
+        // Reset the connected port(s) to generate a Port Status Change Event. A
+        // device attached before the event ring was armed only latches the port's
+        // change bits (no event re-posts on Run), so a fresh Port Reset is what
+        // produces an event the ring can deliver -- and it is the first step of
+        // enumeration regardless. PORTSC[p] = op + 0x400 + (p-1)*0x10.
+        let mut er = unsafe { EventRing::new(erseg_va as *const Trb, trbs_per_frame) };
+        let mut port = None;
+        for p in 1..=self.max_ports {
+            let addr = self.op + 0x400 + (p as u64 - 1) * 0x10;
+            let portsc = r32(addr);
+            if portsc & PORTSC_CCS == 0 {
+                continue; // no device on this port
+            }
+            // Assert Port Reset with power on. Preserve nothing but drop the
+            // RW1C change bits (bits 17-23) and PED (bit 1) so this write neither
+            // clears a pending change nor disables the port.
+            let base = portsc & !PORTSC_CHANGE_BITS & !PORTSC_PED;
+            w32(addr, base | PORTSC_PR | PORTSC_PP);
+
+            // Poll the event ring for the Port Status Change Event the reset posts.
+            for _ in 0..5_000_000u64 {
+                match er.poll() {
+                    Some(ev) => {
+                        if ev.trb_type() == TrbType::PortStatusChange as u8 {
+                            port = Some(ev.port_id());
+                            break;
+                        }
+                    }
+                    None => core::hint::spin_loop(),
+                }
+            }
+            if port.is_some() {
+                break;
+            }
+        }
+        // Advance ERDP past what we consumed and clear Event Handler Busy.
+        let erdp = erseg_phys + (er.dequeue_index() as u64) * 16;
+        w64(ir0 + IR_ERDP, erdp | ERDP_EHB);
+        // Acknowledge the event interrupt bit (write-1-to-clear).
+        w32(self.op + OP_USBSTS, USBSTS_EINT);
+
+        match port {
+            Some(p) => {
+                let _ = writeln!(
+                    out,
+                    "plinth: xhci: port status change on port {p} (device connected)"
+                );
+            }
+            None => {
+                let _ = writeln!(out, "plinth: xhci: no port event seen");
+            }
+        }
         true
     }
 }
@@ -710,6 +913,9 @@ pub fn init<W: Write>(out: &mut W) -> Option<Xhci> {
     );
 
     if !x.reset(out) {
+        return None;
+    }
+    if !x.program_and_run(out) {
         return None;
     }
     Some(x)
