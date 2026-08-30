@@ -1774,10 +1774,11 @@ fn usb_check(uefi_path: &Path) {
     let desc = output.contains("xhci: device descriptor:");
     let boot_kbd = output.contains("(boot keyboard)");
     let cfg = output.contains("xhci: configured");
+    let epcfg = output.contains("xhci: interrupt endpoint configured");
     let booted = output.contains("shell: quit");
 
-    if found && params && reset && running && port && slot && addr && desc && boot_kbd && cfg && booted {
-        println!("usb: ok (device enumerated over EP0: descriptors read, boot keyboard, configured)");
+    if found && params && reset && running && port && slot && addr && desc && boot_kbd && cfg && epcfg && booted {
+        println!("usb: ok (boot keyboard enumerated + interrupt endpoint configured)");
         return;
     }
     eprintln!("usb: FAIL");
@@ -1791,6 +1792,7 @@ fn usb_check(uefi_path: &Path) {
     eprintln!("  device descriptor:    {desc} (want true)");
     eprintln!("  boot keyboard:        {boot_kbd} (want true)");
     eprintln!("  set configuration:    {cfg} (want true)");
+    eprintln!("  int endpoint config:  {epcfg} (want true)");
     eprintln!("  booted to shell quit: {booted} (want true)");
     eprintln!("--- captured output ---");
     eprintln!("{output}");

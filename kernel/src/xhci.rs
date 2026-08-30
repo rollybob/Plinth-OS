@@ -733,6 +733,12 @@ struct Device {
     dev_ctx_va: u64,
     input_ctx_phys: u64,
     input_ctx_va: u64,
+    // Boot interrupt-IN endpoint, parsed from the config descriptor (0 = none).
+    iface: u8,
+    int_ep_num: u8,
+    int_ep_mps: u16,
+    int_ep_interval: u8,
+    int_ring: Option<ProducerRing>,
 }
 
 impl Xhci {
@@ -1086,6 +1092,11 @@ impl Xhci {
             dev_ctx_va,
             input_ctx_phys,
             input_ctx_va,
+            iface: 0,
+            int_ep_num: 0,
+            int_ep_mps: 0,
+            int_ep_interval: 0,
+            int_ring: None,
         });
         true
     }
@@ -1182,17 +1193,33 @@ impl Xhci {
         }
         let total = (rd16(2) as u64).min(64);
         let config_value = rd8(5);
-        // Walk the descriptor chain for the first interface descriptor (type 4).
+        // Walk the descriptor chain: capture the interface (class/sub/proto +
+        // number) and the first interrupt-IN endpoint (for the report reads).
         let mut off = rd8(0) as u64; // skip the 9-byte config descriptor
         let mut iface = None;
+        let mut iface_num = 0u8;
+        let mut int_ep = None; // (ep_num, max_packet_size, b_interval)
         while off + 2 <= total {
             let blen = rd8(off) as u64;
             if blen == 0 {
                 break;
             }
-            if rd8(off + 1) == 4 && off + 8 <= total {
-                iface = Some((rd8(off + 5), rd8(off + 6), rd8(off + 7)));
-                break;
+            match rd8(off + 1) {
+                4 if off + 9 <= total => {
+                    // Interface descriptor.
+                    iface_num = rd8(off + 2);
+                    iface = Some((rd8(off + 5), rd8(off + 6), rd8(off + 7)));
+                }
+                5 if off + 7 <= total => {
+                    // Endpoint descriptor: interrupt (attr bits 1-0 == 3) and IN
+                    // (address bit 7). Take the first such endpoint.
+                    let addr = rd8(off + 2);
+                    let attr = rd8(off + 3);
+                    if attr & 0x3 == 3 && addr & 0x80 != 0 && int_ep.is_none() {
+                        int_ep = Some((addr & 0x0F, rd16(off + 4), rd8(off + 6)));
+                    }
+                }
+                _ => {}
             }
             off += blen;
         }
@@ -1209,12 +1236,123 @@ impl Xhci {
                 let _ = writeln!(out, "plinth: xhci: no interface descriptor found");
             }
         }
+        if let Some(d) = self.dev.as_mut() {
+            d.iface = iface_num;
+            if let Some((ep_num, mps, interval)) = int_ep {
+                d.int_ep_num = ep_num;
+                d.int_ep_mps = mps;
+                d.int_ep_interval = interval;
+            }
+        }
 
         // Set Configuration (no-data control transfer).
         if !self.control_in(0x00, 9, config_value as u16, 0, 0, 0, out) {
             return false;
         }
         let _ = writeln!(out, "plinth: xhci: configured (config value {config_value})");
+        true
+    }
+
+    /// Step 3: put the boot interrupt-IN endpoint into service. SET_PROTOCOL(boot)
+    /// so the device sends fixed 8-byte reports, then Configure Endpoint with an
+    /// Input Context that adds that endpoint (on its own transfer ring). Report
+    /// reads are queued separately.
+    fn configure_interrupt_endpoint<W: Write>(&mut self, out: &mut W) -> bool {
+        let trbs_per_frame = (crate::frame_alloc::FRAME_SIZE / 16) as usize;
+        let cs = if self.csz { 0x40u64 } else { 0x20u64 };
+        let (slot, iface, ep_num, mps, interval, speed, port, input_ctx_phys, input_ctx_va) =
+            match self.dev.as_ref() {
+                Some(d) => (
+                    d.slot,
+                    d.iface,
+                    d.int_ep_num,
+                    d.int_ep_mps,
+                    d.int_ep_interval,
+                    d.speed,
+                    d.port,
+                    d.input_ctx_phys,
+                    d.input_ctx_va,
+                ),
+                None => return false,
+            };
+        if ep_num == 0 {
+            let _ = writeln!(out, "plinth: xhci: no interrupt-IN endpoint to configure");
+            return false;
+        }
+
+        // SET_PROTOCOL(boot): class request to the interface, wValue 0 = boot.
+        if !self.control_in(0x21, 0x0B, 0, iface as u16, 0, 0, out) {
+            return false;
+        }
+
+        // The interrupt endpoint's transfer ring.
+        let (ring_phys, ring_va) = match alloc_zeroed() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = writeln!(out, "plinth: xhci: interrupt ring alloc: {e}");
+                return false;
+            }
+        };
+        // Safety: ring_va is a mapped page-sized frame; trbs_per_frame TRBs fit.
+        let int_ring = unsafe { ProducerRing::new(ring_va as *mut Trb, trbs_per_frame, ring_phys) };
+
+        let d = dci(ep_num, true);
+        // Rebuild the Input Context in its frame: add the slot + interrupt endpoint.
+        unsafe {
+            core::ptr::write_bytes(
+                input_ctx_va as *mut u8,
+                0,
+                crate::frame_alloc::FRAME_SIZE as usize,
+            )
+        };
+        let mut icc = InputControlContext::zeroed();
+        icc.add_context(0);
+        icc.add_context(d);
+        write_context(input_ctx_va, &icc.dwords);
+        // Slot context: context entries now reach the interrupt endpoint's DCI.
+        let mut sc = SlotContext::zeroed();
+        sc.set_route_string(0);
+        sc.set_speed(speed);
+        sc.set_context_entries(d);
+        sc.set_root_hub_port(port);
+        write_context(input_ctx_va + cs, &sc.dwords);
+        // Interrupt endpoint context at DCI d.
+        let mut ep = EndpointContext::zeroed();
+        ep.set_ep_type(EpType::InterruptIn);
+        ep.set_max_packet_size(mps);
+        ep.set_error_count(3);
+        ep.set_interval(encode_interval(speed, interval));
+        ep.set_tr_dequeue(ring_phys, true);
+        ep.set_avg_trb_len(mps.max(8));
+        write_context(input_ctx_va + cs * (1 + d as u64), &ep.dwords);
+
+        // Configure Endpoint command.
+        if let Some(c) = self.cmd.as_mut() {
+            c.push(Trb::configure_endpoint(input_ctx_phys, slot));
+        }
+        w32(self.db, 0);
+        let ev = match self.poll_event(TrbType::CommandCompletion as u8) {
+            Some(e) => e,
+            None => {
+                let _ = writeln!(out, "plinth: xhci: configure endpoint: no completion");
+                return false;
+            }
+        };
+        if ev.completion_code() != 1 {
+            let _ = writeln!(
+                out,
+                "plinth: xhci: configure endpoint failed (code {})",
+                ev.completion_code()
+            );
+            return false;
+        }
+        if let Some(dev) = self.dev.as_mut() {
+            dev.int_ring = Some(int_ring);
+        }
+        let _ = writeln!(
+            out,
+            "plinth: xhci: interrupt endpoint configured (ep {ep_num}, dci {d}, mps {mps})"
+        );
         true
     }
 }
@@ -1239,6 +1377,24 @@ fn ep0_mps(speed: u8) -> u16 {
         SPEED_HIGH => 64,
         SPEED_SUPER => 512,
         _ => 8, // low/full (and unknown): the safe minimum
+    }
+}
+
+/// Encode a USB endpoint's bInterval into the xHCI Endpoint Context Interval field
+/// (a 2^n microframe exponent). High/Super speed carry the exponent directly
+/// (bInterval-1); full/low speed give a frame (ms) count -> floor(log2)+3. QEMU is
+/// lenient here; this keeps the value in range.
+fn encode_interval(speed: u8, b_interval: u8) -> u8 {
+    if speed >= SPEED_HIGH {
+        b_interval.saturating_sub(1).min(15)
+    } else {
+        let mut i = 3u8;
+        let mut v = b_interval.max(1);
+        while v > 1 {
+            v >>= 1;
+            i += 1;
+        }
+        i.min(15)
     }
 }
 
@@ -1320,10 +1476,11 @@ pub fn init<W: Write>(out: &mut W) -> Option<Xhci> {
     if !x.program_and_run(out) {
         return None;
     }
-    // Step 2: enumerate the device -- Enable Slot, Address Device, descriptors.
+    // Step 2-3: enumerate the device -- Enable Slot, Address Device, descriptors,
+    // then bring the boot interrupt-IN endpoint into service.
     if let Some(slot) = x.enable_slot(out) {
-        if x.address_device(slot, out) {
-            x.describe_device(out);
+        if x.address_device(slot, out) && x.describe_device(out) {
+            x.configure_interrupt_endpoint(out);
         }
     }
     Some(x)
