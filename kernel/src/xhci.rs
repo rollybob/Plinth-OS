@@ -187,28 +187,39 @@ impl Trb {
 /// back to the start. The producer holds an enqueue index and a producer cycle
 /// state (PCS); each pushed TRB is stamped with the PCS, and reaching the Link
 /// slot stamps the link with the PCS (so the controller follows it) and toggles
-/// the PCS for the next lap. This is the pure logic the bring-up slice drives over
-/// a DMA frame; here it drives a caller-supplied `&mut [Trb]`.
-pub struct ProducerRing<'a> {
-    trbs: &'a mut [Trb],
+/// the PCS for the next lap.
+///
+/// Backed by a raw pointer and driven with volatile accesses -- the ring lives in
+/// DMA memory the controller reads, so the writes must not be reordered or elided,
+/// and the type must be storable in a long-lived driver (or handed to a library OS
+/// that drives the device directly, the exokernel end-state) rather than borrowing
+/// its backing. `EventRing` is raw-pointer for the mirror-image reason (the device
+/// writes it); the two rings are deliberately symmetric. Tests point it at a plain
+/// array.
+pub struct ProducerRing {
+    base: *mut Trb,
+    cap: usize,
     base_phys: u64,
     enqueue: usize,
     pcs: bool,
 }
 
-impl<'a> ProducerRing<'a> {
-    /// `trbs` must have at least two slots (one usable + the Link). `base_phys`
-    /// is the physical address the Link TRB wraps to. The PCS starts set (1), the
-    /// Link TRB starts clear so the controller will not follow it until the first
-    /// wrap stamps it.
-    pub fn new(trbs: &'a mut [Trb], base_phys: u64) -> Self {
-        assert!(trbs.len() >= 2, "a producer ring needs a usable slot plus the link");
-        for t in trbs.iter_mut() {
-            *t = Trb::zeroed();
+impl ProducerRing {
+    /// `base`/`cap` describe at least two contiguous TRB slots (one usable + the
+    /// Link); `base_phys` is the physical address the Link TRB wraps to. The PCS
+    /// starts set (1); the Link TRB starts clear so the controller will not follow
+    /// it until the first wrap stamps it. All slots are zeroed here.
+    ///
+    /// # Safety
+    /// `base` must point to `cap` contiguous, writable `Trb` slots that stay valid
+    /// for the ring's lifetime (a DMA frame in the driver, a fixed array in tests).
+    pub unsafe fn new(base: *mut Trb, cap: usize, base_phys: u64) -> Self {
+        assert!(cap >= 2, "a producer ring needs a usable slot plus the link");
+        for i in 0..cap {
+            core::ptr::write_volatile(base.add(i), Trb::zeroed());
         }
-        let last = trbs.len() - 1;
-        trbs[last] = Trb::link(base_phys, true);
-        ProducerRing { trbs, base_phys, enqueue: 0, pcs: true }
+        core::ptr::write_volatile(base.add(cap - 1), Trb::link(base_phys, true));
+        ProducerRing { base, cap, base_phys, enqueue: 0, pcs: true }
     }
 
     pub fn pcs(&self) -> bool {
@@ -220,7 +231,8 @@ impl<'a> ProducerRing<'a> {
     }
 
     pub fn peek(&self, i: usize) -> Trb {
-        self.trbs[i]
+        // Safety: i < cap by the caller's contract; base spans cap slots.
+        unsafe { core::ptr::read_volatile(self.base.add(i)) }
     }
 
     /// Write `trb` at the enqueue pointer (stamping the current PCS), advance, and
@@ -230,14 +242,19 @@ impl<'a> ProducerRing<'a> {
     pub fn push(&mut self, mut trb: Trb) -> u64 {
         let idx = self.enqueue;
         trb.set_cycle(self.pcs);
-        self.trbs[idx] = trb;
+        // Safety: idx < cap - 1 always (the wrap below keeps it in range).
+        unsafe { core::ptr::write_volatile(self.base.add(idx), trb) };
         let addr = self.base_phys + (idx as u64) * core::mem::size_of::<Trb>() as u64;
 
         self.enqueue += 1;
         // The last slot is the Link TRB, never a data slot: reaching it wraps.
-        if self.enqueue == self.trbs.len() - 1 {
-            let last = self.trbs.len() - 1;
-            self.trbs[last].set_cycle(self.pcs);
+        if self.enqueue == self.cap - 1 {
+            // Arm the link with the current PCS so the controller follows it.
+            unsafe {
+                let mut link = core::ptr::read_volatile(self.base.add(self.cap - 1));
+                link.set_cycle(self.pcs);
+                core::ptr::write_volatile(self.base.add(self.cap - 1), link);
+            }
             self.enqueue = 0;
             self.pcs = !self.pcs;
         }
@@ -626,16 +643,23 @@ const PORTSC_PR: u32 = 1 << 4; // Port Reset
 const PORTSC_PP: u32 = 1 << 9; // Port Power
 const PORTSC_CHANGE_BITS: u32 = 0x7F << 17; // CSC/PEC/WRC/OCC/PRC/PLC/CEC (RW1C)
 
-/// A brought-up xHCI controller: the mapped register bases and the parsed
-/// capability parameters. The ring/DCBAA fields arrive with the next increment.
+/// A brought-up xHCI controller: the mapped register bases, the parsed capability
+/// parameters, and the command + event rings it drives. The rings are owned
+/// (self-contained raw-pointer types), so the whole controller is a movable driver
+/// object -- a kernel resident today, and the shape a library OS could hold to
+/// drive the device directly (the exokernel end-state, as in direct binding).
 pub struct Xhci {
     mmio: u64,
     op: u64,
     rt: u64,
     db: u64,
+    ir0: u64,
+    erseg_phys: u64,
     max_slots: u8,
     max_ports: u8,
     csz: bool,
+    cmd: Option<ProducerRing>,
+    event: Option<EventRing>,
 }
 
 impl Xhci {
@@ -735,8 +759,9 @@ impl Xhci {
         }
         w64(self.op + OP_DCBAAP, dcbaa_phys);
 
-        // Command ring: initialise the producer ring (this writes the Link TRB
-        // into the frame), then point CRCR at it with the initial cycle state.
+        // Command ring: build the producer ring over the frame (this writes the
+        // Link TRB), store it on the controller, then point CRCR at it with the
+        // initial cycle state.
         let (cr_phys, cr_va) = match alloc_zeroed() {
             Ok(x) => x,
             Err(e) => {
@@ -744,11 +769,8 @@ impl Xhci {
                 return false;
             }
         };
-        {
-            // Safety: cr_va is a mapped page-sized frame; trbs_per_frame TRBs fit.
-            let cr = unsafe { core::slice::from_raw_parts_mut(cr_va as *mut Trb, trbs_per_frame) };
-            let _ring = ProducerRing::new(cr, cr_phys); // sets the Link TRB; memory persists
-        }
+        // Safety: cr_va is a mapped page-sized frame; trbs_per_frame TRBs fit.
+        self.cmd = Some(unsafe { ProducerRing::new(cr_va as *mut Trb, trbs_per_frame, cr_phys) });
         w64(self.op + OP_CRCR, cr_phys | CRCR_RCS);
 
         // Event ring: one segment + a one-entry ERST on interrupter 0.
@@ -771,11 +793,13 @@ impl Xhci {
             // Safety: erst_va is a mapped frame; the ERST entry is 16 bytes.
             unsafe { core::ptr::write_volatile((erst_va + (i as u64) * 4) as *mut u32, *word) };
         }
-        let ir0 = self.rt + IR0;
         // Order per xHCI 4.9.4: size, then dequeue, then base (the base write arms it).
-        w32(ir0 + IR_ERSTSZ, 1);
-        w64(ir0 + IR_ERDP, erseg_phys);
-        w64(ir0 + IR_ERSTBA, erst_phys);
+        w32(self.ir0 + IR_ERSTSZ, 1);
+        w64(self.ir0 + IR_ERDP, erseg_phys);
+        w64(self.ir0 + IR_ERSTBA, erst_phys);
+        self.erseg_phys = erseg_phys;
+        // Safety: erseg_va is a mapped frame of trbs_per_frame zeroed TRBs.
+        self.event = Some(unsafe { EventRing::new(erseg_va as *const Trb, trbs_per_frame) });
 
         // Run.
         let cmd = r32(self.op + OP_USBCMD);
@@ -789,9 +813,8 @@ impl Xhci {
         // Reset the connected port(s) to generate a Port Status Change Event. A
         // device attached before the event ring was armed only latches the port's
         // change bits (no event re-posts on Run), so a fresh Port Reset is what
-        // produces an event the ring can deliver -- and it is the first step of
-        // enumeration regardless. PORTSC[p] = op + 0x400 + (p-1)*0x10.
-        let mut er = unsafe { EventRing::new(erseg_va as *const Trb, trbs_per_frame) };
+        // produces an event the ring delivers -- and it is the first enumeration
+        // step regardless. PORTSC[p] = op + 0x400 + (p-1)*0x10.
         let mut port = None;
         for p in 1..=self.max_ports {
             let addr = self.op + 0x400 + (p as u64 - 1) * 0x10;
@@ -799,31 +822,15 @@ impl Xhci {
             if portsc & PORTSC_CCS == 0 {
                 continue; // no device on this port
             }
-            // Assert Port Reset with power on. Preserve nothing but drop the
-            // RW1C change bits (bits 17-23) and PED (bit 1) so this write neither
-            // clears a pending change nor disables the port.
+            // Assert Port Reset with power on; drop the RW1C change bits and PED so
+            // this write neither clears a pending change nor disables the port.
             let base = portsc & !PORTSC_CHANGE_BITS & !PORTSC_PED;
             w32(addr, base | PORTSC_PR | PORTSC_PP);
-
-            // Poll the event ring for the Port Status Change Event the reset posts.
-            for _ in 0..5_000_000u64 {
-                match er.poll() {
-                    Some(ev) => {
-                        if ev.trb_type() == TrbType::PortStatusChange as u8 {
-                            port = Some(ev.port_id());
-                            break;
-                        }
-                    }
-                    None => core::hint::spin_loop(),
-                }
-            }
-            if port.is_some() {
+            if let Some(ev) = self.poll_event(TrbType::PortStatusChange as u8) {
+                port = Some(ev.port_id());
                 break;
             }
         }
-        // Advance ERDP past what we consumed and clear Event Handler Busy.
-        let erdp = erseg_phys + (er.dequeue_index() as u64) * 16;
-        w64(ir0 + IR_ERDP, erdp | ERDP_EHB);
         // Acknowledge the event interrupt bit (write-1-to-clear).
         w32(self.op + OP_USBSTS, USBSTS_EINT);
 
@@ -839,6 +846,57 @@ impl Xhci {
             }
         }
         true
+    }
+
+    /// Poll the event ring for the next event of `want_type`, draining (and
+    /// ignoring) any other events, then advance ERDP past what was consumed and
+    /// clear Event Handler Busy. Bounded, so a missing event reports rather than
+    /// hangs. Returns None if the wanted event never arrived.
+    fn poll_event(&mut self, want_type: u8) -> Option<Trb> {
+        let ir0 = self.ir0;
+        let erseg_phys = self.erseg_phys;
+        let event = self.event.as_mut()?;
+        let mut found = None;
+        for _ in 0..20_000_000u64 {
+            match event.poll() {
+                Some(ev) => {
+                    if ev.trb_type() == want_type {
+                        found = Some(ev);
+                        break;
+                    }
+                    // A different event this early: keep draining.
+                }
+                None => core::hint::spin_loop(),
+            }
+        }
+        // Advance ERDP to the current dequeue slot and clear Event Handler Busy.
+        let erdp = erseg_phys + (event.dequeue_index() as u64) * 16;
+        w64(ir0 + IR_ERDP, erdp | ERDP_EHB);
+        found
+    }
+
+    /// Issue an Enable Slot command and await its Command Completion Event -- the
+    /// first device-enumeration step (step 2). Rings the command doorbell (DB0,
+    /// target 0). Returns the device slot id the controller assigned, or None on
+    /// failure. Proves the command ring + doorbell + completion path end to end.
+    fn enable_slot<W: Write>(&mut self, out: &mut W) -> Option<u8> {
+        self.cmd.as_mut()?.push(Trb::enable_slot());
+        // Ring the command doorbell (doorbell 0, target 0).
+        w32(self.db, 0);
+
+        let ev = self.poll_event(TrbType::CommandCompletion as u8)?;
+        // Completion code 1 = Success (xHCI table 6-90).
+        if ev.completion_code() != 1 {
+            let _ = writeln!(
+                out,
+                "plinth: xhci: enable slot failed (completion code {})",
+                ev.completion_code()
+            );
+            return None;
+        }
+        let slot = ev.event_slot_id();
+        let _ = writeln!(out, "plinth: xhci: enable slot ok -> slot id {slot}");
+        Some(slot)
     }
 }
 
@@ -896,9 +954,13 @@ pub fn init<W: Write>(out: &mut W) -> Option<Xhci> {
         op: mmio + cap_len,
         rt: mmio + rtsoff,
         db: mmio + dboff,
+        ir0: mmio + rtsoff + IR0,
+        erseg_phys: 0,
         max_slots,
         max_ports,
         csz,
+        cmd: None,
+        event: None,
     };
 
     let _ = writeln!(
@@ -918,5 +980,8 @@ pub fn init<W: Write>(out: &mut W) -> Option<Xhci> {
     if !x.program_and_run(out) {
         return None;
     }
+    // Step 2 (first slice): Enable Slot over the command ring -- the first device
+    // enumeration step, proving the command ring + doorbell + completion path.
+    x.enable_slot(out);
     Some(x)
 }

@@ -1769,11 +1769,12 @@ fn usb_check(uefi_path: &Path) {
     let reset = output.contains("xhci: reset ok");
     let running = output.contains("xhci: running");
     let port = output.contains("xhci: port status change");
+    let slot = output.contains("xhci: enable slot ok");
     let booted = output.contains("shell: quit");
 
-    if found && params && reset && running && port && booted {
+    if found && params && reset && running && port && slot && booted {
         println!(
-            "usb: ok (xhci discovered, mapped, reset, running; port status change from the keyboard seen)"
+            "usb: ok (xhci reset, running; port status change seen; enable slot -> slot id assigned)"
         );
         return;
     }
@@ -1783,6 +1784,7 @@ fn usb_check(uefi_path: &Path) {
     eprintln!("  controller reset:     {reset} (want true)");
     eprintln!("  controller running:   {running} (want true)");
     eprintln!("  port status change:   {port} (want true)");
+    eprintln!("  enable slot ok:       {slot} (want true)");
     eprintln!("  booted to shell quit: {booted} (want true)");
     eprintln!("--- captured output ---");
     eprintln!("{output}");

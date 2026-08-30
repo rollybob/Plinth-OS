@@ -113,7 +113,9 @@ pub fn event_decode(_ctx: &mut TestCtx) -> Result<(), &'static str> {
 pub fn producer_ring_wraps_and_toggles_cycle(_ctx: &mut TestCtx) -> Result<(), &'static str> {
     let base = 0x0002_0000u64;
     let mut buf = [Trb::zeroed(); 4]; // 3 usable slots + 1 link
-    let mut ring = ProducerRing::new(&mut buf, base);
+    // Safety: buf outlives `ring` and is 4 contiguous TRBs; the ring drives it
+    // through the raw pointer (the DMA-memory model), tests inspect via peek().
+    let mut ring = unsafe { ProducerRing::new(buf.as_mut_ptr(), buf.len(), base) };
     test_assert!(ring.pcs(), "PCS starts set");
     test_assert!(ring.enqueue_index() == 0, "enqueue starts at 0");
 
