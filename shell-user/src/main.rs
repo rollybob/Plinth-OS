@@ -541,6 +541,21 @@ fn launch_app(
 ///
 /// Returns the (possibly new) framebuffer and slot, since launching moves the
 /// capability.
+/// A no-op framebuffer write, to keep QEMU repainting on a screen where the
+/// pointer is not drawn. A view hides the cursor (see `open_icon`), so the home
+/// screen's `Cursor::refresh` heartbeat has nothing to re-blit here; without some
+/// write the interactive display heartbeat's zero-motion packets paint nothing and
+/// the view freezes until real mouse motion. This reads one pixel and writes it
+/// straight back -- no visual change, but the page is marked dirty. It touches the
+/// bottom-right pixel, outside the hashed top-left square, so no frame hash moves.
+fn touch_pixel(fb: &Framebuffer) {
+    let info = fb.info();
+    let x = info.width - 1;
+    let y = info.height - 1;
+    let v = fb.read_pixel_raw(x, y);
+    fb.write_pixel_raw(x, y, v);
+}
+
 fn open_icon(
     fb: Framebuffer,
     fb_slot: u64,
@@ -624,6 +639,11 @@ fn open_icon(
                         (cur.x as i64 + mouse_dx(m) as i64).clamp(0, w - CURSOR_SIDE as i64) as u32;
                     cur.y =
                         (cur.y as i64 - mouse_dy(m) as i64).clamp(0, h - CURSOR_SIDE as i64) as u32;
+                    // Keep the window repainting here too. The cursor is hidden in a
+                    // view, so there is nothing to re-blit; a no-op pixel touch marks
+                    // the framebuffer dirty so the interactive display heartbeat's
+                    // packets do not leave the view frozen.
+                    touch_pixel(&fb);
                 }
                 continue;
             }
