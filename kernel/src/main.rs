@@ -1438,139 +1438,104 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 rights: capability::RIGHT_READ,
                 origin: None,
             };
-            // Set-1 scancodes driving the home screen: Right (0xE0 0x4D) ->
-            // select BARS, Enter (0x1C) -> open its view, Backspace (0x0E) ->
-            // back, Down (0xE0 0x50) -> select APP, Enter (0x1C) -> launch it,
-            // Enter (0x1C) -> launch it a SECOND time, 'q' (0x10) -> quit. Must
-            // match shell-user's navigation + the expected_boot_log hashes. The
-            // `interactive` build (cargo xtask run) omits this, so the shell
-            // waits for REAL arrow keys and you drive the cursor yourself.
+            // Synthetic input driving the home screen. The mouse is now
+            // AUTHORITATIVE over the selection (hover-to-select), so the pointer
+            // sequence below CHOOSES each target by hovering it and the keyboard
+            // here only OPENS what the pointer selected (Enter) and quits ('q').
+            // Set-1 scancodes: Enter = 0x1C, Backspace = 0x0E, 'q' = 0x10, and 0xAA
+            // (a left-shift RELEASE) decodes to nothing -- the do-nothing padding.
             //
-            // The second launch is deliberate (D7): both
-            // bugs found on 2026-06-27 -- the capability-slot migration and the
-            // wait-handle leak -- only appear on a RELAUNCH, and a one-launch
-            // tour is exactly why smoke missed them. It is a regression guard for
-            // the framebuffer round-tripping cleanly, not for table exhaustion:
-            // that takes ~9 launches and is caprelease-user's job instead.
+            // The two synthetic queues advance together, one entry per idle pass,
+            // and the shell processes the keyboard entry BEFORE the mouse entry
+            // within a pass. So a hover in pass N sets the selection for an Enter in
+            // pass N+1, never the same pass -- every Enter below fires one pass
+            // after the hover that aimed it. `cargo xtask run` (the `interactive`
+            // kernel feature) omits all of this and waits for a real mouse+keyboard.
             //
-            // The four 0xAA bytes before 'q' are a DELAY, not filler. 0xAA is a
-            // left-shift RELEASE: the keymap decodes it to nothing, so the shell
-            // skips it and no behaviour depends on it. They exist because the two
-            // synthetic queues advance together and 'q' ends the demo -- without
-            // them the quit fires while the pointer sequence still has its second
-            // click (CRASH) pending, and the whole of slice 2 never runs. Any
-            // scancode that decodes to nothing would do; a release is the least
-            // surprising.
-            // The twenty 0xAA after the first Enter are the K-027 regression
-            // guard, and they are load-bearing. They hold the shell inside a view
-            // for twenty-one idle passes while the mouse queue below feeds it
-            // twenty-one no-motion packets. A view services only the keyboard, so
-            // before the fix those packets pile up unconsumed in the libOS
-            // reactor's 16-entry staging table, and the SEVENTEENTH completion --
-            // the next keystroke -- is reaped from the CQ and discarded with
-            // nowhere to go, so Backspace never arrives and the shell hangs
-            // forever. Removing this padding, or dropping it below seventeen
-            // passes, silently retires the only automated test for that hang.
-            //
-            // This is what the 08-13 attempt could not do: it armed twenty
-            // packets into a queue capped at sixteen, exactly the table size, so
-            // it reached the boundary and never crossed it.
+            // Trajectory (pass : key -> effect):
+            //   2  Enter -> open the view the POINTER parked on (icon 1, BARS). This
+            //      is the hover-select assertion: the pointer selected icon 1 in
+            //      pass 1 and no key did, so a BARS "view hash" proves the hover
+            //      moved the selection.
+            //   3..23 twenty-one 0xAA: the K-027 guard, load-bearing. They hold the
+            //      shell inside the view for twenty-one idle passes while the mouse
+            //      queue feeds twenty-one no-motion packets; a view that fails to
+            //      service the mouse subscription piles them up past the reactor's
+            //      16-entry table and drops the next keystroke (Backspace), hanging
+            //      the shell. The count here MUST equal the no-motion run below.
+            //   24 Backspace -> home.
+            //   27 Enter -> launch APP (icon 3, hovered in pass 25). Launch #1.
+            //   30 Enter -> launch APP again (still hovered). Launch #3; the pointer
+            //      click in pass 28 is #2. Three launches -- keyboard, pointer,
+            //      keyboard -- guard the RELAUNCH bugs of 2026-06-27 (cap-slot
+            //      migration + wait-handle leak), which only surface on a relaunch.
+            //   34 'q' -> quit, after the pointer's CRASH click (pass 33) has run.
             #[cfg(not(feature = "interactive"))]
             input::arm_synthetic(&[
-                0xE0, 0x4D, 0x1C, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
-                0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0x0E, 0xE0, 0x50, 0x1C, 0x1C,
-                0xAA, 0xAA, 0xAA, 0xAA, 0x10,
+                0xAA, 0xAA, 0x1C, // 0-2: (pointer hovers icon 1), Enter -> BARS view
+                // 3-23: twenty-one 0xAA -- the in-view K-027 padding.
+                0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+                0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, //
+                0x0E, // 24: Backspace -> home
+                0xAA, 0xAA, 0x1C, // 25-27: (pointer hovers icon 3), Enter -> launch APP #1
+                0xAA, 0xAA, 0x1C, // 28-30: (pointer clicks APP #2, releases), Enter -> APP #3
+                0xAA, 0xAA, 0xAA, // 31-33: (pointer hovers icon 2, clicks CRASH)
+                0x10, // 34: 'q' -> quit
             ]);
-            // The pointer journey, in packets the shell turns into motion. It
-            // starts on the centre of icon 0 (the shell parks it there), so every
-            // delta here is a FIXED icon-to-icon step -- ICON_W + ICON_GAP = 248
-            // across, ICON_H + ICON_GAP = 168 down -- and lands on icon 3 at ANY
-            // resolution, even though the grid origin is centred and this file
-            // does not know the resolution. Split across two packets each because
-            // a PS/2 delta is a signed byte.
+            // The pointer journey, in relative packets the shell turns into
+            // motion. It starts on the centre of icon 0 (the shell parks it there),
+            // and every move is a FIXED icon-to-icon step -- ICON_W + ICON_GAP = 248
+            // across, ICON_H + ICON_GAP = 168 down -- so it lands on the right icon
+            // at ANY resolution though the grid origin is centred and this file does
+            // not know the resolution. A PS/2 delta is a signed byte (max 127), so a
+            // full 248-px step is split across two packets, the first landing in the
+            // gap between icons (reported "over none"). dy is NEGATIVE to move DOWN:
+            // PS/2 reports +Y as up, and the shell decides that means screen-up.
             //
-            // dy is NEGATIVE to move DOWN the screen: PS/2 reports +Y as up, and
-            // the shell (not the kernel) is what decides that means screen-up.
-            //
-            // The last two packets are a button press and its release: a click on
-            // icon 3, which is APP, so the pointer launches the app exactly as
-            // Enter does. Delivery is interleaved with the scancodes above --
-            // `deliver_synthetic` and `deliver_synthetic_mouse` both fire on each
-            // idle-on-input pass -- so the two sequences alternate rather than
-            // running one after the other.
-            //
-            // The two leading zero packets are a deliberate DELAY, not padding.
-            // Both synthetic queues advance one entry per idle-on-input pass, so
-            // the pointer's position in this array is its position in time
-            // relative to the scancodes above. Without the delay the click lands
-            // before the scripted Down, sets the selection to APP itself, and the
-            // Down that follows moves it back off -- which costs the tour the
-            // deliberate SECOND launch that guards the relaunch bugs of
-            // 2026-06-27. Two zero packets put the click after the Down instead,
-            // so the keyboard trajectory is exactly what it was before the pointer
-            // existed and the click is purely additive. A zero packet moves
-            // nothing, changes no hit-test answer and presses no button, so it
-            // emits nothing.
-            //
-            // The SECOND click is slice 2 and the point of the milestone: it
-            // lands on CRASH, which spawns a process that maps the screen, draws
-            // to prove it holds it, and then faults while still holding it. The
-            // shell has to get the screen back from a process that handed nothing
-            // back, and redraw. Before reclamation that was unrecoverable -- no
-            // syscall mints a framebuffer, so a shell that launched a crashing app
-            // took the display down with it for the rest of boot.
-            //
-            // CRASH is one column left of APP, so -(ICON_W + ICON_GAP) in x and
-            // no change in y, again split across two packets.
+            // Because the mouse is authoritative, hovering a box SELECTS it. So this
+            // journey aims every keyboard Enter above, and its two clicks (button
+            // 0x01 then release 0x00) launch directly:
+            //   0-1  icon 0 -> icon 1 (over none, then over icon 1): selects BARS,
+            //        which the Enter in pass 2 then opens (the hover-select proof).
+            //   2-23 no-motion packets held in the view -- the K-027 padding, paired
+            //        one-for-one with the 0xAA run above (count MUST match).
+            //   25-26 icon 1 -> icon 3: selects APP for the Enter in pass 27 (#1).
+            //   28   click on icon 3: launch #2 -- the pointer reaches the SAME
+            //        launch path as Enter (I7). 29 releases the button.
+            //   31-32 icon 3 -> icon 2 (over none, then over icon 2): selects CRASH.
+            //   33   click on icon 2: slice 2 -- CRASH maps the screen, draws, then
+            //        faults while holding it; the shell reclaims the framebuffer and
+            //        redraws, which no syscall-minted framebuffer could ever do.
             #[cfg(not(feature = "interactive"))]
             input::arm_synthetic_mouse(&[
+                (127, 0, 0x00),  // 0: icon 0 -> gap (over none)
+                (121, 0, 0x00),  // 1: gap -> icon 1 (over icon 1, selects BARS)
+                (0, 0, 0x00),    // 2: in-view (Enter opened the view this pass)
+                // 3-23: twenty-one no-motion packets, the K-027 padding (== 0xAA run)
+                (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00),
+                (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00),
+                (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00),
+                (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00), (0, 0, 0x00),
                 (0, 0, 0x00),
-                (127, 0, 0x00),
-                // Twenty no-motion packets, paired ONE FOR ONE with the 0xAA run
-                // in the scancode array above. They land while the shell sits in a
-                // view -- the only screen with no use for a pointer -- so before
-                // the fix they pile up unconsumed and overrun the reactor's
-                // 16-entry staging table.
-                //
-                // The count here MUST equal the count there. The two synthetic
-                // queues advance together, one entry each per idle pass, so an
-                // unequal insertion shifts every later pairing and silently
-                // reshuffles the journey -- which is exactly what a first attempt
-                // at this did.
-                //
-                // Zero deltas on purpose: occupying a staging slot is the whole
-                // job here.
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (0, 0, 0x00),
-                (121, 0, 0x00),
-                (0, -127, 0x00),
-                (0, -41, 0x00),
-                (0, 0, 0x01),
-                (0, 0, 0x00),
-                (-127, 0, 0x00),
-                (-121, 0, 0x00),
-                (0, 0, 0x01),
-                (0, 0, 0x00),
+                (0, 0, 0x00),    // 24: home (Backspace this pass)
+                (0, -127, 0x00), // 25: icon 1 -> icon 3 (over icon 3, selects APP)
+                (0, -41, 0x00),  // 26: settle on icon 3 centre
+                (0, 0, 0x00),    // 27: launch APP #1 (Enter this pass)
+                (0, 0, 0x01),    // 28: click icon 3 -> launch APP #2
+                (0, 0, 0x00),    // 29: release the button
+                (0, 0, 0x00),    // 30: launch APP #3 (Enter this pass)
+                (-127, 0, 0x00), // 31: icon 3 -> gap (over none)
+                (-121, 0, 0x00), // 32: gap -> icon 2 (over icon 2, selects CRASH)
+                (0, 0, 0x01),    // 33: click icon 2 -> launch CRASH
+                (0, 0, 0x00),    // 34: (quit fires on the key this pass)
             ]);
+            // Interactive `run` only: arm the display heartbeat now, so the idle
+            // loop keeps QEMU repainting while the shell waits for real input.
+            // Armed HERE (not at boot) so the scripted demos above -- some of which
+            // read the mouse -- never receive its zero-motion packets. No-op in the
+            // scripted build (the shell auto-plays and exits).
+            #[cfg(feature = "interactive")]
+            scheduler::enable_display_heartbeat();
             scheduler::run(
                 "shell demo",
                 &[SHELL_BIN],

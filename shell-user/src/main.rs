@@ -175,6 +175,29 @@ impl Cursor {
         self.shown = false;
     }
 
+    /// Re-blit the pointer's foreground over itself, without touching the
+    /// save-under. Visually a no-op (the pointer is already drawn there), but it
+    /// rewrites `CURSOR_SIDE^2` framebuffer pixels, which marks the page dirty.
+    /// That is what the interactive display heartbeat needs: QEMU throttles its
+    /// window repaint to nothing when the framebuffer looks idle, so keyboard-only
+    /// changes land in memory but never on screen until something repaints. A
+    /// periodic in-place re-blit keeps the framebuffer continuously dirty so the
+    /// window keeps repainting. No-op unless shown (nothing to re-blit).
+    fn refresh(&self, fb: &Framebuffer) {
+        if !self.shown {
+            return;
+        }
+        let mut dy = 0u32;
+        while dy < CURSOR_SIDE {
+            let mut dx = 0u32;
+            while dx < CURSOR_SIDE {
+                fb.put_pixel(self.x + dx, self.y + dy, CURSOR_FG.0, CURSOR_FG.1, CURSOR_FG.2);
+                dx += 1;
+            }
+            dy += 1;
+        }
+    }
+
     /// Forget the saved block without painting it back.
     ///
     /// For the one case where restoring would be wrong: the framebuffer was
@@ -813,6 +836,13 @@ pub extern "C" fn _start(_idx: u64) -> ! {
                     cur.x = nx as u32;
                     cur.y = ny as u32;
                     cur.show(&fb);
+                } else {
+                    // No motion (e.g. the interactive display heartbeat's zero
+                    // packet): re-blit the pointer in place so the framebuffer stays
+                    // dirty and QEMU keeps repainting the window. Without this a
+                    // keyboard-only change never reaches the screen until real mouse
+                    // motion forces a refresh.
+                    cur.refresh(&fb);
                 }
                 // Report only when the ANSWER changes, not per packet: the pointer
                 // lives outside the hashed square, so this line is the only thing
@@ -825,6 +855,27 @@ pub extern "C" fn _start(_idx: u64) -> ! {
                     sys_write(b"shell: cursor over ");
                     write_icon(over);
                     sys_write(b"\n");
+                    // Hover-to-select: the selection follows the pointer ONTO a box,
+                    // and only on that crossing -- this is gated on `over` CHANGING,
+                    // not run per packet. The mouse is authoritative on MOTION:
+                    // sliding onto a box takes the selection there, overriding the
+                    // keyboard (standard hover behaviour). But a stationary pointer
+                    // leaves `over` unchanged, so it does NOT keep re-grabbing the
+                    // selection -- which is what lets the KEYBOARD move the selection
+                    // while the mouse sits still. This matters because a real PS/2
+                    // mouse keeps posting packets at rest; running hover-select on
+                    // every one of them would re-pin the selection under the pointer
+                    // and no arrow key could ever move it. Over empty space the
+                    // selection stays put (Enter needs a target). The scripted smoke
+                    // tour selects by hovering and opens with Enter or a click, so
+                    // both the pointer and keyboard launch paths stay covered.
+                    if let Some(idx) = over {
+                        if idx != sel {
+                            let prev = sel;
+                            sel = idx;
+                            move_selection(&fb, &mut cur, prev, sel);
+                        }
+                    }
                 }
                 // A click is the press EDGE, not the button being held: one packet
                 // per PS/2 sample means a held button would otherwise re-fire on

@@ -1220,6 +1220,26 @@ unsafe fn resume_process(next: usize) -> ! {
 /// caller before we get here.
 ///
 /// Resumes a process directly (never returning) when one becomes claimable, or
+/// Interactive display heartbeat arming (interactive build only).
+///
+/// QEMU throttles its window repaint to nothing when the guest framebuffer looks
+/// idle, so at the interactive shell a keyboard-only change lands in memory but
+/// never on screen until real mouse motion forces a refresh. Once armed, the idle
+/// loop below feeds the shell a zero-motion mouse packet each tick; the shell
+/// re-blits its pointer in place, keeping the framebuffer continuously dirty so
+/// the window keeps repainting. Armed once, just before the shell demo, so the
+/// scripted demos that run first (some of which read the mouse) never see the
+/// extra packets. Compiled out of the scripted build.
+#[cfg(feature = "interactive")]
+static DISPLAY_HEARTBEAT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the interactive display heartbeat. See `DISPLAY_HEARTBEAT`.
+#[cfg(feature = "interactive")]
+pub fn enable_display_heartbeat() {
+    DISPLAY_HEARTBEAT.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// RETURNS to `switch_to_next` once nothing is waiting on input or disk any
 /// more -- see the comment on that check for the hang that made it necessary.
 /// It deliberately does not decide anything about launchers or an empty table;
@@ -1278,6 +1298,20 @@ unsafe fn idle_until_runnable() {
         x86_64::instructions::interrupts::enable_and_hlt();
         x86_64::instructions::interrupts::disable();
         bkl::acquire();
+        // Interactive display heartbeat (see `DISPLAY_HEARTBEAT`): once armed,
+        // deliver the shell a zero-motion mouse packet each wake. It moves the
+        // pointer nowhere and (its hit-test answer unchanged) triggers no
+        // hover-select -- it exists only to make the shell repaint, keeping QEMU's
+        // window refreshing while the user types. The tick is 100 Hz, so this is a
+        // ~100 Hz repaint, not a busy loop (we HLT above between wakes). A source
+        // with no subscriber drops it, so it is inert until the shell subscribes.
+        #[cfg(feature = "interactive")]
+        if DISPLAY_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed) {
+            crate::input::record(
+                crate::input::SOURCE_MOUSE,
+                crate::input::Event::mouse_move(0, 0, 0),
+            );
+        }
     }
 }
 

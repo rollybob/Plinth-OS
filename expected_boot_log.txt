@@ -770,31 +770,34 @@ plinth: fbrelease demo: all done
 # the spent wait handle used to be unreleasable. Every line of the second launch
 # is identical to the first -- that sameness IS the assertion.
 #
-# Clickable apps, slice 1. Two things are new here and
-# both are asserted on serial rather than in a frame hash, deliberately (C4):
+# Clickable apps. Two things are asserted on serial rather than in a frame hash,
+# deliberately (C4):
 #
 #   - "cursor over ..." reports which icon the pointer is over, emitted only when
 #     that ANSWER changes. The pointer lives outside the hashed 128x128 top-left
 #     square, so no hash can see it -- the same blind spot that let the splash
 #     version banner read 2.7 for the whole of v2.8 with every test green. These
 #     lines are what make the pointer visible to the suite at all.
-#   - "click icon 3" reports what the click RESOLVED TO, not where it landed in
+#   - "click icon N" reports what the click RESOLVED TO, not where it landed in
 #     pixels (C7). The scripted packet journey is in fixed icon-to-icon deltas
 #     from an icon centre, so it is resolution-independent by construction -- but
 #     if it ever stops being, this line says "none" and smoke fails loudly instead
 #     of the click silently missing and every hash still matching.
 #
-# The pointer is hidden while each hash is taken, so all four hashes below are
-# byte-identical to their pre-pointer values. That is hash hygiene, not the
-# pointer's assertion strategy; the two lines above are the assertion.
+# The pointer is hidden while each hash is taken, so every hash below is
+# byte-identical to its pre-pointer value. The selection highlight rides on the
+# centred icons, also outside the top-left square, so hover-select never moves a
+# hash either -- which is why this whole mouse-driven tour leaves the hashes
+# exactly as the keyboard-only tour left them. That is hash hygiene; the "cursor
+# over"/"click" lines are the pointer's actual assertion.
 #
-# The click is purely ADDITIVE to the keyboard trajectory: the two synthetic
-# queues advance together, one entry per idle pass, and the pointer sequence
-# carries two leading zero packets so the click lands after the scripted Down
-# rather than before it. Before that delay was added the click selected APP
-# itself, the Down moved the selection back off, and the tour lost its second
-# launch. Hence THREE launches here -- keyboard, pointer, keyboard -- and the
-# middle one is the only one a human could have caused with a mouse.
+# The mouse is AUTHORITATIVE over the selection (hover-to-select), so the pointer
+# chooses every target and the keyboard only OPENS it. That is why an Enter with
+# no preceding arrow still opens the box under the pointer -- the hover-select
+# proof at the BARS view below. The three APP launches are keyboard, pointer,
+# keyboard (Enter, click, Enter) on the SAME hovered icon: the relaunch guard for
+# the 2026-06-27 bugs (cap-slot migration + wait-handle leak), which only surface
+# on a relaunch.
 plinth: shell demo: 1 processes
 shell: start
 # The ABI version the USER BINARIES were built against, emitted from the same
@@ -810,12 +813,16 @@ shell: home hash 0x4b82ddae83e366a5
 # begins over icon 0. That is also what makes the journey below resolution-
 # independent: from an icon centre every other icon is a fixed delta away.
 shell: cursor over icon 0
-# The pointer crosses out of icon 0 here, at home, before Enter opens the view.
-# This line sat AFTER the view until 2026-08-18: the packet that caused it used
-# to be stranded in the reactor unconsumed until the shell came back, because a
-# view serviced only the keyboard. That stranding was K-027. A view now services
-# the mouse too, so the move is accounted for when it happens.
+# The pointer leaves icon 0 (crossing the gap = "over none"), then lands on icon 1
+# and -- because the mouse is authoritative -- SELECTS it. The Enter that opens the
+# view (below) therefore opens BARS (icon 1) though no key ever moved the
+# selection: that "view hash" IS the hover-select assertion. If hover-select
+# regressed, the selection would still be icon 0 and INFO would open with a
+# different hash. (The "over none" line also matters for K-027: before 2026-08-18 a
+# view serviced only the keyboard, so a mouse packet stranded in the reactor until
+# the shell returned; a view now services the mouse too.)
 shell: cursor over none
+shell: cursor over icon 1
 shell: view hash 0x2a82b4e08a822325
 # The K-027 regression assertion. Everything below this line depends on it.
 #
@@ -839,8 +846,8 @@ shell: view hash 0x2a82b4e08a822325
 # twenty no-motion packets, which MUST stay equal in count). Shortening it below
 # seventeen in-view passes retires the test without failing it.
 shell: view drops kbd=0 mouse=0 bursts=0 undeliv=0
-# The journey resumes: onto icon 1, then down onto icon 3.
-shell: cursor over icon 1
+# Back home, the pointer moves down onto icon 3 and selects APP; the Enter below
+# launches it (#1). No arrow key is involved -- the pointer chose the target.
 shell: cursor over icon 3
 shell: launching app
 shellapp: start

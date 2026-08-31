@@ -38,8 +38,23 @@ fn main() {
         // `run`/`run-gdb` build the kernel with the `interactive` feature, so the
         // shell waits for real keyboard input (drive the cursor yourself) instead
         // of auto-playing its scripted tour. smoke/test/bench stay scripted.
-        "run"     => { let img = build_interactive(); run(&img, false); }
-        "run-gdb" => { let img = build_interactive(); run(&img, true); }
+        //
+        // Default the interactive session to the USB keyboard (PLINTH_USB=1) with
+        // the vIOMMU off (PLINTH_IOMMU=none, which xHCI DMA needs -- D9). This is
+        // the input path that is actually exercised and known good; the PS/2
+        // keyboard is not covered by any lane, so leaving `run` on it silently gave
+        // a window with a working mouse and a dead keyboard. Both are only defaults
+        // -- set either env var yourself to override (e.g. PLINTH_USB=0 for PS/2).
+        "run" | "run-gdb" => {
+            if std::env::var_os("PLINTH_USB").is_none() {
+                std::env::set_var("PLINTH_USB", "1");
+            }
+            if std::env::var_os("PLINTH_IOMMU").is_none() {
+                std::env::set_var("PLINTH_IOMMU", "none");
+            }
+            let img = build_interactive();
+            run(&img, subcmd == "run-gdb");
+        }
         "smoke"   => { let img = build_all(); smoke(&img); }
         "smoke-smp" => { let img = build_all(); smoke_smp(&img); }
         // Boot under QEMU's emulated AMD-Vi (PLINTH_IOMMU=amd) and assert the
