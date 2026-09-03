@@ -72,11 +72,16 @@ fn main() {
         "test"    => { let img = build_test(); run_tests(&img); }
         "console" => { let img = build_force_console(); console_check(&img); }
         "no-i8042" => { let img = build_all(); no_i8042_check(&img); }
+        // Boot with NO virtio-blk device (PLINTH_NOSTORAGE=1) and assert the
+        // diskless-boot path (first-metal-boot D3): the kernel reports storage
+        // absent, skips every selftest/demo, and still draws its shell -- the
+        // metal-storage analogue of `no-i8042`.
+        "smoke-nostorage" => { let img = build_all(); nostorage_check(&img); }
         "check"   => { check_clobbers(); }
         other     => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, smoke-amd, smoke-usb, bench, test, console, no-i8042, check"
+                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, smoke-amd, smoke-usb, bench, test, console, no-i8042, smoke-nostorage, check"
             );
             std::process::exit(1);
         }
@@ -696,52 +701,62 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
     let smp = std::env::var("PLINTH_SMP").unwrap_or_else(|_| "1".to_string());
     cmd.args(["-smp", &smp]);
 
-    // virtio-blk base slot: 3 normally, or 6 under AMD-Vi (whose AMDVI-PCI device
-    // takes slot 3). Kept contiguous so PCI-slot-order enumeration still yields
-    // device indices 0/1/2 for blk0/blk1/blk2.
-    let blk_base = if std::env::var("PLINTH_IOMMU").as_deref() == Ok("amd") { 6 } else { 3 };
-    let blk0_addr = format!("virtio-blk-pci,drive=blk0,addr=0x{:x},disable-legacy=on,iommu_platform=on", blk_base);
-    let blk1_addr = format!("virtio-blk-pci,drive=blk1,addr=0x{:x},disable-legacy=on,iommu_platform=on", blk_base + 1);
-    let blk2_addr = format!("virtio-blk-pci,drive=blk2,addr=0x{:x},disable-legacy=on,iommu_platform=on", blk_base + 2);
+    // PLINTH_NOSTORAGE=1 emulates a real diskless machine: NO virtio-blk device is
+    // presented, so the kernel enumerates zero block devices and every storage
+    // selftest/demo must skip cleanly (first-metal-boot D3, the metal-storage
+    // analogue of `no-i8042`). The `smoke-nostorage` lane drives this; every other
+    // lane leaves it unset, so their PCI topology and smoke output are unchanged.
+    // The vIOMMU (if any) stays realized -- a real diskless UEFI box still has one --
+    // it simply governs no device.
+    let nostorage = std::env::var("PLINTH_NOSTORAGE").as_deref() == Ok("1");
+    if !nostorage {
+        // virtio-blk base slot: 3 normally, or 6 under AMD-Vi (whose AMDVI-PCI device
+        // takes slot 3). Kept contiguous so PCI-slot-order enumeration still yields
+        // device indices 0/1/2 for blk0/blk1/blk2.
+        let blk_base = if std::env::var("PLINTH_IOMMU").as_deref() == Ok("amd") { 6 } else { 3 };
+        let blk0_addr = format!("virtio-blk-pci,drive=blk0,addr=0x{:x},disable-legacy=on,iommu_platform=on", blk_base);
+        let blk1_addr = format!("virtio-blk-pci,drive=blk1,addr=0x{:x},disable-legacy=on,iommu_platform=on", blk_base + 1);
+        let blk2_addr = format!("virtio-blk-pci,drive=blk2,addr=0x{:x},disable-legacy=on,iommu_platform=on", blk_base + 2);
 
-    // Stage 1 storage: a deterministic raw disk behind a modern virtio-blk-pci
-    // device, pinned to slot 3 so discovery output is stable across runs.
-    // disable-legacy=on forces the modern (MMIO-capability) device the driver
-    // targets, rather than a transitional device with a legacy PIO BAR.
-    let blk = block_image();
-    cmd.args([
-        "-drive",
-        &format!("if=none,format=raw,file={},id=blk0", blk.display()),
-        "-device",
-        // iommu_platform=on routes this device's DMA through the vIOMMU (it then
-        // offers VIRTIO_F_ACCESS_PLATFORM); without it QEMU's virtio bypasses the
-        // IOMMU and the domain enforcement would be vacuous.
-        &blk0_addr,
-    ]);
+        // Stage 1 storage: a deterministic raw disk behind a modern virtio-blk-pci
+        // device, pinned to slot 3 so discovery output is stable across runs.
+        // disable-legacy=on forces the modern (MMIO-capability) device the driver
+        // targets, rather than a transitional device with a legacy PIO BAR.
+        let blk = block_image();
+        cmd.args([
+            "-drive",
+            &format!("if=none,format=raw,file={},id=blk0", blk.display()),
+            "-device",
+            // iommu_platform=on routes this device's DMA through the vIOMMU (it then
+            // offers VIRTIO_F_ACCESS_PLATFORM); without it QEMU's virtio bypasses the
+            // IOMMU and the domain enforcement would be vacuous.
+            &blk0_addr,
+        ]);
 
-    // Storage device 1: the read-only boot archive. Pinned to slot 4 (just past
-    // the ramp disk's slot 3) so the kernel's PCI-slot-order enumeration always
-    // gives it device index 1, and so discovery output is stable across runs.
-    let archive = archive_image();
-    cmd.args([
-        "-drive",
-        &format!("if=none,format=raw,file={},id=blk1", archive.display()),
-        "-device",
-        &blk1_addr,
-    ]);
+        // Storage device 1: the read-only boot archive. Pinned to slot 4 (just past
+        // the ramp disk's slot 3) so the kernel's PCI-slot-order enumeration always
+        // gives it device index 1, and so discovery output is stable across runs.
+        let archive = archive_image();
+        cmd.args([
+            "-drive",
+            &format!("if=none,format=raw,file={},id=blk1", archive.display()),
+            "-device",
+            &blk1_addr,
+        ]);
 
-    // Storage device 2: the directly-bound device (direct-binding slice 2),
-    // pinned to slot 5. The kernel claims it with its OWN non-identity IOMMU
-    // domain (its virtqueue at opaque IOVAs) rather than the shared kernel-bridged
-    // domain the other two use. iommu_platform=on so its DMA is governed by the
-    // vIOMMU, like the others -- direct binding relies on that confinement.
-    let bind_disk = bind_image();
-    cmd.args([
-        "-drive",
-        &format!("if=none,format=raw,file={},id=blk2", bind_disk.display()),
-        "-device",
-        &blk2_addr,
-    ]);
+        // Storage device 2: the directly-bound device (direct-binding slice 2),
+        // pinned to slot 5. The kernel claims it with its OWN non-identity IOMMU
+        // domain (its virtqueue at opaque IOVAs) rather than the shared kernel-bridged
+        // domain the other two use. iommu_platform=on so its DMA is governed by the
+        // vIOMMU, like the others -- direct binding relies on that confinement.
+        let bind_disk = bind_image();
+        cmd.args([
+            "-drive",
+            &format!("if=none,format=raw,file={},id=blk2", bind_disk.display()),
+            "-device",
+            &blk2_addr,
+        ]);
+    }
 
     // Optional USB stack (PLINTH_USB=1) for the USB HID bring-up lane
     // (`cargo xtask smoke-usb`): an xHCI controller with a boot keyboard behind
@@ -1671,6 +1686,50 @@ fn no_i8042_check(uefi_path: &Path) {
     eprintln!("  \"i8042 absent, input disabled\" present: {reported_absent} (want true)");
     eprintln!("  \"boot ok\" present:                      {booted} (want true)");
     eprintln!("  \"keyboard ready\" present:               {armed_keyboard} (want false)");
+    eprintln!("--- captured output ---");
+    eprintln!("{output}");
+    eprintln!("--- end output ---");
+    std::process::exit(1);
+}
+
+/// Boot with NO virtio-blk device (`PLINTH_NOSTORAGE=1`) and assert the diskless
+/// path (first-metal-boot D3, section 8 Q1): on real metal Plinth has no NVMe/AHCI
+/// driver, so storage is simply absent and that must degrade to "boots and draws,"
+/// never a hang or panic. Every other lane presents three virtio-blk disks, so this
+/// is the only lane that exercises the zero-block-device branch -- the metal-storage
+/// analogue of `no-i8042`.
+///
+/// Asserts, in one boot:
+/// - storage absence is REPORTED ("virtio-blk not found"), so a diskless machine is
+///   diagnosable rather than a silent black screen;
+/// - NO storage selftest ran ("sector 0 read ok" absent), proving the `ready()`
+///   guards held and nothing touched a device that is not there;
+/// - the shell still DREW ("frames free before shell"), the "boots and draws" bar;
+/// - the boot ran to completion ("boot ok"), so no guard let a storage call hang.
+fn nostorage_check(uefi_path: &Path) {
+    // A QEMU topology flag only (which -device args build_qemu_cmd emits); the
+    // kernel binary is unchanged and discovers zero devices at runtime. Removed
+    // after the capture so it cannot leak into any later env read.
+    std::env::set_var("PLINTH_NOSTORAGE", "1");
+    let output = run_capture(uefi_path);
+    std::env::remove_var("PLINTH_NOSTORAGE");
+
+    let reported_absent = output.contains("virtio-blk not found");
+    let no_selftest = !output.contains("sector 0 read ok");
+    let shell_drew = output.contains("frames free before shell");
+    let booted = output.contains("boot ok");
+    if reported_absent && no_selftest && shell_drew && booted {
+        println!(
+            "smoke-nostorage: ok (no virtio-blk: storage absence reported, selftests skipped, \
+             shell drew, boot ran to completion)"
+        );
+        return;
+    }
+    eprintln!("smoke-nostorage: FAIL");
+    eprintln!("  \"virtio-blk not found\" present:      {reported_absent} (want true)");
+    eprintln!("  no \"sector 0 read ok\" (selftest):    {no_selftest} (want true)");
+    eprintln!("  \"frames free before shell\" present:  {shell_drew} (want true)");
+    eprintln!("  \"boot ok\" present:                   {booted} (want true)");
     eprintln!("--- captured output ---");
     eprintln!("{output}");
     eprintln!("--- end output ---");

@@ -95,6 +95,9 @@ jobs:
       - name: No-i8042 boot test (in QEMU)
         run: cargo xtask no-i8042
 
+      - name: Diskless boot test (in QEMU, no virtio-blk)
+        run: cargo xtask smoke-nostorage
+
       - name: USB HID bring-up (in QEMU, emulated xHCI + boot keyboard)
         run: cargo xtask smoke-usb
 
