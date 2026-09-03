@@ -513,6 +513,12 @@ the bootloader; expect a few minutes. Slow machine or CI?
 boots into the live system -- type into the QEMU window and kbd-demo echoes
 your line through `libinput`.
 
+To boot Plinth from a USB stick on a real UEFI machine, `cargo xtask image`
+stages the bootable image; [METAL_BOOT.md](METAL_BOOT.md) covers writing it and
+the firmware settings. It is a live USB -- it never touches the internal disk --
+and the bar is "boots and draws its shell," with storage and USB input expected
+to be absent (Plinth has no NVMe/AHCI or USB-HID driver yet).
+
 ## Writing your own programs
 
 Plinth runs your code in ring 3 over a stable syscall interface.
