@@ -71,6 +71,10 @@ fn main() {
         "bench"   => { let img = build_bench(); bench(&img); }
         "test"    => { let img = build_test(); run_tests(&img); }
         "console" => { let img = build_force_console(); console_check(&img); }
+        // Force the framebuffer diagnostic console AND boot the demos + visual
+        // shell, asserting the fbcon->tenant framebuffer handoff on a no-serial
+        // machine (first-metal-boot D4).
+        "smoke-fbcon-shell" => { let img = build_fbcon_shell(); fbcon_shell_check(&img); }
         "no-i8042" => { let img = build_all(); no_i8042_check(&img); }
         // Boot with NO virtio-blk device (PLINTH_NOSTORAGE=1) and assert the
         // diskless-boot path (first-metal-boot D3): the kernel reports storage
@@ -81,7 +85,7 @@ fn main() {
         other     => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, smoke-amd, smoke-usb, bench, test, console, no-i8042, smoke-nostorage, check"
+                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, smoke-amd, smoke-usb, bench, test, console, smoke-fbcon-shell, no-i8042, smoke-nostorage, check"
             );
             std::process::exit(1);
         }
@@ -1995,6 +1999,39 @@ fn build_force_console() -> PathBuf {
     uefi_path
 }
 
+/// Build the kernel with the `fbcon_shell` feature (framebuffer diagnostic
+/// console forced on, then the full scripted demos + shell), for the D4 handoff
+/// lane. Writes a separate image so it never clobbers the smoke/run/console image.
+fn build_fbcon_shell() -> PathBuf {
+    for name in USER_CRATES {
+        build_user_crate(name);
+    }
+    archive_image();
+
+    let root = workspace_root();
+    let kernel_dir = root.join("kernel");
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(&cargo)
+        .current_dir(&kernel_dir)
+        .args(["build", "--features", "fbcon_shell"])
+        .status()
+        .expect("failed to invoke cargo for fbcon_shell kernel build");
+    assert!(status.success(), "fbcon_shell kernel build failed");
+
+    let kernel_bin = root.join("target/x86_64-unknown-none/debug/kernel");
+    let out_dir = root.join("target/disk-images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let uefi_path = out_dir.join("uefi-fbcon-shell.img");
+    bootloader::UefiBoot::new(&kernel_bin)
+        .create_disk_image(&uefi_path)
+        .unwrap();
+
+    println!("fbcon-shell disk image: {}", uefi_path.display());
+    uefi_path
+}
+
 /// The frame hash the forced console produces for its fixed test string over
 /// the pinned QEMU/OVMF framebuffer. Deterministic for the same reason the gfx
 /// demo hashes are (fixed geometry + a fixed origin square); if QEMU or OVMF
@@ -2029,6 +2066,49 @@ fn console_check(uefi_path: &Path) {
             std::process::exit(1);
         }
     }
+}
+
+/// The origin-square hash gfx-user's plaid produces -- the same value the serial
+/// build asserts as `gfx: framebuffer hash` in expected_boot_log.txt. In the
+/// fbcon_shell build the kernel reads this back AFTER the tenant seized the
+/// framebuffer the diagnostic console had been drawing to; a match proves the
+/// tenant's pixels replaced the console's (the fbcon->tenant handoff). If gfx-user
+/// or the pinned QEMU/OVMF framebuffer changes, re-derive it from the printed line,
+/// exactly as for the console/gfx hashes.
+const FBCON_SHELL_HANDOFF_HASH: &str = "fbcon-shell: post-handoff hash 0xa89206aa6c9abb25";
+
+/// Force the framebuffer diagnostic console (no-serial machine), boot the full
+/// demos + visual shell, and assert the fbcon->tenant handoff (first-metal-boot
+/// D4). Two proof lines arrive over a direct serial handle (the fb backend + the
+/// freeze latch silence the normal console channel):
+/// - the origin square, read back after gfx-user seized the framebuffer, holds the
+///   tenant's plaid and not leftover console text -> the handoff drew correct pixels;
+/// - `boot ok` after the visual shell ran -> the shell too drew and exited on the
+///   no-serial path without hanging.
+/// The only lane where the framebuffer is the live diagnostic backend end to end.
+fn fbcon_shell_check(uefi_path: &Path) {
+    let output = run_capture(uefi_path);
+    let handoff_line = output
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("fbcon-shell: post-handoff hash "));
+    let handoff_ok = handoff_line == Some(FBCON_SHELL_HANDOFF_HASH);
+    let shell_booted = output.contains("fbcon-shell: boot ok");
+    if handoff_ok && shell_booted {
+        println!(
+            "smoke-fbcon-shell: ok (framebuffer console backend live; tenant seized the fb from \
+             it with correct pixels; shell ran to completion on the no-serial path)"
+        );
+        return;
+    }
+    eprintln!("smoke-fbcon-shell: FAIL");
+    eprintln!("  handoff hash line:   {handoff_line:?}");
+    eprintln!("  expected:            {FBCON_SHELL_HANDOFF_HASH:?} (match: {handoff_ok})");
+    eprintln!("  \"fbcon-shell: boot ok\" present: {shell_booted} (want true)");
+    eprintln!("--- captured output ---");
+    eprintln!("{output}");
+    eprintln!("--- end output ---");
+    std::process::exit(1);
 }
 
 /// Scan captured serial output for the harness tags and print a result

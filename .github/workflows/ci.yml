@@ -98,6 +98,9 @@ jobs:
       - name: Diskless boot test (in QEMU, no virtio-blk)
         run: cargo xtask smoke-nostorage
 
+      - name: Framebuffer-console handoff test (in QEMU, no-serial path + shell)
+        run: cargo xtask smoke-fbcon-shell
+
       - name: USB HID bring-up (in QEMU, emulated xHCI + boot keyboard)
         run: cargo xtask smoke-usb
 

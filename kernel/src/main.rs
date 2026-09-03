@@ -1143,6 +1143,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(serial, "plinth: {after_gfx} frames free after gfx");
         }
 
+        // fbcon_shell lane (first-metal-boot D4): in this build the diagnostic
+        // console backend is the framebuffer, so boot drew its diagnostics to the
+        // screen, freeze_framebuffer latched the console off, and gfx-user then
+        // seized the SAME framebuffer as a tenant. Read the origin square back: it
+        // must now hold gfx-user's plaid (0xa89206aa6c9abb25, the value the serial
+        // build asserts as `gfx: framebuffer hash`), proving the tenant's pixels
+        // replaced the console's -- the fbcon->tenant handoff on a no-serial machine.
+        // Emitted over a DIRECT serial handle because the fb backend plus the freeze
+        // latch silence the normal console channel; the harness reads serial.
+        #[cfg(feature = "fbcon_shell")]
+        if let Some(h) = console::origin_square_hash(128) {
+            let mut direct = serial::init();
+            let _ = writeln!(direct, "fbcon-shell: post-handoff hash {h:#018x}");
+        }
+
         // Visual userspace (Stage 3): bitmap text + an
         // input-driven frame. The kernel grants gfxtext-user the whole-screen
         // Framebuffer (slot 1) AND the keyboard EventSource (slot 2); the
@@ -1574,6 +1589,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // long the demos took) and deterministic only under -icount; nothing
         // asserts the number, only that "boot ok" was reached.
         let _ = writeln!(serial, "plinth: boot ok ({} ticks)", timer::ticks());
+        // fbcon_shell lane: the visual shell (a framebuffer tenant, like gfx-user)
+        // ran between the handoff hash above and here under the framebuffer console
+        // backend. Reaching this point means it drew and exited without hanging on
+        // the no-serial path -- report that over the direct serial handle, since the
+        // normal "boot ok" above went to the (now latched-off) framebuffer console.
+        #[cfg(feature = "fbcon_shell")]
+        {
+            let mut direct = serial::init();
+            let _ = writeln!(direct, "fbcon-shell: boot ok (shell ran under fb console)");
+        }
         qemu_exit(ExitCode::Success)
     }
 }

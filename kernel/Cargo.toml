@@ -31,6 +31,13 @@ bench = []
 # serial stays live so the harness protocol is unaffected. Driven by
 # `cargo xtask console`.
 force_console = []
+# Force the framebuffer diagnostic console (as force_console does) AND boot the
+# full scripted demos + visual shell, then read the origin square back after a
+# framebuffer tenant seizes the screen -- proving the fbcon->tenant handoff on a
+# no-serial machine (first-metal-boot D4). Proof lines leave over a direct serial
+# handle, since the fb backend + the freeze latch silence the console channel.
+# Driven by `cargo xtask smoke-fbcon-shell`.
+fbcon_shell = []
 # Interactive build (`cargo xtask run`): skip arming the shell's scripted input
 # so it waits for REAL keyboard input -- you drive the home-screen cursor with
 # the arrow keys yourself. The default (smoke/test) build keeps the scripted

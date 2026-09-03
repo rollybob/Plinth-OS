@@ -94,10 +94,17 @@ impl GlobalSurface {
 /// Choose the diagnostic backend from hardware presence. Call once, early in
 /// boot. Idempotent and lock-free; it only probes a port and stores a byte.
 pub fn select() {
-    let backend = if serial::probe() {
-        BACKEND_SERIAL
-    } else {
+    // The `fbcon_shell` lane simulates a no-serial machine: force the framebuffer
+    // diagnostic backend even though QEMU provides a UART, so the fbcon->tenant
+    // handoff (the freeze latch, then a tenant seizing the framebuffer the console
+    // had been drawing to) is actually exercised under QEMU. The lane's proof still
+    // leaves the guest over a *direct* serial handle (see main.rs), which the
+    // harness reads -- the `||` short-circuits `probe()` away only when the feature
+    // is on, so the default build still selects from real hardware presence.
+    let backend = if cfg!(feature = "fbcon_shell") || !serial::probe() {
         BACKEND_FRAMEBUFFER
+    } else {
+        BACKEND_SERIAL
     };
     BACKEND.store(backend, Ordering::Relaxed);
 }
@@ -240,10 +247,22 @@ pub fn self_test_hash() -> Option<u64> {
     Some(hash_origin_square(&surface, 128))
 }
 
+/// Read back an FNV-1a hash of the current framebuffer origin square WITHOUT
+/// drawing anything (`fbcon_shell` lane, first-metal-boot D4). After a tenant has
+/// seized the framebuffer the console was drawing to, this reports what is now on
+/// screen so the harness can confirm the tenant's pixels (not leftover console
+/// text) landed there -- the fbcon->tenant handoff. Returns `None` if no
+/// framebuffer was discovered.
+#[cfg(feature = "fbcon_shell")]
+pub fn origin_square_hash(side: u32) -> Option<u64> {
+    let gs = FB.get()?;
+    Some(hash_origin_square(&gs.surface(), side))
+}
+
 /// FNV-1a over the top-left `side` x `side` pixels, read back from the mapped
 /// framebuffer. A fixed square keeps the value independent of the panel's total
 /// resolution, exactly as the gfx demos hash theirs.
-#[cfg(feature = "force_console")]
+#[cfg(any(feature = "force_console", feature = "fbcon_shell"))]
 fn hash_origin_square(surface: &Surface, side: u32) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
