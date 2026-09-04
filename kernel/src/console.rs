@@ -94,14 +94,15 @@ impl GlobalSurface {
 /// Choose the diagnostic backend from hardware presence. Call once, early in
 /// boot. Idempotent and lock-free; it only probes a port and stores a byte.
 pub fn select() {
-    // The `fbcon_shell` lane simulates a no-serial machine: force the framebuffer
-    // diagnostic backend even though QEMU provides a UART, so the fbcon->tenant
-    // handoff (the freeze latch, then a tenant seizing the framebuffer the console
-    // had been drawing to) is actually exercised under QEMU. The lane's proof still
-    // leaves the guest over a *direct* serial handle (see main.rs), which the
-    // harness reads -- the `||` short-circuits `probe()` away only when the feature
-    // is on, so the default build still selects from real hardware presence.
-    let backend = if cfg!(feature = "fbcon_shell") || !serial::probe() {
+    // The fbcon_shell / fbcon_panic lanes simulate a no-serial machine: force the
+    // framebuffer diagnostic backend even though QEMU provides a UART, so the paths
+    // a serial-less machine takes -- the fbcon->tenant handoff (fbcon_shell) and the
+    // terminal seize-and-draw on a crash (fbcon_panic) -- are actually exercised
+    // under QEMU. Each lane's proof still leaves the guest over a *direct* serial
+    // handle (see main.rs), which the harness reads; the `||` short-circuits
+    // `probe()` away only when a feature is on, so the default build still selects
+    // from real hardware presence.
+    let backend = if cfg!(feature = "fbcon_shell") || cfg!(feature = "fbcon_panic") || !serial::probe() {
         BACKEND_FRAMEBUFFER
     } else {
         BACKEND_SERIAL
@@ -253,7 +254,7 @@ pub fn self_test_hash() -> Option<u64> {
 /// screen so the harness can confirm the tenant's pixels (not leftover console
 /// text) landed there -- the fbcon->tenant handoff. Returns `None` if no
 /// framebuffer was discovered.
-#[cfg(feature = "fbcon_shell")]
+#[cfg(any(feature = "fbcon_shell", feature = "fbcon_panic"))]
 pub fn origin_square_hash(side: u32) -> Option<u64> {
     let gs = FB.get()?;
     Some(hash_origin_square(&gs.surface(), side))
@@ -262,7 +263,7 @@ pub fn origin_square_hash(side: u32) -> Option<u64> {
 /// FNV-1a over the top-left `side` x `side` pixels, read back from the mapped
 /// framebuffer. A fixed square keeps the value independent of the panel's total
 /// resolution, exactly as the gfx demos hash theirs.
-#[cfg(any(feature = "force_console", feature = "fbcon_shell"))]
+#[cfg(any(feature = "force_console", feature = "fbcon_shell", feature = "fbcon_panic"))]
 fn hash_origin_square(surface: &Surface, side: u32) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;

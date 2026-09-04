@@ -1158,6 +1158,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let _ = writeln!(direct, "fbcon-shell: post-handoff hash {h:#018x}");
         }
 
+        // fbcon_panic lane (first-metal-boot Q5): the framebuffer console backend
+        // is live and gfx-user has just drawn (so the freeze latch is set and a
+        // tenant owns the screen). Force a panic HERE to prove the terminal path
+        // takes the screen BACK and draws its report -- the "die visibly beats
+        // dying silently" property a no-serial machine depends on to be debuggable.
+        // The panic handler hashes the frame and reports over direct serial. The
+        // black_box guard keeps the compiler from marking the rest of boot dead in
+        // this build (it never runs it, but the warning would be noise).
+        #[cfg(feature = "fbcon_panic")]
+        if core::hint::black_box(true) {
+            panic!("fbcon_panic: forced crash to prove the framebuffer terminal path draws");
+        }
+
         // Visual userspace (Stage 3): bitmap text + an
         // input-driven frame. The kernel grants gfxtext-user the whole-screen
         // Framebuffer (slot 1) AND the keyboard EventSource (slot 2); the
@@ -1657,5 +1670,16 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // panic may have fired at any point, including mid-write.
     let mut serial = console::terminal_writer();
     let _ = writeln!(serial, "plinth: PANIC: {info}");
+    // fbcon_panic lane (first-metal-boot Q5): the terminal_writer above just seized
+    // the framebuffer and drew this report. Read the origin square back -- it now
+    // holds the panic text (not the tenant's pixels), proving a crash IS visible on
+    // a no-serial machine -- and report it over a DIRECT serial handle (the fb
+    // backend cannot answer the harness). Only in this build; the panic handler is
+    // otherwise byte-identical.
+    #[cfg(feature = "fbcon_panic")]
+    if let Some(h) = console::origin_square_hash(128) {
+        let mut direct = serial::init();
+        let _ = writeln!(direct, "fbcon-panic: post-panic hash {h:#018x}");
+    }
     qemu_exit(ExitCode::Failure)
 }

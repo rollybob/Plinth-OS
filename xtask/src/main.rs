@@ -75,6 +75,10 @@ fn main() {
         // shell, asserting the fbcon->tenant framebuffer handoff on a no-serial
         // machine (first-metal-boot D4).
         "smoke-fbcon-shell" => { let img = build_fbcon_shell(); fbcon_shell_check(&img); }
+        // Force the framebuffer console, let a tenant draw, then force a panic, and
+        // assert the terminal path drew the crash report on the framebuffer -- a
+        // crash is visible on a no-serial machine (first-metal-boot Q5).
+        "smoke-fbcon-panic" => { let img = build_fbcon_panic(); fbcon_panic_check(&img); }
         "no-i8042" => { let img = build_all(); no_i8042_check(&img); }
         // Boot with NO virtio-blk device (PLINTH_NOSTORAGE=1) and assert the
         // diskless-boot path (first-metal-boot D3): the kernel reports storage
@@ -85,7 +89,7 @@ fn main() {
         other     => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, smoke-amd, smoke-usb, bench, test, console, smoke-fbcon-shell, no-i8042, smoke-nostorage, check"
+                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, smoke-amd, smoke-usb, bench, test, console, smoke-fbcon-shell, smoke-fbcon-panic, no-i8042, smoke-nostorage, check"
             );
             std::process::exit(1);
         }
@@ -2032,6 +2036,39 @@ fn build_fbcon_shell() -> PathBuf {
     uefi_path
 }
 
+/// Build the kernel with the `fbcon_panic` feature (framebuffer console forced on,
+/// then a forced panic after a tenant draws) for the D4/Q5 crash-visibility lane.
+/// Separate image so it never clobbers the smoke/run/console/fbcon-shell image.
+fn build_fbcon_panic() -> PathBuf {
+    for name in USER_CRATES {
+        build_user_crate(name);
+    }
+    archive_image();
+
+    let root = workspace_root();
+    let kernel_dir = root.join("kernel");
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(&cargo)
+        .current_dir(&kernel_dir)
+        .args(["build", "--features", "fbcon_panic"])
+        .status()
+        .expect("failed to invoke cargo for fbcon_panic kernel build");
+    assert!(status.success(), "fbcon_panic kernel build failed");
+
+    let kernel_bin = root.join("target/x86_64-unknown-none/debug/kernel");
+    let out_dir = root.join("target/disk-images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let uefi_path = out_dir.join("uefi-fbcon-panic.img");
+    bootloader::UefiBoot::new(&kernel_bin)
+        .create_disk_image(&uefi_path)
+        .unwrap();
+
+    println!("fbcon-panic disk image: {}", uefi_path.display());
+    uefi_path
+}
+
 /// The frame hash the forced console produces for its fixed test string over
 /// the pinned QEMU/OVMF framebuffer. Deterministic for the same reason the gfx
 /// demo hashes are (fixed geometry + a fixed origin square); if QEMU or OVMF
@@ -2105,6 +2142,78 @@ fn fbcon_shell_check(uefi_path: &Path) {
     eprintln!("  handoff hash line:   {handoff_line:?}");
     eprintln!("  expected:            {FBCON_SHELL_HANDOFF_HASH:?} (match: {handoff_ok})");
     eprintln!("  \"fbcon-shell: boot ok\" present: {shell_booted} (want true)");
+    eprintln!("--- captured output ---");
+    eprintln!("{output}");
+    eprintln!("--- end output ---");
+    std::process::exit(1);
+}
+
+/// Like `run_capture` but for a build that deliberately PANICS: the kernel exits
+/// via isa-debug-exit with ExitCode::Failure (QEMU code 3), which `run_capture`
+/// would treat as an error. Returns `(qemu_exit_code, serial)`; only a timeout
+/// (i32::MIN) is fatal here -- the caller asserts on both the code and the content.
+fn run_capture_allow_failure(uefi_path: &Path) -> (i32, String) {
+    use std::io::Read;
+    let mut cmd = build_qemu_cmd(uefi_path, false, true, "");
+    cmd.args(["-display", "none"]);
+    cmd.stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to launch qemu-system-x86_64");
+    let mut stdout = child.stdout.take().expect("no stdout handle");
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        stdout.read_to_string(&mut buf).ok();
+        buf
+    });
+    let code = wait_qemu(child);
+    let output = reader.join().expect("reader thread panicked");
+    if code == i32::MIN {
+        eprintln!("smoke-fbcon-panic: FAIL -- QEMU timed out (a forced panic should exit fast)");
+        eprintln!("--- captured output ---\n{output}\n--- end output ---");
+        std::process::exit(2);
+    }
+    (code, output)
+}
+
+/// The origin-square hash the panic frame produces: the framebuffer terminal path
+/// clears the screen and draws "plinth: PANIC: ...", so the top-left square holds
+/// that text. Deterministic for a fixed panic message + pinned QEMU/OVMF. MUST
+/// differ from the gfx plaid hash (0xa89206aa6c9abb25) -- that difference is the
+/// proof the terminal path took the screen back from the tenant. Re-derive from the
+/// printed line if the panic message or the pinned firmware changes.
+const FBCON_PANIC_FRAME_HASH: &str = "fbcon-panic: post-panic hash 0x6c2e82b02fb5dc67";
+
+/// Force the framebuffer console, let a tenant draw, force a panic, and assert the
+/// terminal path drew the crash report on the framebuffer (first-metal-boot Q5).
+/// The panic handler hashes the frame and reports over a direct serial handle; a
+/// hash that matches the pinned panic frame -- and differs from the tenant's plaid
+/// -- proves a crash is VISIBLE on a no-serial machine rather than a black screen.
+/// The kernel exits ExitCode::Failure (QEMU code 3) by design, since it panicked.
+fn fbcon_panic_check(uefi_path: &Path) {
+    const GFX_PLAID_HASH: &str = "0xa89206aa6c9abb25";
+    let (code, output) = run_capture_allow_failure(uefi_path);
+    let panic_line = output
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("fbcon-panic: post-panic hash "));
+    let drew = panic_line.is_some();
+    let matches_pin = panic_line == Some(FBCON_PANIC_FRAME_HASH);
+    // The seize is only proven if the frame changed away from the tenant's pixels.
+    let seized_from_tenant = panic_line.is_some_and(|l| !l.contains(GFX_PLAID_HASH));
+    // Failure exit (3) is expected: the kernel panicked on purpose.
+    let exited_failure = code == 3;
+    if drew && matches_pin && seized_from_tenant && exited_failure {
+        println!(
+            "smoke-fbcon-panic: ok (forced panic under the framebuffer console: the terminal path \
+             seized the screen from the tenant and drew the crash report -- a crash is visible on \
+             a no-serial machine)"
+        );
+        return;
+    }
+    eprintln!("smoke-fbcon-panic: FAIL");
+    eprintln!("  panic hash line:      {panic_line:?}");
+    eprintln!("  expected:             {FBCON_PANIC_FRAME_HASH:?} (match: {matches_pin})");
+    eprintln!("  differs from plaid {GFX_PLAID_HASH}: {seized_from_tenant} (want true)");
+    eprintln!("  exited Failure (code 3): {exited_failure} (got {code})");
     eprintln!("--- captured output ---");
     eprintln!("{output}");
     eprintln!("--- end output ---");

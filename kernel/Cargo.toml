@@ -38,6 +38,13 @@ force_console = []
 # handle, since the fb backend + the freeze latch silence the console channel.
 # Driven by `cargo xtask smoke-fbcon-shell`.
 fbcon_shell = []
+# Force the framebuffer diagnostic console (as fbcon_shell does), let a tenant
+# draw, then force a panic -- proving the terminal path (panic/fault) SEIZES the
+# framebuffer and draws its report on a no-serial machine, ignoring the freeze
+# latch (first-metal-boot Q5: a crash must be visible, or a boot failure is an
+# indistinguishable black screen). The panic handler hashes the drawn frame and
+# reports over a direct serial handle. Driven by `cargo xtask smoke-fbcon-panic`.
+fbcon_panic = []
 # Interactive build (`cargo xtask run`): skip arming the shell's scripted input
 # so it waits for REAL keyboard input -- you drive the home-screen cursor with
 # the arrow keys yourself. The default (smoke/test) build keeps the scripted

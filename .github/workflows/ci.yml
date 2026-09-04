@@ -101,6 +101,9 @@ jobs:
       - name: Framebuffer-console handoff test (in QEMU, no-serial path + shell)
         run: cargo xtask smoke-fbcon-shell
 
+      - name: Framebuffer-console panic visibility test (in QEMU, crash draws on screen)
+        run: cargo xtask smoke-fbcon-panic
+
       - name: USB HID bring-up (in QEMU, emulated xHCI + boot keyboard)
         run: cargo xtask smoke-usb
 
