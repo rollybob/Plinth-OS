@@ -194,6 +194,17 @@ pub fn enable_bus_master(loc: Location) {
     write32(loc.bus, loc.slot, loc.func, 0x04, cmd as u32);
 }
 
+/// Enable memory-space decoding (command register bit 1) WITHOUT bus mastering.
+/// A device must decode its BAR before its MMIO registers respond, but reading
+/// registers does no DMA, so discovery leaves Bus Master Enable clear -- unlike
+/// `enable_bus_master`, which a driver about to post a DMA request uses. Keeps
+/// the high half (status, write-1-to-clear) zero so nothing is cleared.
+pub fn enable_memory_space(loc: Location) {
+    let dword = read32(loc.bus, loc.slot, loc.func, 0x04);
+    let cmd = (dword as u16) | (1 << 1);
+    write32(loc.bus, loc.slot, loc.func, 0x04, cmd as u32);
+}
+
 /// Set the command register's INTx Disable bit (bit 10): once a device's
 /// completion interrupts move to MSI-X, the legacy INTx# pin must stop being
 /// asserted, so it cannot deliver a stray interrupt alongside (or instead of)
@@ -490,6 +501,14 @@ fn report_storage_func<W: Write>(out: &mut W, bus: u8, slot: u8, func: u8) {
     }
     let subclass = (class >> 16) as u8;
     let prog_if = (class >> 8) as u8;
+    // NVMe (subclass 0x08) is reported in richer detail by `nvme::discover`
+    // (location, BAR, CAP, version), which runs right after this scan. Naming it
+    // here too would double-report the one controller, so leave NVMe to that path
+    // and keep this to the controllers Plinth has no discovery for at all (AHCI,
+    // SATA, IDE).
+    if subclass == 0x08 {
+        return;
+    }
     let _ = writeln!(
         out,
         "plinth: storage controller {} at {:02x}:{:02x}.{} vendor {:04x}, unsupported (no driver)",

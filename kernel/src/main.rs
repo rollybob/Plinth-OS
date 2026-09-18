@@ -79,6 +79,11 @@ mod pci;
 // path, after PCI discovery.
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod virtio_blk;
+// NVMe controller discovery (storage driver-gap milestone, step 1) runs on the
+// userspace boot path after PCI discovery, and only when an NVMe controller is
+// present. Discovery only -- no driver yet -- so it is dead in the test build.
+#[cfg_attr(feature = "tests", allow(dead_code))]
+mod nvme;
 // xHCI (USB HID) is being built bottom-up (usb_hid.md section 4). The module
 // straddles two builds mid-construction: the encoding layer is exercised by the
 // test suite (dead on the boot path), while the controller bring-up is exercised
@@ -347,6 +352,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // This runs before any process is created, so the BAR's kernel-half
         // MMIO mapping propagates to every process address space.
         let (infos, ndev) = pci::init(&mut serial);
+        // NVMe controller discovery (storage driver-gap milestone, step 1): if an
+        // NVMe controller is present, map its register BAR and read CAP + Version.
+        // Discovery only -- Plinth does not yet drive NVMe I/O -- so this reports
+        // the controller and returns. Silent (and inert) when none is present, so
+        // the default lanes' PCI topology and boot output are unchanged. Runs here,
+        // before any process is created, so the BAR's kernel-half MMIO mapping
+        // propagates to every process address space (as the virtio-blk BARs do).
+        nvme::discover(&mut serial);
         // The directly-bound device (direct-binding slice 2) is pinned at PCI slot
         // BIND_SLOT by the xtask. It is claimed with its OWN non-identity IOMMU
         // domain instead of the shared kernel-bridged one (D9), so `init` takes the

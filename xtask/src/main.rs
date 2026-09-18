@@ -85,11 +85,16 @@ fn main() {
         // absent, skips every selftest/demo, and still draws its shell -- the
         // metal-storage analogue of `no-i8042`.
         "smoke-nostorage" => { let img = build_all(); nostorage_check(&img); }
+        // Boot with an emulated NVMe controller (PLINTH_NVME=1) and assert NVMe
+        // controller discovery (storage driver-gap milestone, step 1): the PCI
+        // class scan finds it, its register BAR maps, and CAP + Version read back.
+        // Discovery only -- no reset, no queues, no namespace I/O.
+        "smoke-nvme" => { let img = build_all(); nvme_check(&img); }
         "check"   => { check_clobbers(); }
         other     => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, smoke-amd, smoke-usb, bench, test, console, smoke-fbcon-shell, smoke-fbcon-panic, no-i8042, smoke-nostorage, check"
+                "expected one of: build, image, run, run-gdb, smoke, smoke-smp, smoke-amd, smoke-usb, bench, test, console, smoke-fbcon-shell, smoke-fbcon-panic, no-i8042, smoke-nostorage, smoke-nvme, check"
             );
             std::process::exit(1);
         }
@@ -393,6 +398,21 @@ fn bind_image() -> PathBuf {
         .map(|i| ((i / 512 + i % 512) & 0xFF) as u8)
         .collect();
     std::fs::write(&path, &data).expect("failed to write bind image");
+    path
+}
+
+/// Backing image for the emulated NVMe controller (`smoke-nvme` lane). NVMe
+/// discovery reads only the controller's own registers, never a namespace, so
+/// the contents are irrelevant -- a small zero-filled file is enough to satisfy
+/// QEMU's requirement that `-device nvme` have a drive behind it. A separate file
+/// from the virtio-blk images so QEMU is never asked to open one image on two
+/// drives. 1 MiB.
+fn nvme_image() -> PathBuf {
+    let out_dir = workspace_root().join("target/disk-images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let path = out_dir.join("nvme.img");
+    let data = vec![0u8; 1024 * 1024];
+    std::fs::write(&path, &data).expect("failed to write nvme image");
     path
 }
 
@@ -774,6 +794,23 @@ fn build_qemu_cmd(uefi_path: &Path, gdb: bool, exit_on_debug: bool, machine_extr
     if std::env::var("PLINTH_USB").as_deref() == Ok("1") {
         cmd.args(["-device", "qemu-xhci,id=xhci"]);
         cmd.args(["-device", "usb-kbd,bus=xhci.0"]);
+    }
+
+    // Optional NVMe controller (PLINTH_NVME=1) for the storage driver-gap
+    // discovery lane (`cargo xtask smoke-nvme`): one emulated NVMe controller
+    // backed by a small raw image. The kernel finds it by PCI class scan, maps its
+    // register BAR, and reads CAP + Version -- discovery only, no I/O. Pinned to a
+    // fixed slot (0xa) well clear of the virtio-blk devices (3/4/5) so discovery
+    // output is stable across runs. Default lanes leave it off, so their PCI
+    // topology and smoke output are unchanged.
+    if std::env::var("PLINTH_NVME").as_deref() == Ok("1") {
+        let nvme = nvme_image();
+        cmd.args([
+            "-drive",
+            &format!("if=none,format=raw,file={},id=nvme0", nvme.display()),
+            "-device",
+            "nvme,drive=nvme0,serial=plinthnvme0,addr=0xa",
+        ]);
     }
 
     // Log CPU resets and exceptions for post-mortem debugging.
@@ -1738,6 +1775,48 @@ fn nostorage_check(uefi_path: &Path) {
     eprintln!("  no \"sector 0 read ok\" (selftest):    {no_selftest} (want true)");
     eprintln!("  \"frames free before shell\" present:  {shell_drew} (want true)");
     eprintln!("  \"boot ok\" present:                   {booted} (want true)");
+    eprintln!("--- captured output ---");
+    eprintln!("{output}");
+    eprintln!("--- end output ---");
+    std::process::exit(1);
+}
+
+/// Boot with an emulated NVMe controller (`PLINTH_NVME=1`) and assert NVMe
+/// controller discovery (storage driver-gap milestone, step 1): the PCI class
+/// scan finds the controller, its register BAR maps into the kernel, and the CAP
+/// + Version registers read back. Discovery only -- no reset, no queues, no
+/// namespace I/O; driving the controller is a later slice. Every default lane
+/// leaves NVMe off, so their PCI topology and smoke output are unchanged, and the
+/// three virtio-blk disks stay present so the rest of the boot runs normally.
+///
+/// Asserts, in one boot:
+/// - the controller is FOUND by class scan ("nvme controller at ...");
+/// - its identifying registers PARSE ("nvme version ...");
+/// - discovery completed without touching I/O ("nvme discovery ok");
+/// - the boot still ran to completion ("boot ok"), so discovery hung nothing.
+fn nvme_check(uefi_path: &Path) {
+    // A QEMU topology flag only (which -device args build_qemu_cmd emits); the
+    // kernel binary is unchanged and discovers the controller at runtime. Removed
+    // after the capture so it cannot leak into any later env read.
+    std::env::set_var("PLINTH_NVME", "1");
+    let output = run_capture(uefi_path);
+    std::env::remove_var("PLINTH_NVME");
+
+    let found = output.contains("nvme controller at");
+    let version = output.contains("nvme version ");
+    let discovered = output.contains("nvme discovery ok");
+    let booted = output.contains("boot ok");
+    if found && version && discovered && booted {
+        println!(
+            "smoke-nvme: ok (nvme controller discovered: BAR mapped, CAP + version read, no I/O)"
+        );
+        return;
+    }
+    eprintln!("smoke-nvme: FAIL");
+    eprintln!("  \"nvme controller at\" present:  {found} (want true)");
+    eprintln!("  \"nvme version\" present:        {version} (want true)");
+    eprintln!("  \"nvme discovery ok\" present:   {discovered} (want true)");
+    eprintln!("  \"boot ok\" present:             {booted} (want true)");
     eprintln!("--- captured output ---");
     eprintln!("{output}");
     eprintln!("--- end output ---");
