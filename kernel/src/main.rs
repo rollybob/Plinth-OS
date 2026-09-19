@@ -352,14 +352,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // This runs before any process is created, so the BAR's kernel-half
         // MMIO mapping propagates to every process address space.
         let (infos, ndev) = pci::init(&mut serial);
-        // NVMe controller discovery (storage driver-gap milestone, step 1): if an
-        // NVMe controller is present, map its register BAR and read CAP + Version.
-        // Discovery only -- Plinth does not yet drive NVMe I/O -- so this reports
-        // the controller and returns. Silent (and inert) when none is present, so
-        // the default lanes' PCI topology and boot output are unchanged. Runs here,
-        // before any process is created, so the BAR's kernel-half MMIO mapping
-        // propagates to every process address space (as the virtio-blk BARs do).
-        nvme::discover(&mut serial);
+        // NVMe controller bring-up (storage driver-gap milestone): if an NVMe
+        // controller is present, map its register BAR, read CAP + Version, then
+        // reset it, stand up the admin submission/completion queues, and enable it
+        // (wait for CSTS.RDY=1). Stops at "ready" -- no doorbell, no IDENTIFY, no
+        // I/O queues yet (the admin-command slice is next). Silent (and inert)
+        // when none is present, so the default lanes' PCI topology and boot output
+        // are unchanged. Runs here, before any process is created, so the BAR's
+        // kernel-half MMIO mapping propagates to every process address space (as
+        // the virtio-blk BARs do).
+        nvme::init(&mut serial);
         // The directly-bound device (direct-binding slice 2) is pinned at PCI slot
         // BIND_SLOT by the xtask. It is claimed with its OWN non-identity IOMMU
         // domain instead of the shared kernel-bridged one (D9), so `init` takes the

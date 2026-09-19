@@ -86,9 +86,10 @@ fn main() {
         // metal-storage analogue of `no-i8042`.
         "smoke-nostorage" => { let img = build_all(); nostorage_check(&img); }
         // Boot with an emulated NVMe controller (PLINTH_NVME=1) and assert NVMe
-        // controller discovery (storage driver-gap milestone, step 1): the PCI
-        // class scan finds it, its register BAR maps, and CAP + Version read back.
-        // Discovery only -- no reset, no queues, no namespace I/O.
+        // controller bring-up (storage driver-gap milestone): the PCI class scan
+        // finds it, its register BAR maps, CAP + Version read back, then the
+        // controller is reset, the admin queues are stood up, and it is enabled
+        // (RDY=1). Stops at ready -- no doorbell, no IDENTIFY, no namespace I/O.
         "smoke-nvme" => { let img = build_all(); nvme_check(&img); }
         "check"   => { check_clobbers(); }
         other     => {
@@ -1782,21 +1783,26 @@ fn nostorage_check(uefi_path: &Path) {
 }
 
 /// Boot with an emulated NVMe controller (`PLINTH_NVME=1`) and assert NVMe
-/// controller discovery (storage driver-gap milestone, step 1): the PCI class
-/// scan finds the controller, its register BAR maps into the kernel, and the CAP
-/// + Version registers read back. Discovery only -- no reset, no queues, no
-/// namespace I/O; driving the controller is a later slice. Every default lane
-/// leaves NVMe off, so their PCI topology and smoke output are unchanged, and the
-/// three virtio-blk disks stay present so the rest of the boot runs normally.
+/// controller bring-up (storage driver-gap milestone): the PCI class scan finds
+/// the controller, its register BAR maps into the kernel, CAP + Version read
+/// back, then the controller is reset, the admin submission/completion queues are
+/// stood up, and the controller is enabled and reports ready. Bring-up stops at
+/// "ready" -- no doorbell, no IDENTIFY, no namespace I/O; issuing admin commands
+/// is a later slice. Every default lane leaves NVMe off, so their PCI topology and
+/// smoke output are unchanged, and the three virtio-blk disks stay present so the
+/// rest of the boot runs normally.
 ///
 /// Asserts, in one boot:
 /// - the controller is FOUND by class scan ("nvme controller at ...");
 /// - its identifying registers PARSE ("nvme version ...");
-/// - discovery completed without touching I/O ("nvme discovery ok");
-/// - the boot still ran to completion ("boot ok"), so discovery hung nothing.
+/// - reset quiesced the controller ("nvme reset ok");
+/// - the admin queues were stood up ("nvme admin queues ready");
+/// - the controller ENABLED and reported ready ("nvme enabled ok (RDY=1)"), the
+///   load-bearing proof that it accepted the admin-queue configuration;
+/// - the boot still ran to completion ("boot ok"), so bring-up hung nothing.
 fn nvme_check(uefi_path: &Path) {
     // A QEMU topology flag only (which -device args build_qemu_cmd emits); the
-    // kernel binary is unchanged and discovers the controller at runtime. Removed
+    // kernel binary is unchanged and brings the controller up at runtime. Removed
     // after the capture so it cannot leak into any later env read.
     std::env::set_var("PLINTH_NVME", "1");
     let output = run_capture(uefi_path);
@@ -1804,19 +1810,23 @@ fn nvme_check(uefi_path: &Path) {
 
     let found = output.contains("nvme controller at");
     let version = output.contains("nvme version ");
-    let discovered = output.contains("nvme discovery ok");
+    let reset = output.contains("nvme reset ok");
+    let queues = output.contains("nvme admin queues ready");
+    let ready = output.contains("nvme enabled ok (RDY=1)");
     let booted = output.contains("boot ok");
-    if found && version && discovered && booted {
+    if found && version && reset && queues && ready && booted {
         println!(
-            "smoke-nvme: ok (nvme controller discovered: BAR mapped, CAP + version read, no I/O)"
+            "smoke-nvme: ok (nvme controller brought up: reset, admin queues stood up, RDY=1)"
         );
         return;
     }
     eprintln!("smoke-nvme: FAIL");
-    eprintln!("  \"nvme controller at\" present:  {found} (want true)");
-    eprintln!("  \"nvme version\" present:        {version} (want true)");
-    eprintln!("  \"nvme discovery ok\" present:   {discovered} (want true)");
-    eprintln!("  \"boot ok\" present:             {booted} (want true)");
+    eprintln!("  \"nvme controller at\" present:      {found} (want true)");
+    eprintln!("  \"nvme version\" present:            {version} (want true)");
+    eprintln!("  \"nvme reset ok\" present:           {reset} (want true)");
+    eprintln!("  \"nvme admin queues ready\" present: {queues} (want true)");
+    eprintln!("  \"nvme enabled ok (RDY=1)\" present: {ready} (want true)");
+    eprintln!("  \"boot ok\" present:                 {booted} (want true)");
     eprintln!("--- captured output ---");
     eprintln!("{output}");
     eprintln!("--- end output ---");
