@@ -79,18 +79,19 @@ mod pci;
 // path, after PCI discovery.
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod virtio_blk;
-// NVMe controller discovery (storage driver-gap milestone, step 1) runs on the
-// userspace boot path after PCI discovery, and only when an NVMe controller is
-// present. Discovery only -- no driver yet -- so it is dead in the test build.
+// NVMe controller discovery and bring-up (storage driver-gap milestone: reset,
+// admin queues, enable to RDY=1; no commands or I/O yet) runs on the normal boot
+// path after PCI discovery, and only when an NVMe controller is present. The test
+// build stops before that point, so the module is dead there.
 #[cfg_attr(feature = "tests", allow(dead_code))]
 mod nvme;
-// xHCI (USB HID) is being built bottom-up (usb_hid.md section 4). The module
-// straddles two builds mid-construction: the encoding layer is exercised by the
-// test suite (dead on the boot path), while the controller bring-up is exercised
-// on the boot path (dead in the test build, which stops before userspace). Rather
-// than gate each half against the opposite build, allow dead code across the
-// module until the driver is fully wired (input flowing to an EventSource), at
-// which point real use covers it and this comes off.
+// xHCI (USB HID) was built bottom-up (usb_hid.md section 4) and is now wired end
+// to end: boot-keyboard reports reach the keyboard EventSource. The module still
+// straddles two builds: the encoding layer is exercised by the test suite, while
+// the controller bring-up runs only on the boot path (dead in the test build,
+// which stops before userspace). The module-wide allow below was meant to come
+// off once the driver was wired; narrowing it to per-build gates has not been
+// done yet.
 #[allow(dead_code)]
 mod xhci;
 // Async completion rings are reached only from the userspace syscall path; the
