@@ -33,6 +33,41 @@ here on 2026-08-13.
 ## [Unreleased]
 
 ### Added
+- **NVMe controller bring-up (the first storage-driver slices).** The kernel finds
+  an NVMe controller by PCI class, maps its register BAR, reads CAP and the version,
+  resets it, stands up the admin submission/completion queues, and enables it until
+  it reports ready. It stops there on purpose: no doorbell, no IDENTIFY, no I/O
+  queues, so no disk data is read or written. A new `smoke-nvme` lane boots with an
+  emulated controller and asserts each step; the default lanes present none, so
+  their boot output is unchanged. No ABI change.
+- **Real-hardware groundwork and a USB boot guide.** `METAL_BOOT.md` covers booting
+  the image from a USB stick on a UEFI machine (not yet done on physical hardware).
+  Three new CI lanes cover paths a real machine takes and QEMU's defaults do not:
+  `smoke-nostorage` (no disks: storage is reported absent, no storage demo runs,
+  and the shell still draws), `smoke-fbcon-shell` (on a no-serial machine the
+  framebuffer console hands the screen to the shell cleanly), and
+  `smoke-fbcon-panic` (a panic is drawn on screen, checked by frame hash). Earlier
+  in the cycle: device MMIO is now mapped uncached (it had silently inherited the
+  bootloader's cacheable mapping), the kernel powers off through ACPI S5 when there
+  is no QEMU debug-exit device, `cargo xtask image` stages a USB-stick image, PCI
+  scanning names storage controllers it cannot drive (such as AHCI) instead of
+  ignoring them, a missing i8042 controller is detected and skipped (guarded by the
+  `no-i8042` lane), and `MAX_CORES` rose from 8 to 16.
+- **USB keyboard input over xHCI.** A USB host-controller driver, built bottom-up:
+  a pure encoding layer for TRBs, rings, and contexts (unit-tested); controller
+  discovery, reset, and start; Enable Slot and Address Device; descriptor reads and
+  Set Configuration; SET_PROTOCOL(boot), SET_IDLE(0), and the interrupt-IN
+  endpoint; and a decoder that turns 8-byte boot-keyboard reports into the same
+  Set-1 scancode stream the i8042 produces, posted to the keyboard `EventSource`,
+  so library OSes see no difference. This version handles one keyboard on a root
+  port, is polled (no MSI-X), and runs with the IOMMU off, because the controller
+  has no IOMMU domain yet. `smoke-usb` asserts enumeration and endpoint setup;
+  `usb-key` injects keystrokes through the QEMU monitor into the interactive shell
+  and asserts that an app launches. No ABI change.
+- **A staged SMP interleaving test.** An in-kernel test sets up the exact contended
+  state a past work-stealing bug reached (a donor core blocked on a slot still in
+  its own queue) and asserts the steal guard skips it -- the first test that stages
+  an SMP interleaving rather than arguing about one.
 - **A vendor-portable IOMMU: Intel VT-d and AMD-Vi.** The protected-DMA and
   direct-binding work was written against one chipset (Intel VT-d). It now runs on
   either vendor, chosen at boot from the ACPI table the machine presents -- VT-d's
@@ -313,6 +348,13 @@ here on 2026-08-13.
   would pass even if the mapping had never been established.
 
 ### Changed
+- **The interactive shell works with a real keyboard and mouse.** The selection
+  follows the mouse pointer (hover-to-select; a click or Enter opens), and in the
+  interactive build the idle loop keeps the framebuffer repainting, so keyboard-only
+  changes reach the QEMU window instead of waiting for mouse motion. `cargo xtask
+  run` now defaults to the emulated USB keyboard with the vIOMMU off; set
+  `PLINTH_USB` / `PLINTH_IOMMU` to override. The scripted boot and its assertions
+  are unchanged apart from the tour selecting by hover.
 - **`cargo xtask run` closes its window again when the shell quits.** The
   interactive path had omitted QEMU's isa-debug-exit device so the window would
   survive boot and the framebuffer's last frame could be inspected; the cost was
