@@ -12,20 +12,56 @@ on the same kernel answer those questions differently, in unprivileged code,
 and the boot log shows the difference.
 
 It began as one boot proving a single contrast -- the same workload over two
-allocators -- and has grown a preemptive scheduler, IPC, a disk, a keyboard,
-and symmetric multiprocessing, without giving up the property that makes it
-worth reading: a kernel that is mechanism, with policy in unprivileged library
-OSes, whose single-core boot is still checked line-by-line in CI.
+allocators -- and has grown a preemptive scheduler, IPC, storage, input, a
+graphical shell, an IOMMU, and symmetric multiprocessing, without giving up the
+property that makes it worth reading: a kernel that is mechanism, with policy in
+unprivileged library OSes, whose single-core boot is still checked line-by-line
+in CI.
+
+## Status
+
+Everything below runs under QEMU and is checked in CI on every push. A USB-stick
+boot path for real UEFI machines is written up in [METAL_BOOT.md](METAL_BOOT.md)
+but has not yet been run on a physical machine.
+
+- **Syscall ABI v2.12** ([ABI.md](ABI.md)): frames, CPU budgets, IPC endpoints,
+  disk ranges, input sources, and the framebuffer are all capabilities.
+- **Vendor-portable IOMMU.** Intel VT-d and AMD-Vi backends, chosen at boot from
+  the ACPI tables (DMAR or IVRS). A machine with neither falls back to
+  kernel-mediated DMA.
+- **Direct device binding.** A library OS can bind a virtio-blk device
+  exclusively, write its own descriptors, and ring the doorbell itself, with the
+  device's DMA confined by its own IOMMU domain.
+- **USB keyboard over xHCI.** Controller bring-up, enumeration of one
+  boot-protocol keyboard, and keystrokes fed into the same keyboard event source
+  the PS/2 path uses. Polled, and verified only with the IOMMU off: the xHCI
+  controller does not have an IOMMU domain yet.
+- **NVMe bring-up (partial).** Discovery, reset, and admin-queue setup until the
+  controller reports ready. No commands are issued yet, so there is no NVMe disk
+  I/O.
+- **Graphical shell.** A home screen of apps, driven by keyboard or mouse and
+  drawn entirely by unprivileged library OSes over a framebuffer capability.
+  On a machine with no serial port the kernel's diagnostics, including a panic,
+  are drawn on a framebuffer console instead.
+- **SMP.** Every CPU the ACPI MADT lists is brought up; per-core run queues
+  with work stealing, under one big kernel lock.
+- **CI lanes:** `check` (syscall clobber lint), `test` (136 in-kernel unit
+  tests), `smoke` (the boot log below, under VT-d), `smoke-amd` (AMD-Vi),
+  `smoke-smp` (2-4 cores), `no-i8042` (no PS/2 controller), `smoke-nostorage`
+  (diskless boot), `smoke-nvme`, `smoke-fbcon-shell` and `smoke-fbcon-panic`
+  (the no-serial display path), `smoke-usb` and `usb-key` (xHCI keyboard,
+  including injected keystrokes). See [Testing](#testing).
 
 ## The demo
 
-This is one single-core boot, verified line-by-line in CI against
-[expected_boot_log.txt](expected_boot_log.txt) -- the same assertion battery
-reruns on 2-4 cores (see [Testing](#testing)). It runs in two acts: the core
-exokernel moves, then the system machinery -- a scheduler, IPC, storage, and
-input -- that turns the kernel into something you could build on. The machinery
-was added without giving up the determinism that makes the single-core boot
-checkable.
+Below is an excerpt of one single-core boot's serial output. CI checks the
+whole boot line-by-line against [expected_boot_log.txt](expected_boot_log.txt)
+(262 asserted lines; `[...]` marks where this excerpt skips some), and the same
+assertion battery reruns on 2-4 cores (see [Testing](#testing)). It runs in two
+acts: the core exokernel moves, then the system machinery -- a scheduler, IPC,
+storage, input, and the screen -- that turns the kernel into something you could
+build on. The machinery was added without giving up the determinism that makes
+the single-core boot checkable.
 
 ```text
 plinth: kernel entry
@@ -33,18 +69,26 @@ plinth: frame allocator ready
 plinth: GDT + TSS loaded
 plinth: IDT loaded
 plinth: syscall interface ready
+plinth: framebuffer present
+plinth: acpi: S5 poweroff available (pm1a 0x604, slp_typ 0)
 plinth: acpi: 1 cpu(s), 1 ioapic(s)
+plinth: iommu: 1 dma remapping unit(s)
 plinth: timer armed
+plinth: smp: 0 ap(s) online
 plinth: keyboard ready (i8042, IRQ1)
 plinth: mouse ready (i8042 port 2, IRQ12)
 plinth: scanning PCI bus
+plinth: storage controller SATA (AHCI) at 00:1f.2 vendor 8086, unsupported (no driver)
 plinth: virtio-blk found at 00:03.0
 plinth: virtio-blk found at 00:04.0
-plinth: virtio-blk[0] ready (queue 0, size 64, capacity 2048 sectors)
-plinth: virtio-blk[0] msix vector 0x30
-plinth: virtio-blk[1] msix vector 0x31
+plinth: virtio-blk found at 00:05.0
+[...]
+plinth: iommu: translation enabled
 plinth: virtio-blk[0] sector 0 read ok (ramp verified)
 plinth: virtio-blk[1] sector 0 read ok (distinct disk)
+plinth: iommu: fault control: PASS
+plinth: virtio-blk[2] bind selftest: sector 0 read ok via non-identity domain
+plinth: mmio: 18 pages mapped uncached
 plinth: running hello
 hello: ring 3
 hello: frame mapped and writable
@@ -97,12 +141,21 @@ plinth: share demo: 2 processes
 plinth: share demo: all done
 plinth: rpc demo: 2 processes
 plinth: rpc demo: all done
-plinth: spawn demo: 1 processes
-plinth: spawn demo: all done
+[...]
 plinth: blk demo: 1 processes
+blk: start
 blk: read ok b0=1 b1=2 b5=6
 blk: out-of-range rejected
 plinth: blk demo: all done
+plinth: bind demo: 1 processes
+bind: ring 3
+bind: executor ran 4 overlapping reads over the bound device, each verified
+bind: out-of-domain executor read confined (named an unmapped iova)
+bind: released the device (binding torn down)
+plinth: bind demo: all done
+plinth: iommu: bind fault control: PASS
+plinth: bind teardown: binding reclaimed on release
+[...]
 plinth: fs demo: 1 processes
 fsdemo: loading 'diskhello' from the boot archive
 diskhello: running from disk
@@ -112,20 +165,44 @@ plinth: evt demo: 1 processes
 evt: non-source rejected
 evt: got scancode 0x1e
 plinth: evt demo: all done
+[...]
 plinth: kbd demo: 1 processes
 kbd: type a line
 kbd: read 'Hi'
 plinth: kbd demo: all done
+[...]
+plinth: gfx demo: 1 processes
+gfx: start
+gfx: non-framebuffer rejected
+gfx: framebuffer hash 0xa89206aa6c9abb25
+gfx: ok
+plinth: gfx demo: all done
+[...]
+plinth: gfxbound demo: 1 processes
+gfxbound: writing past my band
+plinth: [user fault] #PF
+plinth: terminating user process
+plinth: gfxbound demo: all done
+[...]
+plinth: shell demo: 1 processes
+shell: start
+shell: VERSION 2.12
+[...]
+shell: quit
+plinth: shell demo: all done
 plinth: boot ok
 ```
 
-The single-process demos print verbatim, in order. The Phase 2 demos that run
-several processes under the scheduler print only their bracketing lines here,
+The single-process demos shown print verbatim, in order. The Phase 2 demos that
+run several processes under the scheduler print only their bracketing lines here,
 because the interleaving between processes is deliberately nondeterministic;
 CI checks each process's *own* lines stay in program order
 (`check_per_process_order`), and that the free-frame count returns to its
 baseline around every demo (`check_frames_baseline`) -- the no-leak invariant,
-asserted across the whole boot rather than printed.
+asserted across the whole boot rather than printed. The check runs both ways: a
+captured line that no expectation matches also fails the run, apart from a short
+allowlist at the bottom of the file for output that cannot be pinned (firmware
+chatter, addresses).
 
 ### Act one -- the core exokernel moves
 
@@ -220,7 +297,7 @@ handed to mutually isolated tenants, the display analogue of disjoint
 `BlockRange`s -- and the guarantee is structural, not a cooperative clip.
 
 **And on top of all of it, a shell.** shell-demo is the skin: a splash, a home
-screen of app icons, and a selection cursor you move with the arrow keys -- all
+screen of app icons, and a selection you move with the arrow keys or the mouse -- all
 unprivileged policy over the framebuffer and keyboard capabilities (the keymap
 even decodes the arrows' extended scancodes in `libinput`, the kernel still
 shipping only raw bytes). Selecting the app icon makes the shell `spawn` a real
@@ -281,15 +358,18 @@ Plinth implements the minimum machinery that makes the argument concrete:
         |    libplinth: syscall shim + int 0x80 gate shim    |
   ======+======+============+=============+============+======+======
   syscall/sysret  |              int 0x80 gate              |
-   write exit      | send recv call reply ring_wait
+   write exit      | send recv call reply ring_wait bind_wait
    frame_alloc/map cap_release cpu_charge fault_reg/return spawn
-   spawn_from_buffer ring_register ring_submit fb_map
+   spawn_from_buffer ring_register ring_submit fb_map ring_dropped
+   bind_device
   +----------------------------------------------------------------+
   |                        plinth kernel                           |
   |  capabilities | frames | CPU budgets | endpoints | block ranges|
   |  event sources | async rings | scheduler + timer | addr spaces |
   |  fault upcall  | virtio-blk | i8042 kbd+mouse | irq seam        |
   |  LAPIC + I/O APIC | MSI-X | SMP: AP trampoline + BKL + per-CPU |
+  |  IOMMU: VT-d + AMD-Vi | xHCI USB kbd | NVMe (bring-up)         |
+  |  GOP framebuffer | fb diagnostic console | ACPI S5 poweroff    |
   +----------------------------------------------------------------+
                        ring 0, one or more CPUs
 ```
@@ -318,7 +398,10 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
   timer.rs         100 Hz preemption tick: per-CPU LAPIC timer (PIT fallback)
   irq.rs           interrupt-controller seam: LAPIC + I/O APIC, MSI-X
                    (8259 PIC kept as a fallback when no MADT is present)
-  acpi.rs          MADT parser: CPU + interrupt-controller topology
+  acpi.rs          ACPI tables: MADT (CPU + interrupt-controller topology),
+                   DMAR/IVRS (the IOMMU units), and the _S5_ soft-off value
+  iommu.rs         IOMMU seam: VT-d and AMD-Vi backends, per-device DMA
+                   domains, fault reporting, direct-binding domains
   smp.rs           AP bring-up: INIT-SIPI-SIPI + the long-mode trampoline
   bkl.rs           the big kernel lock: one lock, held entry-to-exit
   percpu.rs        per-CPU state via IA32_GS_BASE (current process, stacks)
@@ -338,7 +421,14 @@ kernel/      the exokernel (no_std, x86_64-unknown-none)
   gdt.rs           GDT/TSS, sysret-compatible selector layout
   serial.rs        serial console
   framebuffer.rs   discover the GOP framebuffer; hand it out as a Framebuffer cap
-  tests/           in-kernel test suite (123 tests, run in QEMU)
+  console.rs       kernel diagnostics: serial, or the framebuffer when no UART
+  fbcon.rs         framebuffer text console (layout over the libfont glyphs)
+  xhci.rs          xHCI USB host controller: bring-up, one boot-protocol
+                   keyboard, reports decoded into the keyboard event source
+  nvme.rs          NVMe discovery + bring-up (reset, admin queues, ready);
+                   no commands or I/O yet
+  main.rs          boot sequence: device bring-up, selftests, the demo tour
+  tests/           in-kernel test suite (136 tests, run in QEMU)
 
 libplinth/   user-side syscall + gate shim -- deliberately NOT a library OS
 libos/       allocator library OSes (BumpAlloc, FreeListAlloc) + ring, a
@@ -350,6 +440,8 @@ libinput/    a Set-1 keymap (with shift) and line reader -- input as a libOS
 libgfx/      a framebuffer writer, an 8x8 bitmap font + draw_text, text
              centering + a border primitive -- graphics (rendering) as a libOS
              over the Framebuffer capability
+libfont/     the shared 8x8 glyph table (used by libgfx and the kernel's
+             framebuffer console)
 demo-app/    the shared allocator workload, generic over the memory policy
 
 user programs (ring 3, each its own crate):
@@ -365,6 +457,8 @@ user programs (ring 3, each its own crate):
   stealer-user/ stealwork-user/  work-stealing demo (force an imbalance, assert
                  completion + cross-core steal fired)
   blk-user/      read disk sectors through a bounded BlockRange
+  bind-user/     direct binding: the libos executor drives a bound virtio-blk
+                 device; an out-of-domain read is confined by the IOMMU
   asyncblk-user/ several overlapping reads via the libos async executor
   blkwrite-user/ write a pattern, read it back, verify the round-trip
   fsdemo-user/   load a program off disk with libfs + spawn_from_buffer
@@ -379,11 +473,24 @@ user programs (ring 3, each its own crate):
   gfxtext-user/  draw a title + echo a keyboard line on-screen (libgfx + libinput)
   gfxsplit-user/ two libOSes each draw a disjoint screen band (run as two procs)
   gfxbound-user/ write past a band's grant -> kernel page-faults it (the boundary)
+  gfxrevoke-user/ release the Framebuffer cap, write anyway -> the mapping is gone
   shell-user/    the skin: splash + a home screen of app icons + arrow-key nav
   shellapp-user/ an app the shell spawns + hands the screen to, then gets back
   caprelease-user/  spawn/join/release round-trips past the endpoint pool
   quietworker-user/ a silent worker for the loop above (grantee without output)
   faultchild-user/  a child that faults, for liveness testing
+  fbreclaim-user/ fbreclaimchild-user/   a lent framebuffer comes home when
+                 the borrower dies holding it
+  fbrelease-user/ fbreleasechild-user/   the borrower hands it back with
+                 cap_release instead
+  spawnwaitcap-user/  spawn_and_wait_cap: the lent screen returns to a slot
+                 known in advance
+  blkreclaim-user/ blkreclaimchild-user/   the same for a lent BlockRange
+  blkrelend-user/ blkrelendmid-user/   a range re-lent A -> B -> C comes home
+                 to A, not B
+  blkipclend-user/ blkrecvchild-user/   a range lent over IPC comes home when
+                 the receiver dies
+  bench-user/    kernel-entry hammer for the lock benchmark (`cargo xtask bench`)
   template-user/    minimal skeleton to copy for a new program (see GUIDE.md)
 xtask/       build orchestration: user binaries, disk images, QEMU,
              smoke + test harnesses, asm clobber lint
@@ -500,30 +607,38 @@ Requirements: Rust nightly (pinned via `rust-toolchain.toml`, needs
 `rust-src`) and `qemu-system-x86_64` on PATH.
 
 ```text
-cargo xtask run     # build everything, boot in QEMU
+cargo xtask run     # build everything, boot the interactive build in QEMU
 cargo xtask smoke   # boot captured, assert expected_boot_log.txt in order
 cargo xtask test    # in-kernel test suite under QEMU
 cargo xtask check   # lint libplinth asm blocks for syscall clobbers
 cargo xtask run-gdb # boot paused, GDB server on :1234
+cargo xtask image   # stage plinth-usb.img for a USB stick (METAL_BOOT.md)
 ```
+
+The other boot lanes CI runs are listed under [Testing](#testing).
 
 First build downloads OVMF firmware (cached in `target/ovmf/`) and compiles
 the bootloader; expect a few minutes. Slow machine or CI?
 `PLINTH_QEMU_TIMEOUT=180` extends the QEMU watchdog. `cargo xtask run` then
-boots into the live system -- type into the QEMU window and kbd-demo echoes
-your line through `libinput`.
+boots the interactive build: the scripted demos run, and the shell waits for
+you -- move the selection with the arrow keys or the mouse, open an app with
+Enter or a click. The session defaults to an emulated USB keyboard with the
+vIOMMU off (the xHCI controller has no IOMMU domain yet); `PLINTH_USB=0` selects
+the PS/2 keyboard instead.
 
 To boot Plinth from a USB stick on a real UEFI machine, `cargo xtask image`
 stages the bootable image; [METAL_BOOT.md](METAL_BOOT.md) covers writing it and
-the firmware settings. It is a live USB -- it never touches the internal disk --
-and the bar is "boots and draws its shell," with storage and USB input expected
-to be absent (Plinth has no NVMe/AHCI or USB-HID driver yet).
+the firmware settings. It is a live USB -- it never reads or writes the internal
+disk -- and the bar is "boots and draws its shell." It has not yet been run on a
+physical machine. Expect storage to be absent (NVMe stops at controller
+bring-up; AHCI is detected and reported but not driven) and USB input to be
+uncertain (the xHCI keyboard is verified only under QEMU, with the IOMMU off).
 
 ## Writing your own programs
 
 Plinth runs your code in ring 3 over a stable syscall interface.
 [ABI.md](ABI.md) is the contract -- syscalls, the IPC and device gate, the
-executable format, and entry state, versioned as **v2.8** -- and
+executable format, and entry state, versioned as **v2.12** -- and
 [GUIDE.md](GUIDE.md) is the walkthrough: copy `template-user/` to start a
 program, and see how memory policy goes in a library OS rather than the
 kernel. Where the project is headed is in [ROADMAP.md](ROADMAP.md); how to
@@ -531,34 +646,54 @@ contribute is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Testing
 
-Three layers, all in CI on every push:
+Every step below runs in CI on every push (`.github/workflows/ci.yml`); all but
+the lint boot the kernel under QEMU.
 
-1. `cargo xtask test` -- 78 in-kernel unit tests (frame allocator, capability
-   table, CPU-budget charging, the ELF loader/validator, the scheduler's
-   `pick_next` policy, the IPC wait queue, the block-completion demux, the
-   event-subscription routing + CQ-full backpressure, and the mouse
-   packet-decode framing) executed
-   inside QEMU, reported over a serial protocol (`[PASS]`/`[FAIL]`/`[SUITE]`)
-   that xtask parses. Pure library-OS logic that does not need the kernel --
-   the `libfs` archive parser and the `libinput` keymap -- is host-unit-tested
-   as well.
-2. `cargo xtask smoke` -- full boot with captured serial output. The
-   single-process demos are asserted line-by-line in order
-   (`expected_boot_log.txt`); the multi-process Phase 2 demos are checked for
-   per-process ordering (interleaving-robust) and that free frames return to
-   baseline around each demo, since the cross-process interleaving is
-   deliberately nondeterministic. `PLINTH_ICOUNT` can pin the interleaving
-   reproducibly for debugging; the kernel never depends on it.
-   `cargo xtask smoke-smp` reruns the same interleaving-robust assertions on 2,
-   3, and 4 cores -- the SMP regression lane, since multicore output is no
-   longer a fixed transcript the single-core boot can stand in for.
-3. `cargo xtask check` -- static lint: every syscall `asm!` block in libplinth
+1. `cargo xtask check` -- static lint: every syscall `asm!` block in libplinth
    must declare the full clobber set the kernel ABI implies.
+2. `cargo xtask test` -- 136 in-kernel unit tests (frame allocator, capability
+   table, CPU-budget charging, the ELF loader/validator, the scheduler including
+   a staged work-stealing interleaving, the IPC wait queue, the block-completion
+   demux, event routing + CQ-full backpressure, mouse packet framing, the IOMMU
+   page-table formats, and the xHCI ring/context encoding + boot-keyboard report
+   decoding) executed inside QEMU, reported over a serial protocol
+   (`[PASS]`/`[FAIL]`/`[SUITE]`) that xtask parses.
+3. `cargo xtask smoke` -- full boot with captured serial output, under an
+   emulated Intel VT-d IOMMU. The single-process demos are asserted line-by-line
+   in order (`expected_boot_log.txt`); the multi-process Phase 2 demos are checked
+   for per-process ordering (interleaving-robust) and that free frames return to
+   baseline around each demo, since the cross-process interleaving is
+   deliberately nondeterministic. Any captured line nothing expects also fails
+   the run, apart from a short documented allowlist. `PLINTH_ICOUNT` can pin the
+   interleaving reproducibly for debugging; the kernel never depends on it.
+4. `cargo xtask smoke-smp` -- reruns the same interleaving-robust assertions on
+   2, 3, and 4 cores, the SMP regression lane.
+5. Targeted boot lanes, each asserting one path the default boot does not take:
+   - `smoke-amd` -- the AMD-Vi IOMMU backend (QEMU's emulated amd-iommu).
+     Positive only: QEMU's amd-iommu does not fault an out-of-domain DMA, so
+     the forced-fault check stays on the VT-d lane.
+   - `no-i8042` -- no PS/2 controller: the kernel reports it absent, arms
+     nothing, and still finishes the tour.
+   - `smoke-nostorage` -- no disks: storage is reported absent, no storage demo
+     runs, and the shell still draws.
+   - `smoke-nvme` -- an emulated NVMe controller is found, reset, given admin
+     queues, and reports ready.
+   - `smoke-fbcon-shell` / `smoke-fbcon-panic` -- the framebuffer diagnostic
+     console a serial-less machine uses: the handoff to the shell's pixels, and
+     a panic drawn visibly on screen (checked by frame hash).
+   - `smoke-usb` -- an emulated xHCI controller comes up and enumerates a USB
+     boot keyboard.
+   - `usb-key` -- the interactive build with a USB keyboard: keystrokes injected
+     through the QEMU monitor drive the shell and launch an app.
+
+The library OSes `libfs`, `librwfs`, and `libinput` also carry host-side
+`#[test]` unit tests for their pure logic (archive parsing, the allocation
+bitmap and directory, the keymap); CI does not currently run those.
 
 ## Current limitations
 
 These are where Plinth is today, not where it stops. The syscall interface is
-a documented, versioned contract ([ABI.md](ABI.md), v2.6), so you can write
+a documented, versioned contract ([ABI.md](ABI.md), v2.12), so you can write
 your own programs and library OSes against it; growing Plinth toward a
 genuinely usable general-purpose exokernel is the ongoing direction
 ([ROADMAP.md](ROADMAP.md)).
@@ -570,8 +705,14 @@ genuinely usable general-purpose exokernel is the ongoing direction
   deliberately: a benchmark showed it only contends near 100% kernel residency,
   a regime real workloads do not occupy, so splitting it is deferred until
   contention data justifies the complexity. Adding cores therefore scales
-  scheduling locality, not kernel-entry throughput. Real-machine device support
-  (leaving QEMU's defaults) is the next milestone.
+  scheduling locality, not kernel-entry throughput.
+- **Real hardware is not yet proven.** Every lane runs under QEMU. The
+  real-machine groundwork is in place (a USB boot image, a framebuffer console
+  for serial-less machines, ACPI soft-off, uncached device MMIO, graceful
+  absence of disks and the PS/2 controller), but the path in
+  [METAL_BOOT.md](METAL_BOOT.md) has not yet been run on a physical machine.
+  Storage drivers stop at virtio-blk: NVMe reaches controller-ready with no I/O,
+  and AHCI is only detected and reported.
 - **`write` is uncapability-gated console output** for demo legibility -- the
   one call that is not behind a capability. A single `write` is atomic with
   respect to other processes, so interleaved demos never tear a line.
@@ -590,16 +731,20 @@ genuinely usable general-purpose exokernel is the ongoing direction
   `libfs`'s read-only boot archive (the permanent initramfs/boot-image role)
   and `librwfs`'s read-write filesystem (a bitmap allocator, a flat mutable
   directory, single-extent fixed-size files) over the block ring ABI's write
-  half (`RING_OP_WRITE`, v2.6). The writable format has no crash consistency,
-  no nested directories, and no append/truncate/rename -- delete-then-recreate
-  covers what the demo needs; a real journaling filesystem is a different,
-  much larger project. No network.
-- **Input is two i8042 devices, raw events only.** The kernel ships raw Set-1
-  scancodes from the keyboard and raw dx/dy/button packets from the mouse;
-  one reader per source. Keymaps, layouts, line editing, and cursor/click
-  semantics are library-OS policy (`libinput` for the keyboard); fanning
-  input out to many consumers would itself be a library OS over the
-  primitive.
+  half (`RING_OP_WRITE`, added in v2.6). The writable format has no crash
+  consistency, no nested directories, and no append/truncate/rename --
+  delete-then-recreate covers what the demo needs; a real journaling
+  filesystem is a different, much larger project. No network.
+- **Input is raw events only.** The kernel ships raw Set-1 scancodes from the
+  keyboard and raw dx/dy/button packets from the mouse; one reader per source.
+  Keyboard input comes from the i8042 (PS/2) controller or from a USB boot
+  keyboard over xHCI, which the kernel translates into the same scancode
+  stream. The USB path handles one keyboard on a root port, is polled rather
+  than interrupt-driven, and needs the IOMMU off, since the xHCI controller has
+  no IOMMU domain yet. The mouse is PS/2 only. Keymaps, layouts, line editing,
+  and cursor/click semantics are library-OS policy (`libinput` for the
+  keyboard); fanning input out to many consumers would itself be a library OS
+  over the primitive.
 - **IPC endpoints are kernel-granted.** A process does not yet create its own
   endpoints: the kernel mints one per `spawn` (the result channel) and may
   grant one at launch. A process-facing endpoint-create call is not part of
@@ -642,6 +787,10 @@ Hard-won, possibly useful to other no_std kernel people:
   `int 0x80` gate instead, whose interrupt entry saves the full resumable trap
   frame. Several arrived as `syscall` calls and had to move once they learned to
   block.
+
+## Acknowledgments
+
+Developed with Claude Code (Anthropic) as an AI pair-programmer.
 
 ## License
 
