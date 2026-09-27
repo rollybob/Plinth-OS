@@ -42,6 +42,14 @@ each confined to its rows by paging. A capability lent to another process is a
 bounded loan rather than a handoff: the kinds no syscall can re-mint come home
 to the lender's reserved slot when the borrower dies or hands them back, across
 spawn and both IPC directions and however many hops deep the loan was re-lent.
+The IOMMU is vendor-portable (Intel VT-d or AMD-Vi, chosen at boot from the
+ACPI tables), and a machine with neither stays kernel-bridged.
+Groundwork for real machines is in place but not yet proven on one: a USB boot
+image ([METAL_BOOT.md](METAL_BOOT.md)), a framebuffer diagnostic console for
+machines with no serial port, ACPI soft-off, uncached device MMIO, a clean
+diskless / no-PS/2 boot, an xHCI driver that brings up one USB boot keyboard
+(verified under QEMU with the IOMMU off), and NVMe controller bring-up to
+"ready" (no commands or I/O yet).
 No network yet, and the single lock is intentionally left whole -- a benchmark
 showed it only contends near 100% kernel residency, so splitting it earns
 nothing real workloads would feel.
@@ -54,7 +62,8 @@ library OS against a stable interface, while the kernel stays deterministic
 and small.
 
 - [x] **Versioned syscall ABI** -- the interface is a documented contract
-  ([ABI.md](ABI.md)), frozen as v1.
+  ([ABI.md](ABI.md)), first frozen as v1; see [Stability](#stability) for
+  the versions since (currently v2.12).
 - [x] **In-kernel ELF loader** -- the kernel loads a static `ET_EXEC` ELF
   with per-segment W^X, instead of a flat blob. Bring your own program.
 - [x] **Templates and a guide** -- a skeleton program crate and a
@@ -67,7 +76,8 @@ and small.
 Everything here follows from adding a timer, and each step is weighed
 against the cost to determinism rather than taken for granted.
 
-- [x] **Timer + preemptive scheduling.** A 100 Hz PIT preempts ring-3 code;
+- [x] **Timer + preemptive scheduling.** A 100 Hz timer (first the PIT, now the
+  per-CPU LAPIC timer, with the PIT as fallback) preempts ring-3 code;
   the kernel saves the full context, switches address space and kernel stack,
   and round-robins independent processes (`kernel/src/scheduler.rs`). The
   kernel is non-preemptible (it reschedules only out of ring 3). Testing moved
@@ -234,9 +244,26 @@ against the cost to determinism rather than taken for granted.
     forces an imbalance (one parent spawns workers that pile onto its core while
     others idle) and asserts both completion and that a cross-core steal fired;
     `cargo xtask smoke-smp` exercises it on 2-4 cores.
-  - [ ] **Real-machine hardware.** Leaving QEMU's comfortable defaults: real
-    ACPI quirks, MMIO cache attributes, PCIe ECAM, a NIC. Its own milestone,
-    once the concurrency model is scaled.
+  - [ ] **Real-machine hardware.** Leaving QEMU's comfortable defaults. In
+    progress; each piece below has its own CI lane under QEMU, but none has
+    yet been run on a physical machine:
+    - [x] Device MMIO mapped uncached (it had silently inherited cacheable
+      attributes), ACPI S5 soft-off, and `cargo xtask image` for a USB stick
+      ([METAL_BOOT.md](METAL_BOOT.md)).
+    - [x] Graceful absence: no i8042 (`no-i8042`), no disks
+      (`smoke-nostorage`), and unsupported storage controllers reported by
+      PCI class rather than ignored.
+    - [x] A framebuffer diagnostic console for machines with no serial port,
+      including a visible panic (`smoke-fbcon-shell`, `smoke-fbcon-panic`).
+    - [x] A vendor-portable IOMMU (above).
+    - [x] USB keyboard: an xHCI driver that enumerates one boot-protocol
+      keyboard and feeds the keyboard `EventSource` (`smoke-usb`, `usb-key`).
+      Polled, and xHCI DMA is not yet given an IOMMU domain, so it runs with
+      the IOMMU off.
+    - [ ] NVMe storage: controller bring-up to ready is done (`smoke-nvme`);
+      admin commands (IDENTIFY), I/O queues, and namespace I/O are next.
+    - [ ] A first boot on a physical machine; real ACPI quirks; PCIe ECAM; a
+      NIC.
 
 ## Stability
 

@@ -3,9 +3,11 @@
 Plinth normally runs under QEMU. It can also boot from a USB stick on a real
 UEFI machine and draw its shell -- the "it lives outside a VM" proof. This is a
 **live USB**: it runs entirely from the stick and RAM, and the machine's
-internal disk is never touched. Plinth has no NVMe or AHCI driver, so it cannot
-see an internal disk, let alone write one; remove the stick and reboot and the
-machine is exactly as it was.
+internal disk is never read or written. Plinth has no NVMe or AHCI I/O path:
+AHCI controllers are only detected and reported, and on an NVMe controller the
+kernel goes no further than a reset and admin-queue setup to "ready" -- it
+issues no commands, so no data is read or written. Remove the stick and reboot
+and the disk is exactly as it was.
 
 > **Status: not yet booted on physical hardware.** These are the instructions,
 > not a guarantee. The first real run is what turns the open questions
@@ -21,10 +23,11 @@ framebuffer. That is the whole milestone.
 It is **not** a working OS on metal. Two things are expected to be absent, and
 that is fine:
 
-- **Storage** -- no NVMe/AHCI driver, so the boot is diskless. The storage demos
+- **Storage** -- no NVMe/AHCI I/O, so the boot is diskless. The storage demos
   simply do not run (proven under QEMU by `cargo xtask smoke-nostorage`).
 - **Input** -- best-effort only (see below). If no key ever registers, the
-  machine still booted and drew, which is the win.
+  machine still booted and drew, which is the win. The staged image is the
+  scripted build anyway, so it does not wait for input.
 
 ## 1. Build the image
 
@@ -55,11 +58,15 @@ In the target machine's firmware setup:
 - **Secure Boot OFF.** The image is unsigned; Secure Boot will refuse it.
 - **USB boot enabled** and the stick ahead of the internal disk in the boot
   order (or use the one-time boot menu).
-- **USB Legacy Support ON** *if* you intend to use a **USB** keyboard. Plinth has
-  no USB HID driver yet, so a USB keyboard works only through the firmware's
-  legacy (SMM) emulation, which presents it at the PS/2 ports. This is common on
-  desktops but unreliable on pure-UEFI systems and laptops. A **PS/2** keyboard
-  on a machine with a real PS/2 port works directly and needs none of this.
+- **USB keyboards are uncertain on metal.** Plinth has its own xHCI driver for
+  one USB boot-protocol keyboard, but it is verified only under QEMU and only
+  with the IOMMU off: the xHCI controller has no IOMMU domain yet, so on a
+  machine where Plinth turns IOMMU translation on, the controller's DMA would
+  be blocked. The driver also resets the controller without first taking
+  ownership from the firmware, so whether the firmware's USB Legacy Support
+  (which presents a USB keyboard at the PS/2 ports) still works afterwards is
+  untested. A **PS/2** keyboard on a machine with a real PS/2 port is the most
+  dependable input.
 
 None of these touch the internal disk; they are all boot/firmware settings.
 
@@ -79,6 +86,6 @@ Remove the stick and reboot. Nothing was installed and no disk was written.
 
 ## Not on this path
 
-A real storage driver (NVMe/AHCI) and a real USB HID stack (xHCI + USB-HID) are
-each their own milestone; they are deliberately out of scope for first boot. See
-[ROADMAP.md](ROADMAP.md).
+Storage I/O (NVMe beyond controller bring-up, and AHCI) is its own milestone and
+deliberately out of scope for first boot. The xHCI keyboard driver exists but is
+not relied on here, for the reasons in section 3. See [ROADMAP.md](ROADMAP.md).

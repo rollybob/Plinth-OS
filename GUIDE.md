@@ -115,10 +115,11 @@ cargo build --release
 
 ## 2. Running your program
 
-Plinth does not load programs from disk yet (that is Phase 2 -- see
-[ROADMAP.md](ROADMAP.md)). For now a program runs by being **embedded in
-the kernel image** and launched at boot. Wiring a new program in touches
-three lists:
+The shortest path is to **embed the program in the kernel image** and
+launch it at boot. (Plinth can also load a program from disk: `fsdemo-user/`
+reads one out of the boot archive with `libfs` and launches it with
+`spawn_from_buffer`. Embedding is simpler to start with.) Wiring a new
+embedded program in touches three lists:
 
 1. **`xtask/src/main.rs`** -- add your short name to `USER_CRATES` so xtask
    builds the crate.
@@ -135,8 +136,10 @@ cargo xtask run     # build everything and boot in QEMU
 cargo xtask smoke   # boot and assert expected_boot_log.txt, in order
 ```
 
-(If you assert your program's output, add its lines to
-`expected_boot_log.txt`. The matcher is substring-based and in order.)
+(Add your program's output lines to `expected_boot_log.txt`. The matcher is
+substring-based and in order, and it also fails on any captured line that no
+expectation matches, so new output that is not listed there breaks the smoke
+test.)
 
 To launch a program as a **spawned child** instead -- in its own address
 space, receiving a transferred capability -- add it to the kernel's
@@ -191,7 +194,7 @@ only through a capability you hold, at an aligned address in the window);
 ## Where to look next
 
 - [ABI.md](ABI.md) -- the syscall interface, executable format, and entry
-  state, frozen as v1.
+  state; the current contract is v2.12.
 - `hello-user/` -- exercises the whole syscall surface end to end.
 - `lazy-user/` -- registers a ring-3 page-fault handler (self-paging).
 - `spawner-user/` + `grantee-user/` -- spawn and capability transfer.
